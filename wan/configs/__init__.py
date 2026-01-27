@@ -10,12 +10,16 @@ from .wan_t2v_A14B import t2v_A14B
 from .wan_ti2v_5B import ti2v_5B
 from .wan_animate_14B import animate_14B
 
+# v2v reuses i2v config
+v2v_14B = copy.deepcopy(i2v_A14B)
+
 WAN_CONFIGS = {
     't2v-A14B': t2v_A14B,
     'i2v-A14B': i2v_A14B,
     'ti2v-5B': ti2v_5B,
     'animate-14B': animate_14B,
     's2v-14B': s2v_14B,
+    'v2v-14B': v2v_14B,
 }
 
 SIZE_CONFIGS = {
@@ -46,5 +50,7 @@ SUPPORTED_SIZES = {
     'ti2v-5B': ('704*1280', '1280*704'),
     's2v-14B': ('720*1280', '1280*720', '480*832', '832*480', '1024*704',
                 '704*1024', '704*1280', '1280*704'),
-    'animate-14B': ('720*1280', '1280*720')
+    'animate-14B': ('720*1280', '1280*720'),
+    'v2v-14B': ('720*1280', '1280*720', '480*832', '832*480'),
 }
+
