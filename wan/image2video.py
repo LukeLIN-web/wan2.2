@@ -279,21 +279,24 @@ class WanI2V:
         seed_g.manual_seed(seed)
         noise = torch.randn(
             16,
-            (F - 1) // self.vae_stride[0] + 1,
+            (F - 1) // self.vae_stride[0] + 1, # 第一帧：作为条件图像（I2V 任务），单独编码，占 1 个 latent 位置
             lat_h,
             lat_w,
             dtype=torch.float32,
             generator=seed_g,
             device=self.device)
+        # 后续 F-1 帧：按 stride 分组压缩，得到 (F-1) // stride 个 latent 位置
 
         msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
-            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
+            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), 
+            msk[:, 1:]
         ],
                            dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
+        #在 temporal 维度上把第一帧"展开"到 4 帧的位置，使其不被压缩丢失信息.  21 个 latent frames。
+        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w) # [1, 21, 4, h, w]
+        msk = msk.transpose(1, 2)[0]  # [4, 21, h, w]
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -418,7 +421,8 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                videos = self.vae.decode(x0)
+                videos = self.vae.decode(x0) # VAE decoder 会在时间维度做 4× 上采样：21 → 84，然后裁掉前 3 帧（repeat 出来的冗余），最终得到 81 帧
+        # decode 怎么正确应对.
 
         del noise, latent, x0
         del sample_scheduler

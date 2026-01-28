@@ -17,7 +17,7 @@ PORT = 8080
 # 视频目录
 VIDEO_DIRS = [
     # "/home/user1/workspace/juyi/Wan2.2",
-    # "/home/user1/workspace/juyi/Wan2.2/generatedvideo"
+    "/home/user1/workspace/juyi/Wan2.2/generatedvideo",
     "/home/user1/workspace/juyi/Wan2.2/v2v"
 ]
 
@@ -440,28 +440,37 @@ class VideoHandler(http.server.SimpleHTTPRequestHandler):
 def kill_port(port):
     """杀掉占用指定端口的进程"""
     import subprocess
-    try:
-        result = subprocess.run(
-            f"fuser -k {port}/tcp 2>/dev/null",
-            shell=True,
-            capture_output=True
-        )
-        if result.returncode == 0:
-            print(f"🔄 已杀掉占用端口 {port} 的进程")
-            import time
-            time.sleep(0.5)
-            return True
-    except Exception:
-        pass
+    import signal
+    
+    # 尝试多种方法
+    methods = [
+        f"fuser -k {port}/tcp",
+        f"lsof -ti:{port} | xargs -r kill -9",
+    ]
+    
+    for cmd in methods:
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+            if result.returncode == 0:
+                print(f"🔄 已杀掉占用端口 {port} 的进程")
+                import time
+                time.sleep(1)
+                return True
+        except Exception:
+            continue
     return False
+
+# 允许端口复用的TCP服务器
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
 
 def main():
     import time
-    max_retries = 2
+    max_retries = 3
     
     for attempt in range(max_retries):
         try:
-            with socketserver.TCPServer(("127.0.0.1", PORT), VideoHandler) as httpd:
+            with ReusableTCPServer(("127.0.0.1", PORT), VideoHandler) as httpd:
                 print(f"🎬 视频播放器已启动!")
                 print(f"📺 请在浏览器访问: http://127.0.0.1:{PORT}")
                 print(f"📁 视频目录: {VIDEO_DIRS}")
@@ -473,11 +482,13 @@ def main():
                 break
         except OSError as e:
             if "Address already in use" in str(e) and attempt < max_retries - 1:
-                print(f"⚠️  端口 {PORT} 被占用，尝试清理...")
+                print(f"⚠️  端口 {PORT} 被占用，尝试清理... (尝试 {attempt + 1}/{max_retries})")
                 kill_port(PORT)
+                time.sleep(1)
                 continue
             else:
                 raise
 
 if __name__ == "__main__":
     main()
+

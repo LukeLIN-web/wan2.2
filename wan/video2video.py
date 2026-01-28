@@ -676,7 +676,7 @@ class WanV2V:
 
         # Step 3: Call i2v with extracted frame and prompt
         logging.info("V2V: Starting i2v generation...")
-        return self.generate(
+        video = self.generate(
             input_prompt=input_prompt,
             img=last_frame,
             max_area=max_area,
@@ -689,3 +689,5 @@ class WanV2V:
             seed=seed,
             offload_model=offload_model
         )
+        prompt = input_prompt
+        return video, prompt

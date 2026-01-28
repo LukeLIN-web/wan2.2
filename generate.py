@@ -536,7 +536,6 @@ def generate(args):
     elif "v2v" in args.task:
         logging.info("Creating WanV2V pipeline.")
         args.prompt = "continue video"
-        print(args.prompt)
         from wan.video2video import WanV2V
         wan_v2v = WanV2V(
             config=cfg,
@@ -551,7 +550,7 @@ def generate(args):
             vlm_device=args.vlm_device,
         )
         logging.info(f"Generating video from {args.video} ...")
-        video = wan_v2v.v2v(
+        video, args.prompt  = wan_v2v.v2v(
             video_path=args.video,
             max_area=MAX_AREA_CONFIGS[args.size],
             frame_num=args.frame_num,
@@ -562,6 +561,7 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             custom_prompt=args.prompt if args.prompt else None)
+        print(args.prompt)
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
