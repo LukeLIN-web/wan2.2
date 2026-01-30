@@ -116,22 +116,6 @@ self.vae = Wan2_2_VAE(...)
 
 ## 使用方法
 
-### 单次 V2V 生成
-
-```bash
-# v2v-14B (使用 I2V-A14B 模型)
-python generate.py --task v2v-14B --video input.mp4 --ckpt_dir ./Wan2.2-I2V-A14B
-
-# v2v-5B (使用 TI2V-5B 模型) - 更低显存占用
-python generate.py --task v2v-5B --video input.mp4 --ckpt_dir ./Wan2.2-TI2V-5B --size 704*1280
-
-# VLM 在不同 GPU 上运行
-python generate.py --task v2v-5B --video input.mp4 --ckpt_dir ./Wan2.2-TI2V-5B --vlm_device cuda:1
-
-# 使用自定义 prompt
-python generate.py --task v2v-5B --video input.mp4 --ckpt_dir ./Wan2.2-TI2V-5B --prompt "A cat playing"
-```
-
 ### Continuous Generations (连续视频生成)
 
 新增脚本 `generate_continuous.py` 支持**链式连续视频生成**：
@@ -149,35 +133,6 @@ flowchart LR
 2. 调用 i2v 生成 `video2`
 3. 读取 `video2`，重复步骤 1-2
 4. 循环直到生成指定数量的视频 (默认 12 个)
-
-#### 使用方法
-
-```bash
-# 基础用法 - 从 input.mp4 开始连续生成 12 个视频
-python generate_continuous.py --video input.mp4 --ckpt_dir ./Wan2.2-I2V-A14B
-
-# 自定义生成数量
-python generate_continuous.py --video input.mp4 --ckpt_dir ./Wan2.2-I2V-A14B --num_videos 6
-
-# 指定输出目录和 VLM 设备
-python generate_continuous.py \
-    --video input.mp4 \
-    --ckpt_dir ./Wan2.2-I2V-A14B \
-    --output_dir ./my_continuous_videos \
-    --vlm_device cuda:1
-
-# 完整参数示例
-python generate_continuous.py \
-    --video input.mp4 \
-    --ckpt_dir ./Wan2.2-I2V-A14B \
-    --num_videos 12 \
-    --output_dir ./continuous_outputs \
-    --frame_num 81 \
-    --sample_steps 40 \
-    --sample_guide_scale 5.0 \
-    --base_seed 42 \
-    --custom_prompt "continue video slowly"
-```
 
 #### 参数说明
 
@@ -198,15 +153,3 @@ python generate_continuous.py \
 - Prompt 日志: `prompts_log.txt` (记录每个视频对应的 VLM 生成的描述)
 
 ---
-
-## 文件结构
-
-```
-wan/
-├── video2video.py          # WanV2V (14B) - 基于 I2V-A14B
-├── wan22video2video5B.py   # WanV2V5B (5B) - 基于 TI2V-5B [NEW]
-├── image2video.py          # WanI2V (14B)
-├── textimage2video.py      # WanTI2V (5B)
-└── configs/
-    └── __init__.py         # v2v-14B, v2v-5B 配置
-```
