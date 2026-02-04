@@ -14,10 +14,20 @@ warnings.filterwarnings('ignore')
 import random
 import torch
 import torch.distributed as dist
+from decord import VideoReader, cpu
+from PIL import Image
 
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.utils import save_video
 from concat_videos import concat_videos
+
+
+def extract_last_frame(video_path):
+    """Extract the last frame from a video as PIL Image."""
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+    last_frame_idx = len(vr) - 1
+    last_frame = vr[last_frame_idx].asnumpy()
+    return Image.fromarray(last_frame).convert('RGB')
 
 
 def _parse_args():
@@ -53,7 +63,7 @@ def _parse_args():
     parser.add_argument(
         "--frame_num",
         type=int,
-        default=121,
+        default=81,
         help="Number of frames to generate per video (should be 4n+1).")
     parser.add_argument(
         "--sample_steps",
@@ -87,15 +97,10 @@ def _parse_args():
         default=True,
         help="Whether to offload the model to CPU after generation.")
     parser.add_argument(
-        "--vlm_device",
+        "--prompt_file",
         type=str,
-        default=None,
-        help="Device for VLM model (e.g., 'cuda:1').")
-    parser.add_argument(
-        "--custom_prompt",
-        type=str,
-        default="continue video",
-        help="Custom prompt prefix to prepend to VLM-generated description.")
+        required=True,
+        help="Path to text file containing the prompt for video generation.")
     parser.add_argument(
         "--t5_fsdp",
         action="store_true",
@@ -123,6 +128,11 @@ def _parse_args():
     assert os.path.exists(args.video), f"Input video not found: {args.video}"
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
     assert args.num_videos >= 1, "num_videos must be at least 1"
+    assert os.path.exists(args.prompt_file), f"Prompt file not found: {args.prompt_file}"
+    
+    # Read prompt from file
+    with open(args.prompt_file, 'r', encoding='utf-8') as f:
+        args.custom_prompt = f.read().strip()
     
     if args.base_seed < 0:
         args.base_seed = random.randint(0, sys.maxsize)
@@ -142,13 +152,13 @@ def _init_logging(rank=0):
 
 def generate_continuous(args):
     """
-    连续生成视频的主函数
+    连续生成视频的主函数 (不使用VLM，每段视频使用相同的prompt)
     
     流程:
-    1. 读取 video1, 提取最后一帧 + VLM分析 -> 生成 video2
-    2. 读取 video2, 提取最后一帧 + VLM分析 -> 生成 video3
+    1. 读取 video1, 提取最后一帧 + custom_prompt -> 生成 video2
+    2. 读取 video2, 提取最后一帧 + custom_prompt -> 生成 video3
     ...
-    12. 读取 video11, 提取最后一帧 + VLM分析 -> 生成 video12
+    12. 读取 video11, 提取最后一帧 + custom_prompt -> 生成 video12
     """
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -175,21 +185,23 @@ def generate_continuous(args):
     run_output_dir = os.path.join(args.output_dir, f"{input_video_name}_{run_timestamp}")
     os.makedirs(run_output_dir, exist_ok=True)
     
-    # Get config for v2v-5B (uses ti2v config)
-    cfg = WAN_CONFIGS["v2v-5B"]
+    # Get config for i2v-14B
+    cfg = WAN_CONFIGS["i2v-A14B"]
     
     logging.info("=" * 60)
-    logging.info("Continuous Video Generation")
+    logging.info("Continuous Video Generation (using I2V-14B)")
     logging.info(f"Input video: {args.video}")
     logging.info(f"Number of videos to generate: {args.num_videos}")
     logging.info(f"Output directory: {run_output_dir}")
     logging.info(f"Base seed: {args.base_seed}")
     logging.info("=" * 60)
     
-    # Initialize WanV2V5B pipeline (only once)
-    logging.info("Creating WanV2V5B pipeline (5B model)...")
-    from wan.wan22video2video5B import WanV2V5B
-    wan_v2v = WanV2V5B(
+    # Initialize WanI2V pipeline (original i2v-14B model)
+    logging.info("Creating WanI2V pipeline (14B model)...")
+    logging.info(f"Prompt file: {args.prompt_file}")
+    logging.info(f"Using prompt: {args.custom_prompt}")
+    from wan.image2video import WanI2V
+    wan_i2v = WanI2V(
         config=cfg,
         checkpoint_dir=args.ckpt_dir,
         device_id=device,
@@ -199,7 +211,6 @@ def generate_continuous(args):
         use_sp=False,
         t5_cpu=args.t5_cpu,
         convert_model_dtype=args.convert_model_dtype,
-        vlm_device=args.vlm_device,
     )
     
     # Start continuous generation
@@ -217,9 +228,18 @@ def generate_continuous(args):
         current_seed = args.base_seed + i
         logging.info(f"Using seed: {current_seed}")
         
-        # Generate video
-        video, prompt = wan_v2v.v2v(
-            video_path=current_video_path,
+        # Extract last frame from current video
+        logging.info("Extracting last frame from input video...")
+        last_frame = extract_last_frame(current_video_path)
+        logging.info(f"Extracted frame size: {last_frame.size}")
+        
+        # Generate video with fixed prompt (no VLM)
+        prompt = args.custom_prompt
+        logging.info(f"Using prompt: {prompt}")
+        
+        video = wan_i2v.generate(
+            input_prompt=prompt,
+            img=last_frame,
             max_area=MAX_AREA_CONFIGS[args.size],
             frame_num=args.frame_num,
             shift=args.sample_shift,
@@ -228,10 +248,8 @@ def generate_continuous(args):
             guide_scale=args.sample_guide_scale,
             seed=current_seed,
             offload_model=args.offload_model,
-            custom_prompt=args.custom_prompt,
         )
         
-        logging.info(f"VLM generated prompt: {prompt[:100]}...")
         generated_prompts.append(prompt)
         
         # Save the generated video
@@ -270,7 +288,7 @@ def generate_continuous(args):
             logging.info(f"  {idx}. {path}")
         
         # Save prompts to a log file
-        prompts_log_path = os.path.join(run_output_dir, "prompts_log.txt")
+        prompts_log_path = os.path.join(run_output_dir, f"{input_video_name}_prompts_log.txt")
         with open(prompts_log_path, 'w', encoding='utf-8') as f:
             f.write("Continuous Video Generation - Prompts Log\n")
             f.write("=" * 60 + "\n\n")
