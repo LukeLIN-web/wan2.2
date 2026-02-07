@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+
+
+always firstly `conda activate wan` before run any command.
+
+### 
+
+don't write redundant code in markdown, keep it concise.
+
+
 ## Architecture
 
 

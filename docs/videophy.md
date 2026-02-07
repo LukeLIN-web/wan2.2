@@ -1,0 +1,240 @@
+# 用 Wan2.2 推理 VIDEOPHY2 Benchmark
+
+## 1. VIDEOPHY2 是什么
+
+VIDEOPHY2 是一个评估 T2V（Text-to-Video）模型**物理常识**能力的 benchmark。包含 200 个动作类别、600 条唯一 prompt，评估三个维度：
+
+| 维度 | 说明 | 评分 |
+|------|------|------|
+| **SA (Semantic Adherence)** | 视频是否匹配文本描述 | 1-5 分 |
+| **PC (Physical Commonsense)** | 视频是否遵循物理定律 | 1-5 分 |
+| **Rule (Physical Rule)** | 视频是否遵循特定物理规则 | 0/1/2 |
+
+**Joint Score** = SA≥4 且 PC≥4 的比例（当前 SOTA Wan2.1-14B 只有 32.6%）。
+
+## 2. 整体流程
+
+```
+VIDEOPHY2 prompts → Wan2.2 生成视频 → 整理成 CSV → VIDEOPHY2 AutoEval 评分
+```
+
+### 三步走：
+1. **下载 VIDEOPHY2 测试集 prompts**（从 HuggingFace）— 已完成
+2. **用 Wan2.2 批量生成视频**（5B 或 14B）
+3. **下载 AutoEval 模型并评分**
+
+## 3. Step 1: 获取 VIDEOPHY2 测试 Prompts（已完成）
+
+```bash
+conda activate wan
+python download_videophy2.py
+```
+
+数据已下载到 `./videophy_data/`。
+
+### videophy2_test.csv vs videophy2_prompts.csv
+
+两个文件都在 `./videophy_data/` 下：
+
+| | `videophy2_test.csv` | `videophy2_prompts.csv` |
+|---|---|---|
+| **行数** | 3397 | **600** |
+| **含义** | 原始测试集，每行 = 1个prompt × 1个模型的评测结果 | **去重后的唯一 prompts，用于生成** |
+| **重复** | 同一 caption 出现多次（7个模型各一条） | 每个 caption 只出现一次 |
+| **模型** | 包含 hunyuan, ray2, wan, cogvideo, cosmos, videocrafter, sora 7个模型的结果 | 无模型信息 |
+| **评分列** | 有 sa, pc, joint（human eval 分数） | 无评分列 |
+| **用途** | 参考其他模型的表现 | **直接喂给 Wan2.2 生成视频** |
+
+**`videophy2_test.csv` 列说明：**
+- `caption` — 原始 prompt（用于生成视频）
+- `upsampled_caption` — 扩展后的详细 prompt（平均 138 tokens，可选用）
+- `video_url` — 该模型生成的视频 URL
+- `sa`, `pc`, `joint` — human eval 分数
+- `action` — 动作类别（197个，如 yoyo, bulldozing, folding clothes）
+- `is_hard` — 是否属于 hard subset
+- `model_name` — 生成该视频的模型名
+- `physics_rules_*` — 物理规则评估详情
+- `metadata_rules` — 规则对应的物理定律分类
+
+**`videophy2_prompts.csv` 列说明：**
+- `id` — 序号 0-599
+- `caption` — 用于 T2V 生成的 prompt
+- `upsampled_caption` — 扩展版 prompt（可选用，更详细）
+- `action` — 动作类别
+- `is_hard` — 是否 hard subset（600 中有 180 条）
+- `category` — 大类（Sports and Physical Activities / Object Interactions）
+
+**简单说：用 `videophy2_prompts.csv` 的 600 条 caption 生成视频就行。**
+
+## 4. Step 2: 批量生成视频
+
+两个模型可选：
+
+### 模型对比
+
+| | **TI2V-5B** | **T2V-A14B** |
+|---|---|---|
+| 脚本 | `run_videophy.py` | `run_videophy_14b.py` |
+| Checkpoint | `./Wan2.2-TI2V-5B` | `./Wan2.2-T2V-A14B` |
+| 输出目录 | `./videophy_outputs/` | `./videophy_outputs_14b/` |
+| 分辨率 | `1280*704` | `1280*720` |
+| 帧数 | 121 | 81 |
+| 采样步数 | 50 | 40 |
+| CFG scale | 5.0 | (3.0, 4.0) 双阶段 |
+| Shift | 5.0 | 12.0 |
+| FPS | 24 | 16 |
+| VAE | Wan2.2 (16×16×4) | Wan2.1 (4×8×8) |
+| 架构 | 单模型 | 双模型 (high/low noise) |
+| 显存 | ~20-30GB | ~40-60GB |
+
+### 方案 A: TI2V-5B（`run_videophy.py`）
+
+```bash
+conda activate wan
+cd /shared/user72/workspace/juyi/Wan2.2
+
+# 双 GPU 并行（单进程，内部多线程）
+python run_videophy.py --gpus 0,1
+```
+
+**`run_videophy.py` 代码逻辑：**
+
+1. 从 `videophy2_prompts.csv` 加载 600 条 prompt
+2. `--start/--end` 切片选取范围，扫描 `videophy_outputs/` 跳过已有视频，得到 `to_generate` 列表
+3. 按 `--gpus` 参数（默认 `0,1`）在每个 GPU 上各加载一份 TI2V-5B pipeline
+4. **Round-robin 分配**：遍历 `to_generate`，按 `idx % num_gpus` 交替分给各 GPU。即 GPU 0 拿第 0、2、4... 项，GPU 1 拿第 1、3、5... 项
+5. 每个 GPU 启动一个 `threading.Thread`，各自独立循环生成自己的 chunk
+6. 主线程 `join()` 等待所有线程完成
+
+### 方案 B: T2V-A14B（`run_videophy_14b.py`）
+
+Leaderboard 上的 Wan2.1-14B 就是这个架构，结果更可比。
+
+```bash
+conda activate wan
+cd /shared/user72/workspace/juyi/Wan2.2
+
+# GPU 0 和 1 各跑一半
+CUDA_VISIBLE_DEVICES=0 python run_videophy_14b.py --start 0 --end 300 &
+CUDA_VISIBLE_DEVICES=1 python run_videophy_14b.py --start 300 --end 600 &
+wait
+```
+
+### 通用说明
+
+单 GPU 先测几条：
+```bash
+CUDA_VISIBLE_DEVICES=1 python run_videophy.py --start 0 --end 5
+CUDA_VISIBLE_DEVICES=1 python run_videophy_14b.py --start 0 --end 5
+```
+
+脚本特点：
+- 模型只加载一次，循环生成所有 prompt
+- 自动跳过已有视频，支持断点续跑
+- `--start/--end` 分片，方便多 GPU 并行
+- 文件名格式 `0001_caption_text.mp4`
+
+## 5. Step 3: 评估生成的视频
+
+### 下载 AutoEval 模型
+
+```bash
+cd /shared/user72/workspace/juyi/Wan2.2/videophy/
+git lfs install
+git clone https://huggingface.co/videophysics/videophy_2_auto
+```
+
+### 准备评估 CSV
+
+生成视频后，需要创建符合格式的 CSV 文件：
+
+```python
+"""prepare_eval_csv.py - 准备评估用 CSV"""
+import os
+import csv
+
+OUTPUT_DIR = "./videophy_outputs"
+PROMPT_CSV = "./videophy_data/videophy2_prompts.csv"
+
+# 读取 prompts
+prompts = []
+with open(PROMPT_CSV, "r") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        prompts.append(row)
+
+# SA + PC 评估用 CSV
+with open("eval_sa_pc.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["caption", "videopath"])
+    for row in prompts:
+        pid = int(row["id"])
+        caption = row["caption"]
+        clean = caption.replace(" ", "_").replace("/", "_").replace('"', "")
+        clean = "".join(c for c in clean if c.isalnum() or c in "_-.,")[:80]
+        video_path = os.path.join(OUTPUT_DIR, f"{pid:04d}_{clean}.mp4")
+        if os.path.exists(video_path):
+            writer.writerow([caption, video_path])
+```
+
+### 运行评估
+
+```bash
+cd /shared/user72/workspace/juyi/Wan2.2/videophy/VIDEOPHY2
+
+# 语义匹配度评估
+CUDA_VISIBLE_DEVICES=0 python inference.py \
+    --input_csv ../../eval_sa_pc.csv \
+    --checkpoint ../videophy_2_auto \
+    --output_csv ../../eval_output_sa.csv \
+    --task sa
+
+# 物理常识评估
+CUDA_VISIBLE_DEVICES=1 python inference.py \
+    --input_csv ../../eval_sa_pc.csv \
+    --checkpoint ../videophy_2_auto \
+    --output_csv ../../eval_output_pc.csv \
+    --task pc
+```
+
+### 计算 Joint Score
+
+```python
+"""compute_score.py - 计算 VIDEOPHY2 Joint Score"""
+import pandas as pd
+
+sa = pd.read_csv("eval_output_sa.csv")
+pc = pd.read_csv("eval_output_pc.csv")
+
+# 合并
+merged = sa.merge(pc, on="videopath", suffixes=("_sa", "_pc"))
+
+# Joint Score: SA>=4 AND PC>=4 的比例
+joint = ((merged["score_sa"] >= 4) & (merged["score_pc"] >= 4)).mean() * 100
+print(f"Joint Score (SA>=4 & PC>=4): {joint:.1f}%")
+print(f"Mean SA: {merged['score_sa'].mean():.2f}")
+print(f"Mean PC: {merged['score_pc'].mean():.2f}")
+print(f"Total videos evaluated: {len(merged)}")
+```
+
+## 6. 预期结果与对比
+
+VIDEOPHY2 Leaderboard（Human Evaluation）：
+
+| Model | Joint Score (All) | Joint Score (Hard) |
+|-------|-------------------|-------------------|
+| **Wan2.1-T2V-14B** | **32.6%** | **21.9%** |
+| CogVideoX-5B | 25.0% | 0% |
+| Cosmos-Diffusion-7B | 24.1% | 10.9% |
+| OpenAI Sora | 23.3% | 5.3% |
+
+Wan2.2 是 Wan2.1 的升级版，理论上表现应该 ≥ 32.6%。AutoEval 的分数与 Human Eval 可能有偏差，但趋势应一致。
+
+## 7. 注意事项
+
+1. **视频格式**: Wan2.2 输出 MP4，VIDEOPHY2 评估器也接受 MP4，无需转换
+2. **分辨率**: TI2V-5B 只支持 `1280*704` / `704*1280`；T2V-A14B 支持 `1280*720` / `720*1280` / `832*480` / `480*832`
+3. **Prompt 长度**: VIDEOPHY2 的 prompt 平均 138 tokens，Wan2.2 的 T5 encoder 支持 512 tokens，不会截断
+4. **评估模型依赖**: VIDEOPHY2 AutoEval 基于 mPLUG-Owl-Video，需要 `peft`、`transformers` 和 `llama tokenizer`
+5. **批量生成时间**: 600 个 prompt × 每个约 2-5 分钟 ≈ 20-50 小时（单 GPU），两路并行约 10-25 小时
+6. **可以先跑一小批**: `python run_videophy.py --start 0 --end 5` 先测试流程
