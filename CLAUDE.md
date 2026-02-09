@@ -6,9 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 always firstly `conda activate wan` before run any command.
 
-### 
-
 don't write redundant code in markdown, keep it concise.
+
+## Model Weights
+
+All model weights are stored at `./models/`:
+
+- **`models/Wan2.2-T2V-A14B/`** — T2V 14B (MoE, high/low noise experts, Wan2.1 VAE)
+- **`models/Wan2.2-I2V-A14B/`** — I2V 14B (MoE, high/low noise experts, Wan2.1 VAE)
+- **`models/Wan2.2-TI2V-5B/`** — TI2V 5B (single model, Wan2.2 VAE)
+
+Each directory contains its own T5 weights (`models_t5_umt5-xxl-enc-bf16.pth`) and VAE checkpoint. Use `--ckpt_dir ./models/Wan2.2-<task>` to specify.
 
 
 ## Architecture

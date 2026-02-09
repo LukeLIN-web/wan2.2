@@ -217,18 +217,91 @@ print(f"Mean PC: {merged['score_pc'].mean():.2f}")
 print(f"Total videos evaluated: {len(merged)}")
 ```
 
-## 6. 预期结果与对比
+## 6. 实测结果与对比
 
-VIDEOPHY2 Leaderboard（Human Evaluation）：
+### Wan2.2-TI2V-5B AutoEval 结果（2026-02-08）
+
+| 指标 | All (600) | Hard (180) | Easy (420) |
+|------|-----------|------------|------------|
+| Mean SA | 3.18 | — | — |
+| Mean PC | 3.61 | — | — |
+| **Joint Score** | **26.3%** | **8.3%** | **34.0%** |
+
+### VIDEOPHY2 Leaderboard 对比（Human Evaluation）
 
 | Model | Joint Score (All) | Joint Score (Hard) |
 |-------|-------------------|-------------------|
 | **Wan2.1-T2V-14B** | **32.6%** | **21.9%** |
+| **Wan2.2-TI2V-5B (ours, AutoEval)** | **26.3%** | **8.3%** |
 | CogVideoX-5B | 25.0% | 0% |
 | Cosmos-Diffusion-7B | 24.1% | 10.9% |
 | OpenAI Sora | 23.3% | 5.3% |
 
-Wan2.2 是 Wan2.1 的升级版，理论上表现应该 ≥ 32.6%。AutoEval 的分数与 Human Eval 可能有偏差，但趋势应一致。
+- AutoEval 分数与 Human Eval 可能有偏差，但趋势一致
+- 5B 模型超过 CogVideoX-5B 和 Sora，但低于 14B 版本
+- Hard subset 得分 8.3% 相对较低，物理常识难题仍是短板
+
+### 失败原因分析
+
+#### 失分分布
+
+| 失败类型 | 数量 | 占比 | 说明 |
+|----------|------|------|------|
+| SA<4 且 PC<4 | 229 | 38.2% | 语义和物理都不行 |
+| 仅 SA<4（PC>=4）| 181 | 30.2% | **语义不匹配是主要瓶颈** |
+| 仅 PC<4（SA>=4）| 32 | 5.3% | 物理常识单独失分较少 |
+| Joint 通过 | 158 | 26.3% | — |
+
+**核心发现：SA（语义匹配）是最大瓶颈**，68.3% 的 prompt SA<4，而 PC<4 只有 43.5%。模型经常生成视觉合理但语义不匹配的视频。
+
+#### Hard vs Easy
+
+| 子集 | SA 失败率 | PC 失败率 | Joint |
+|------|-----------|-----------|-------|
+| Easy (420) | 59.5% | 38.6% | 34.0% |
+| Hard (180) | 88.9% | 55.0% | 8.3% |
+
+Hard subset 的 SA 失败率高达 88.9%，说明模型难以理解和生成复杂/罕见场景。
+
+#### 按类别
+
+- **Object Interactions**：Joint=31.4%，SA=3.24，PC=3.75（相对较好）
+- **Sports and Physical Activities**：Joint=24.2%，SA=3.16，PC=3.56（较差）
+
+#### 最差的动作类别（Joint=0%，共 108 个 action）
+
+典型失败模式：
+
+1. **球类/拍类运动**：badminton (SA=2.0)、volleyball (SA=2.3)、tennis (SA=2.5)、squash (SA=2.3)、polo (SA=2.3)、field hockey (SA=2.3)、ping pong、kickball、cricket — 模型无法准确生成运动场景细节（球拍、球网、击球动作）
+
+2. **投掷类运动**：javelin throw、discus throw、throwing axe、throwing knife、drop kicking — 需要精确的抛物线轨迹和物体旋转，模型难以捕捉
+
+3. **罕见/专业活动**：pole vault、bobsledding、parasailing、spinning poi、nunchucks、pizzatossing、tightrope walking — 训练数据中此类场景稀少
+
+4. **碰撞/连锁反应**：`something colliding with something`、`poking a stack so it collapses` — 需要多物体交互的物理推理
+
+5. **精细操作**：playing darts、billiards、threading needle、opening bottle — 需要手部精细动作和小物体交互
+
+#### 最好的动作类别（Joint=100%，共 20 个 action）
+
+成功模式都是**简单、常见的日常场景**：
+- wading through water/mud、walking through snow（步行类）
+- smoking、mopping floor、clay pottery making（日常动作）
+- poking a hole、burying something、using a paint roller（简单物理交互）
+- tying bow tie、tying knot、twisting something（手部常规操作）
+
+#### SA<=2 的极差案例（102 个）
+
+高频出现：球类运动（basketball、baseball、badminton × 3）、投掷运动（javelin × 3、discus × 2）、drop kicking × 3、playing polo × 2。这些 prompt 通常要求特定的运动姿势、球的轨迹、或器材细节，模型倾向于生成模糊或错误的运动场景。
+
+#### 总结
+
+| 失败原因 | 影响程度 | 说明 |
+|----------|----------|------|
+| 语义理解不足（SA） | **最高** | 模型不理解 prompt 中的具体动作、器材、运动规则 |
+| 运动/稀有场景 | 高 | 球类运动、专业体育几乎全军覆没 |
+| 精细物体交互 | 中 | 小物体、精细手部动作难以生成 |
+| 物理常识（PC） | 较低 | 仅 5.3% 的 prompt 是纯物理失分 |
 
 ## 7. 注意事项
 

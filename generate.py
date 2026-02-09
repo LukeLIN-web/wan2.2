@@ -318,6 +318,16 @@ def _parse_args():
         type=str,
         default=None,
         help="Device for VLM model (e.g., 'cuda:1'). If not set, uses same device as main model.")
+    parser.add_argument(
+        "--use_simple_v2v",
+        type=str2bool,
+        default=False,
+        help="Use simplified v2v without VLM (reads prompt from file).")
+    parser.add_argument(
+        "--prompt_file",
+        type=str,
+        default=None,
+        help="Path to prompt file for simple v2v mode.")
     args = parser.parse_args()
     _validate_args(args)
 
@@ -539,10 +549,17 @@ def generate(args):
         )
     elif "v2v" in args.task:
         args.prompt = "continue video"
-        if args.task == "v2v-5B":
-            logging.info("Creating WanV2V5B pipeline (5B model).")
-            from wan.wan22video2video5B import WanV2V5B
-            wan_v2v = WanV2V5B(
+
+        # Use simple v2v without VLM
+        if args.use_simple_v2v:
+            if args.task == "v2v-5B":
+                logging.error("Simple v2v is only supported for v2v-14B (A14B model).")
+                raise NotImplementedError("Simple v2v for 5B model not implemented yet.")
+
+            assert args.prompt_file is not None, "Please specify --prompt_file when using --use_simple_v2v"
+            logging.info("Creating WanV2VSimple pipeline (14B model, no VLM).")
+            from wan.wan21video2video_simple import WanV2VSimple
+            wan_v2v = WanV2VSimple(
                 config=cfg,
                 checkpoint_dir=args.ckpt_dir,
                 device_id=device,
@@ -552,35 +569,63 @@ def generate(args):
                 use_sp=(args.ulysses_size > 1),
                 t5_cpu=args.t5_cpu,
                 convert_model_dtype=args.convert_model_dtype,
-                vlm_device=args.vlm_device,
             )
+            logging.info(f"Generating video from {args.video} with prompt from {args.prompt_file}...")
+            video, args.prompt = wan_v2v.v2v(
+                video_path=args.video,
+                prompt_file=args.prompt_file,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
         else:
-            logging.info("Creating WanV2V pipeline (14B model).")
-            from wan.video2video import WanV2V
-            wan_v2v = WanV2V(
-                config=cfg,
-                checkpoint_dir=args.ckpt_dir,
-                device_id=device,
-                rank=rank,
-                t5_fsdp=args.t5_fsdp,
-                dit_fsdp=args.dit_fsdp,
-                use_sp=(args.ulysses_size > 1),
-                t5_cpu=args.t5_cpu,
-                convert_model_dtype=args.convert_model_dtype,
-                vlm_device=args.vlm_device,
-            )
-        logging.info(f"Generating video from {args.video} ...")
-        video, args.prompt = wan_v2v.v2v(
-            video_path=args.video,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model,
-            custom_prompt=args.prompt if args.prompt else None)
+            # Original v2v with VLM
+            if args.task == "v2v-5B":
+                logging.info("Creating WanV2V5B pipeline (5B model).")
+                from wan.wan22video2video5B import WanV2V5B
+                wan_v2v = WanV2V5B(
+                    config=cfg,
+                    checkpoint_dir=args.ckpt_dir,
+                    device_id=device,
+                    rank=rank,
+                    t5_fsdp=args.t5_fsdp,
+                    dit_fsdp=args.dit_fsdp,
+                    use_sp=(args.ulysses_size > 1),
+                    t5_cpu=args.t5_cpu,
+                    convert_model_dtype=args.convert_model_dtype,
+                    vlm_device=args.vlm_device,
+                )
+            else:
+                logging.info("Creating WanV2V pipeline (14B model).")
+                from wan.wan21video2video import WanV2V
+                wan_v2v = WanV2V(
+                    config=cfg,
+                    checkpoint_dir=args.ckpt_dir,
+                    device_id=device,
+                    rank=rank,
+                    t5_fsdp=args.t5_fsdp,
+                    dit_fsdp=args.dit_fsdp,
+                    use_sp=(args.ulysses_size > 1),
+                    t5_cpu=args.t5_cpu,
+                    convert_model_dtype=args.convert_model_dtype,
+                    vlm_device=args.vlm_device,
+                )
+            logging.info(f"Generating video from {args.video} ...")
+            video, args.prompt = wan_v2v.v2v(
+                video_path=args.video,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model,
+                custom_prompt=args.prompt if args.prompt else None)
         print(args.prompt)
     else:
         logging.info("Creating WanI2V pipeline.")

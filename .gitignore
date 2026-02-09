@@ -17,3 +17,5 @@ scripts/
 videophy_outputs*
 videophy_outputs_14b*
 videophy_data*
+models/
+*.csv
