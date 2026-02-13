@@ -10,14 +10,6 @@
 | LLM 推理 + 视频描述 | GPT-4 + Tarsier-34B (两个模型) | **Qwen3-VL-8B-Instruct (一个模型)** |
 | 视频评估 | videocon-physics | VIDEOPHY2 AutoEval (1-5 分) |
 
-## 模型选择踩坑记录
-
-| 模型 | 结果 |
-|------|------|
-| `Qwen3-VL-30B-A3B-Thinking` | **不可用** — transformers 5.2.0.dev0 加载 MoE expert 权重维度 mismatch（ckpt `[128, 768, 2048]` vs model `[128, 2048, 768]`），疑似 transformers 主分支 regression |
-| `Qwen3-VL-8B-Thinking` | 可用但**极慢** — Thinking 模型每次回复先生成大量思考 token，`max_new_tokens=1024` 不够输出 JSON 结果，需要 4096+ |
-| **`Qwen3-VL-8B-Instruct`** | **推荐** — 直接输出结果，~10s/条，Phase 1 提取物理定律 JSON 解析成功率高 |
-
 **transformers 版本要求**：
 - Qwen3-VL: `pip install git+https://github.com/huggingface/transformers`（需 5.2.0.dev0+）
 - VIDEOPHY2 AutoEval (mplug-owl): 需要 `transformers==4.44.0`，与 Qwen3-VL 冲突
