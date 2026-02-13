@@ -19,3 +19,4 @@ videophy_outputs_14b*
 videophy_data*
 models/
 *.csv
+*.json
