@@ -241,6 +241,43 @@ print(f"Total videos evaluated: {len(merged)}")
 - 5B 模型超过 CogVideoX-5B 和 Sora，但低于 14B 版本
 - Hard subset 得分 8.3% 相对较低，物理常识难题仍是短板
 
+### Wan2.2-TI2V-5B VideoCon-Physics 结果（2026-02-13）
+
+评估模型：`videocon-physics`（entailment 概率 0~1），评估 600 个视频。
+
+| 指标 | All (600) | Hard (180) | Easy (420) |
+|------|-----------|------------|------------|
+| Mean SA | 0.3888 | 0.2817 | 0.4347 |
+| Mean PC | 0.1840 | 0.1406 | 0.2026 |
+| Combined | 0.2864 | 0.2112 | 0.3187 |
+
+按类别：
+
+| 类别 | 数量 | SA | PC |
+|------|------|-----|-----|
+| Sports and Physical Activities | 422 | 0.3834 | 0.1675 |
+| Object Interactions | 159 | 0.4047 | 0.2278 |
+
+### VideoCon-Physics 对比（同评估模型，0~1）
+
+PhyT2V 论文 Round 1 = 原始模型直接生成，Round 4 = PhyT2V 迭代优化后。
+
+| Model | SA | PC | 备注 |
+|-------|-----|-----|------|
+| **Wan2.2-TI2V-5B (ours)** | **0.39** | **0.18** | Round 1，无 PhyT2V |
+| CogVideoX-5B | 0.48 | 0.26 | Round 1 |
+| CogVideoX-5B + PhyT2V | 0.59 | 0.42 | Round 4 |
+| VideoCrafter | 0.24 | 0.15 | Round 1 |
+| VideoCrafter + PhyT2V | 0.49 | 0.33 | Round 4 |
+| OpenSora | 0.29 | 0.17 | Round 1 |
+| OpenSora + PhyT2V | 0.47 | 0.31 | Round 4 |
+| CogVideoX-2B | 0.22 | 0.13 | Round 1 |
+| CogVideoX-2B + PhyT2V | 0.42 | 0.29 | Round 4 |
+
+- Wan2.2-TI2V-5B 的 PC=0.18 与 OpenSora Round 1（0.17）持平，但 SA=0.39 低于 CogVideoX-5B（0.48）
+- PhyT2V 迭代优化能显著提升 SA 和 PC（CogVideoX-5B: SA +0.11, PC +0.16）
+- Wan2.2 若加上 PhyT2V 优化，预期可达 SA~0.50, PC~0.30 左右
+
 ### 失败原因分析
 
 #### 失分分布
