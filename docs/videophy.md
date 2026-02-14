@@ -219,7 +219,7 @@ print(f"Total videos evaluated: {len(merged)}")
 
 ## 6. 实测结果与对比
 
-### Wan2.2-TI2V-5B AutoEval 结果（2026-02-08）
+### Baseline: Wan2.2-TI2V-5B 直接生成（2026-02-08）
 
 | 指标 | All (600) | Hard (180) | Easy (420) |
 |------|-----------|------------|------------|
@@ -227,19 +227,52 @@ print(f"Total videos evaluated: {len(merged)}")
 | Mean PC | 3.61 | — | — |
 | **Joint Score** | **26.3%** | **8.3%** | **34.0%** |
 
+### PhyT2V: Wan2.2-TI2V-5B + Qwen3-VL prompt 优化（2026-02-13）
+
+使用 PhyT2V pipeline（物理定律提取 → round1 视频 caption → mismatch 分析 → 增强 prompt → round2 生成），仅评估了 360/600 个视频（GPU 4/5 OOM 导致 240 个未生成）。
+
+| 指标 | PhyT2V (360) | Baseline (360, 同子集) | Delta |
+|------|-------------|----------------------|-------|
+| Mean SA | 3.106 | 3.142 | **-0.036** |
+| Mean PC | 3.631 | 3.642 | **-0.011** |
+| **Joint** | **22.8%** | **24.2%** | **-1.4%** |
+
+Hard/Easy 分布（PhyT2V, 360 个视频中 111 hard / 249 easy）：
+
+| 子集 | SA | PC | Joint |
+|------|-----|-----|-------|
+| Hard (111) | 2.676 | 3.360 | **2.7%** |
+| Easy (249) | 3.297 | 3.751 | **31.7%** |
+
+逐样本变化（同 360 个 prompt 对比）：
+
+| | SA | PC | Joint |
+|---|---|---|---|
+| 改善 | 40 | 62 | +22 |
+| 不变 | 267 | 234 | — |
+| 退化 | 53 | 64 | -27 |
+
+**结论：PhyT2V prompt 优化未带来提升，反而略有退化。** 可能原因：
+1. **仅 1 轮迭代**：PhyT2V 论文中 CogVideoX-5B 在 Round 4 才有显著提升（SA: 0.48→0.59），Round 1→2 改进有限
+2. **TI2V 当 T2V 用**：round2 生成用了 TI2V-5B 但 `img=None`（无图像输入），可能不如直接 T2V 效果
+3. **增强 prompt 可能过长/过细**：Qwen3-VL 生成的增强 prompt 可能引入噪声，SA 退化多于改善（53 退化 vs 40 改善）
+4. **缺失 240 个样本**：未评估的样本可能影响整体趋势
+
 ### VIDEOPHY2 Leaderboard 对比（Human Evaluation）
 
 | Model | Joint Score (All) | Joint Score (Hard) |
 |-------|-------------------|-------------------|
 | **Wan2.1-T2V-14B** | **32.6%** | **21.9%** |
-| **Wan2.2-TI2V-5B (ours, AutoEval)** | **26.3%** | **8.3%** |
+| **Wan2.2-TI2V-5B (ours, Baseline)** | **26.3%** | **8.3%** |
+| Wan2.2-TI2V-5B + PhyT2V (ours) | 22.8%* | 2.7%* |
 | CogVideoX-5B | 25.0% | 0% |
 | Cosmos-Diffusion-7B | 24.1% | 10.9% |
 | OpenAI Sora | 23.3% | 5.3% |
 
-- AutoEval 分数与 Human Eval 可能有偏差，但趋势一致
-- 5B 模型超过 CogVideoX-5B 和 Sora，但低于 14B 版本
-- Hard subset 得分 8.3% 相对较低，物理常识难题仍是短板
+*仅 360/600 个视频
+
+- Baseline 已超过 CogVideoX-5B 和 Sora，但低于 14B 版本
+- PhyT2V 单轮优化未改善结果，需要多轮迭代或调整策略
 
 ### Wan2.2-TI2V-5B VideoCon-Physics 结果（2026-02-13）
 
