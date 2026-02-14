@@ -10,6 +10,15 @@ don't write redundant code in markdown, keep it concise.
 
 Don't delete anything in `docs/`.
 
+## 经验教训沉淀
+
+每次遇到问题或完成重要改动后，要在[PROGRESS.md](./PROGRESS.md) 中记录:
+- 遇到了什么问题如何解决的以后如何避免
+**必须附上 git commit ID**
+
+**同样的问题不要犯两次!**
+
+
 ## Model Weights
 
 All model weights are stored at `./models/`:

@@ -20,3 +20,5 @@ videophy_data*
 models/
 *.csv
 *.json
+.claude/*
+!.claude/settings.json
