@@ -10,6 +10,8 @@ don't write redundant code in markdown, keep it concise.
 
 Don't delete anything in `docs/`.
 
+每次完成任务后，`git add` 改动的文件并 `git commit`。
+
 ## 经验教训沉淀
 
 每次遇到问题或完成重要改动后，要在[PROGRESS.md](./PROGRESS.md) 中记录:
