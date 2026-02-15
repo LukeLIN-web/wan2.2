@@ -16,9 +16,9 @@ from pathlib import Path
 PORT = 8080
 # 视频目录
 VIDEO_DIRS = [
-    # "/home/user1/workspace/juyi/Wan2.2",
-    "/home/user1/workspace/juyi/Wan2.2/generatedvideo",
-    "/home/user1/workspace/juyi/Wan2.2/v2v"
+    # ".",
+    "./generatedvideo",
+    "./v2v"
 ]
 
 def get_video_files():

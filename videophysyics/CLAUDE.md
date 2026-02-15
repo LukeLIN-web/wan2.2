@@ -50,7 +50,7 @@ Tasks: `sa` (semantic adherence, 1-5), `pc` (physical commonsense, 1-5), `rule` 
 
 ```bash
 conda activate videophy
-cd /shared/user72/workspace/juyi/Wan2.2
+cd "$(git rev-parse --show-toplevel)"
 
 python -m myphyt2v.eval_videocon \
   --video_dir ./videophysyics/videophy_outputs \

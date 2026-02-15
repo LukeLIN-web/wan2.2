@@ -91,7 +91,7 @@ python download_videophy2.py
 
 ```bash
 conda activate wan
-cd /shared/user72/workspace/juyi/Wan2.2
+cd "$(git rev-parse --show-toplevel)"
 
 # 双 GPU 并行（单进程，内部多线程）
 python run_videophy.py --gpus 0,1
@@ -112,7 +112,7 @@ Leaderboard 上的 Wan2.1-14B 就是这个架构，结果更可比。
 
 ```bash
 conda activate wan
-cd /shared/user72/workspace/juyi/Wan2.2
+cd "$(git rev-parse --show-toplevel)"
 
 # GPU 0 和 1 各跑一半
 CUDA_VISIBLE_DEVICES=0 python run_videophy_14b.py --start 0 --end 300 &
@@ -139,7 +139,7 @@ CUDA_VISIBLE_DEVICES=1 python run_videophy_14b.py --start 0 --end 5
 ### 下载 AutoEval 模型
 
 ```bash
-cd /shared/user72/workspace/juyi/Wan2.2/videophy/
+cd videophy/
 git lfs install
 git clone https://huggingface.co/videophysics/videophy_2_auto
 ```
@@ -180,7 +180,7 @@ with open("eval_sa_pc.csv", "w", newline="") as f:
 ### 运行评估
 
 ```bash
-cd /shared/user72/workspace/juyi/Wan2.2/videophy/VIDEOPHY2
+cd videophy/VIDEOPHY2
 
 # 语义匹配度评估
 CUDA_VISIBLE_DEVICES=0 python inference.py \

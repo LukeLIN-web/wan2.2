@@ -52,7 +52,7 @@ flowchart LR
 
 ### v2v-14B (原有)
 
-#### [video2video.py](file:///home/user1/workspace/juyi/Wan2.2/wan/video2video.py)
+#### [video2video.py](../wan/video2video.py)
 
 - ✅ 新增导入: `decord`, `transformers`, `numpy`
 - ✅ `__init__` 添加 `vlm_path`, `vlm_device` 参数
@@ -68,7 +68,7 @@ flowchart LR
 
 ### v2v-5B (新增)
 
-#### [wan22video2video5B.py](file:///home/user1/workspace/juyi/Wan2.2/wan/wan22video2video5B.py) [NEW]
+#### [wan22video2video5B.py](../wan/wan22video2video5B.py) [NEW]
 
 基于 TI2V-5B 架构的 Video-to-Video 实现:
 
@@ -93,7 +93,7 @@ self.vae = Wan2_2_VAE(...)
 
 ---
 
-### [generate.py](file:///home/user1/workspace/juyi/Wan2.2/generate.py)
+### [generate.py](../generate.py)
 
 - ✅ 添加 `v2v-14B` 到 `EXAMPLE_PROMPT`
 - ✅ 添加 `v2v-5B` 到 `EXAMPLE_PROMPT`
@@ -105,7 +105,7 @@ self.vae = Wan2_2_VAE(...)
 
 ---
 
-### [configs/__init__.py](file:///home/user1/workspace/juyi/Wan2.2/wan/configs/__init__.py)
+### [configs/__init__.py](../wan/configs/__init__.py)
 
 - ✅ 添加 `v2v_14B` 配置 (复用 `i2v_A14B`)
 - ✅ 添加 `v2v_5B` 配置 (复用 `ti2v_5B`)

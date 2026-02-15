@@ -10,7 +10,7 @@ don't write redundant code in markdown, keep it concise.
 
 Don't delete anything in `docs/`.
 
-每次完成任务后，`git add` 改动的文件并 `git commit`。
+每次完成任务后，`git add` 改动的文件并 `git commit`。 不要提交有名字的绝对路径, 改成相对路径. 
 
 ## 经验教训沉淀
 

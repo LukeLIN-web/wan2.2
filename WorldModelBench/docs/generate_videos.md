@@ -3,7 +3,7 @@
 ## 运行命令
 
 ```bash
-cd /shared/user72/workspace/juyi/Wan2.2
+cd "$(git rev-parse --show-toplevel)"
 conda activate wan
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 WorldModelBench/generate_videos.py
 ```
