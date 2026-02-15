@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -320,30 +321,80 @@ def phase_eval(video_dir, args, round_num):
     eval_dir = os.path.join(args.output_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
 
-    save_name = os.path.join(eval_dir, f"eval_round{round_num}")
+    save_name = os.path.abspath(os.path.join(eval_dir, f"eval_round{round_num}"))
     result_file = f"{save_name}_cot.json" if args.cot else f"{save_name}.json"
 
     if os.path.exists(result_file):
-        log.info("Round %d eval already exists: %s, skipping", round_num, result_file)
+        log.info("Round %d eval already exists, loading...", round_num)
+        _print_eval_summary(result_file, round_num)
         return
 
     log.info("=" * 60)
     log.info("VILA evaluation for round %d on %s", round_num, video_dir)
 
-    eval_script = str(BENCH_DIR / "evaluation.py")
+    judge_path = os.path.abspath(args.judge_path)
+    video_dir_abs = os.path.abspath(video_dir)
     cot_flag = "--cot" if args.cot else ""
+
+    # evaluation.py loads ./worldmodelbench.json from CWD → must run from BENCH_DIR
     cmd = (
         f"CUDA_VISIBLE_DEVICES={args.eval_gpu} "
-        f"conda run --no-banner -n vila python {eval_script} "
-        f"--judge {args.judge_path} "
-        f"--video_dir {os.path.abspath(video_dir)} "
+        f"conda run --no-banner -n vila python evaluation.py "
+        f"--judge {judge_path} "
+        f"--video_dir {video_dir_abs} "
         f"--model_name Wan2.2-TI2V-5B-round{round_num} "
-        f"--save_name {os.path.abspath(save_name)} {cot_flag}"
+        f"--save_name {save_name} {cot_flag}"
     )
     log.info("Running: %s", cmd)
-    ret = os.system(cmd)
-    if ret != 0:
-        log.error("Evaluation failed with exit code %d", ret)
+    ret = subprocess.run(cmd, shell=True, cwd=str(BENCH_DIR))
+    if ret.returncode != 0:
+        log.error("Evaluation failed with exit code %d", ret.returncode)
+        return
+
+    _print_eval_summary(result_file, round_num)
+
+
+def _print_eval_summary(result_file, round_num):
+    """Parse eval JSON and log score summary."""
+    if not os.path.exists(result_file):
+        return
+    import numpy as np
+    with open(result_file) as f:
+        results = json.load(f)
+    accs = results.get("accs", {})
+    num_vids = len(results.get("preds", {}))
+
+    log.info("─── Round %d Eval Summary (%d videos) ───", round_num, num_vids)
+    total = 0.0
+
+    if "instruction" in accs:
+        score = float(np.mean(accs["instruction"]))
+        log.info("  Instruction Following: %.2f / 3", score)
+        total += score
+
+    if "physical_laws" in accs:
+        pl = accs["physical_laws"]
+        names = ["Newton", "Mass", "Fluid", "Penetration", "Gravity"]
+        pl_total = 0.0
+        for j, name in enumerate(names):
+            sub = float(np.mean([pl[k] for k in range(j, len(pl), 5)]))
+            log.info("  Physics / %-12s: %.2f", name, sub)
+            pl_total += sub
+        log.info("  Physics Overall: %.2f / 5", pl_total)
+        total += pl_total
+
+    if "common_sense" in accs:
+        cs = accs["common_sense"]
+        cs_names = ["Framewise", "Temporal"]
+        cs_total = 0.0
+        for j, name in enumerate(cs_names):
+            sub = float(np.mean([cs[k] for k in range(j, len(cs), 2)]))
+            log.info("  Common Sense / %-8s: %.2f", name, sub)
+            cs_total += sub
+        log.info("  Common Sense Overall: %.2f / 2", cs_total)
+        total += cs_total
+
+    log.info("  TOTAL: %.2f / 10", total)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────
@@ -363,14 +414,13 @@ def parse_args():
     p.add_argument("--limit", type=int, default=0, help="Limit to first N instances (0 = all)")
     # Directories
     p.add_argument("--output_dir", default=str(BENCH_DIR / "iterative_outputs"))
-    p.add_argument("--round1_dir", default="", help="Reuse existing videos as round 1")
     # Qwen3-VL
     p.add_argument("--qwen_model", default=str(WAN_ROOT / "models" / "Qwen3-VL-8B-Instruct"))
     p.add_argument("--qwen_device", default="cuda:0")
     # Wan 2.2
     p.add_argument("--wan_ckpt", default=str(WAN_ROOT / "models" / "Wan2.2-TI2V-5B"))
     p.add_argument("--wan_gpus", default="1,2,3,4,5")
-    p.add_argument("--size", default="1280*704")
+    p.add_argument("--size", default="704*1280")
     p.add_argument("--frame_num", type=int, default=81)
     p.add_argument("--seed", type=int, default=42)
     # Eval
@@ -410,30 +460,24 @@ def main():
         log.info("===== ROUND %d / %d =====", r, total_rounds)
 
         # ── Generate ──
+        video_dir = os.path.join(args.output_dir, f"round{r}_videos")
         steps = get_steps_for_round(r, total_rounds, args.min_steps, args.max_steps)
+        enhanced_data = None
+        if r > 1:
+            enhanced_data = load_json(os.path.join(ckpt_dir, f"enhanced_r{r - 1}.json"))
+        log.info("Generating round %d with %d steps", r, steps)
 
-        if r == 1 and args.round1_dir:
-            video_dir = args.round1_dir
-            log.info("Reusing existing round 1 videos from %s", video_dir)
-        else:
-            video_dir = os.path.join(args.output_dir, f"round{r}_videos")
-            enhanced_data = None
-            if r > 1:
-                enh_path = os.path.join(ckpt_dir, f"enhanced_r{r - 1}.json")
-                enhanced_data = load_json(enh_path)
-            log.info("Generating round %d with %d steps", r, steps)
+        if shared_gpu:
+            log.info("Unloading Qwen3-VL for generation")
+            reasoner.unload()
+            reasoner = None
+            torch.cuda.empty_cache()
 
-            if shared_gpu:
-                log.info("Unloading Qwen3-VL for generation")
-                reasoner.unload()
-                reasoner = None
-                torch.cuda.empty_cache()
+        phase_generate(instances, enhanced_data, video_dir, args, steps)
 
-            phase_generate(instances, enhanced_data, video_dir, args, steps)
-
-            if shared_gpu and r < total_rounds:
-                log.info("Reloading Qwen3-VL")
-                reasoner = Qwen3VLReasoner(model_path=args.qwen_model, device=args.qwen_device)
+        if shared_gpu and r < total_rounds:
+            log.info("Reloading Qwen3-VL")
+            reasoner = Qwen3VLReasoner(model_path=args.qwen_model, device=args.qwen_device)
 
         # ── Evaluate ──
         phase_eval(video_dir, args, round_num=r)
