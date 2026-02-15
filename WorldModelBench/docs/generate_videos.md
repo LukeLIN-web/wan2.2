@@ -39,3 +39,26 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 WorldModelBench/generate_vi
 - **总耗时**: ~8.5h（2026-02-14 12:25 → 20:49）
 - **单视频耗时**: ~1.5 min（50 steps × 1.44s/step + VAE decode）
 - **GPU**: 0, 1
+
+## 评测结果（CoT）
+
+| 维度 | 分项 | 分数 |
+|---|---|---|
+| Instruction Following | Overall | 2.23 / 3 |
+| Physical Laws | Newton | 1.00 |
+| | Mass | 0.81 |
+| | Fluid | 0.99 |
+| | Penetration | 0.87 |
+| | Gravity | 1.00 |
+| | Overall | 4.67 / 5 |
+| Common Sense | Framewise | 0.89 |
+| | Temporal | 0.87 |
+| | Overall | 1.76 / 2 |
+| **Total** | | **8.65 / 10** |
+
+## 踩坑记录
+
+1. **shell 脚本中 `conda activate` 失败**: 非交互式 shell 需先 `source /home/user1/miniconda3/etc/profile.d/conda.sh`
+2. **评测环境缺依赖**: `vila` env 需安装 `rich` 和 `mmengine`，且 numpy 必须保持 `1.26.4`（`pip install rich mmengine numpy==1.26.4`）
+3. **VILA import `ps3` 报错**: `builder.py` 无条件 import `ps3_encoder`，但 judge 模型不需要。已改为 `try/except` lazy import
+4. **评测 GPU OOM**: 评测默认用 GPU 0，如果被占用会 OOM。必须用 `CUDA_VISIBLE_DEVICES` 指定空闲 GPU
