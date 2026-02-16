@@ -216,7 +216,9 @@ def main():
     parser.add_argument("--save_name", type=str, default="worldmodelbench_results", help="Path to save evaluation results")
     parser.add_argument("--cot", action="store_true", help="Enable Chain-of-Thought output")
     parser.add_argument("--no-save", action="store_true", help="Disable saving results")
-    
+    parser.add_argument("--start", type=int, default=0, help="Start index (for parallel sharding)")
+    parser.add_argument("--end", type=int, default=0, help="End index (0 = all)")
+
     args = parser.parse_args()
     
     # Setup logging with custom Rich handler
@@ -235,7 +237,11 @@ def main():
     # Load validation set with status message
     printer.console.print("[bold]Loading validation set...[/bold]")
     validation_set = load("./worldmodelbench.json")
-    
+    if args.end > 0:
+        validation_set = validation_set[args.start:args.end]
+    elif args.start > 0:
+        validation_set = validation_set[args.start:]
+
     # Check for existing results
     save_path = f"{args.save_name}_cot.json" if args.cot else f"{args.save_name}.json"
     if os.path.exists(save_path):

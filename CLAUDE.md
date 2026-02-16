@@ -8,6 +8,9 @@ always firstly `conda activate wan` before run any command.
 
 don't write redundant code in markdown, keep it concise.
 
+生成output比如视频，log都 应该带时间戳。 
+
+
 Don't delete anything in `docs/`.
 
 每次完成任务后，`git add` 改动的文件并 `git commit`。 不要提交有名字的绝对路径, 改成相对路径. 

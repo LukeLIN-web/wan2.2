@@ -8,6 +8,8 @@ WorldModelBench evaluates video generation models as world models. It uses a VIL
 
 不要提交有名字的绝对路径, 改成相对路径. 
 
+生成output比如视频，log都 应该带时间戳。 
+
 ## 经验教训沉淀
 
 每次遇到问题或完成重要改动后，要在[PROGRESS.md](./PROGRESS.md) 中记录:
