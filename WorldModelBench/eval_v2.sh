@@ -13,7 +13,7 @@ NUM_GPUS=8
 PER_GPU=$(( (TOTAL + NUM_GPUS - 1) / NUM_GPUS ))
 JUDGE="vila-ewm-qwen2-1.5b"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN_DIR="eval_v2_${TIMESTAMP}"
+RUN_DIR="evaloutputs/eval_v2_${TIMESTAMP}"
 mkdir -p "$RUN_DIR"
 
 echo "Run dir: $RUN_DIR"
