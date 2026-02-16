@@ -149,7 +149,7 @@ class ResultsPrinter:
     def __init__(self):
         self.console = Console()
 
-    def print_results(self, accs: Dict[str, list], num_videos: int) -> float:
+    def print_results(self, accs: Dict[str, list], num_videos: int) -> Dict[str, float]:
         sub_names = {
             EvaluationType.PHYSICAL_LAWS.value: ["Newton", "Mass", "Fluid", "Penetration", "Gravity"],
             EvaluationType.COMMON_SENSE.value: ["Aesthetics", "Temporal"],
@@ -161,42 +161,59 @@ class ResultsPrinter:
         table.add_column("Mean", justify="right", style="yellow")
         table.add_column("/ Max", justify="right", style="dim")
 
-        raw_total = 0.0
+        dim_scores = {}  # per-dimension raw scores
 
         for eval_type in EvaluationType:
+            dim_name = eval_type.value.replace("_", " ").title()
             scores = accs[eval_type.value]
+
             if eval_type.value in sub_names:
                 names = sub_names[eval_type.value]
                 num_sub = len(names)
+                dim_max = num_sub * MAX_SCORE_PER_QUESTION
                 dim_sum = 0.0
                 for i, name in enumerate(names):
                     sub_mean = np.mean(scores[i::num_sub])
                     dim_sum += sub_mean
+                    dim_scores[f"{dim_name}/{name}"] = sub_mean
                     table.add_row(
-                        eval_type.value.replace("_", " ").title() if i == 0 else "",
+                        dim_name if i == 0 else "",
                         name, f"{sub_mean:.2f}", f"/ {MAX_SCORE_PER_QUESTION}",
                     )
                 table.add_row("", "[bold]Subtotal[/bold]", f"[bold]{dim_sum:.2f}[/bold]",
-                              f"/ {num_sub * MAX_SCORE_PER_QUESTION}")
-                raw_total += dim_sum
+                              f"/ {dim_max}")
+                dim_scores[dim_name] = dim_sum
             else:
                 mean = np.mean(scores)
-                table.add_row(
-                    eval_type.value.replace("_", " ").title(),
-                    "Overall", f"{mean:.2f}", f"/ {MAX_SCORE_PER_QUESTION}",
-                )
-                raw_total += mean
+                dim_scores[dim_name] = mean
+                table.add_row(dim_name, "", f"{mean:.2f}", f"/ {MAX_SCORE_PER_QUESTION}")
 
         self.console.print(table)
 
-        normalized = raw_total / TOTAL_RAW_MAX * NORMALIZED_MAX
-        panel = Panel(
-            f"[bold]Raw: {raw_total:.2f} / {TOTAL_RAW_MAX}[/bold]\n"
-            f"[bold green]Normalized: {normalized:.2f} / {NORMALIZED_MAX:.1f}[/bold green]",
-            title="Total Score", border_style="green",
+        # Per-dimension summary
+        raw_total = sum(dim_scores[k] for k in ["Instruction", "Physical Laws", "Common Sense"])
+        summary_table = Table(title="Per-Dimension Summary", show_header=True, header_style="bold magenta")
+        summary_table.add_column("Dimension", style="cyan")
+        summary_table.add_column("Score", justify="right", style="yellow")
+        summary_table.add_column("Max", justify="right", style="dim")
+        summary_table.add_column("Pct", justify="right", style="green")
+
+        dim_max_map = {"Instruction": 5, "Physical Laws": 25, "Common Sense": 10}
+        for dim, max_val in dim_max_map.items():
+            val = dim_scores[dim]
+            summary_table.add_row(dim, f"{val:.2f}", str(max_val), f"{val / max_val * 100:.1f}%")
+        summary_table.add_row(
+            "[bold]Total[/bold]", f"[bold]{raw_total:.2f}[/bold]", f"[bold]{TOTAL_RAW_MAX}[/bold]",
+            f"[bold]{raw_total / TOTAL_RAW_MAX * 100:.1f}%[/bold]",
         )
-        self.console.print(panel)
-        return normalized
+        normalized = raw_total / TOTAL_RAW_MAX * NORMALIZED_MAX
+        summary_table.add_row(
+            "[bold green]Normalized[/bold green]", f"[bold green]{normalized:.2f}[/bold green]",
+            f"[bold green]{NORMALIZED_MAX:.0f}[/bold green]", "",
+        )
+        self.console.print(summary_table)
+
+        return dim_scores
 
 
 # --- Evaluator ---
