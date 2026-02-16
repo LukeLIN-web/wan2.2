@@ -1,14 +1,12 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 import logging
 import os
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-# from rich.progress import track
-# from rich import print as rprint
 from rich.progress import Progress, BarColumn, TimeRemainingColumn
 import numpy as np
 from mmengine import load, dump
@@ -23,7 +21,6 @@ class EvaluationType(Enum):
 
 
 def get_default_prompt_templates() -> Dict[str, str]:
-    """Factory function for default prompt templates."""
     return {
         EvaluationType.INSTRUCTION.value: """
             Evaluate if this video follows the instruction: '{instruction}'.
@@ -50,7 +47,6 @@ def get_default_prompt_templates() -> Dict[str, str]:
 
 
 def get_default_question_pool() -> Dict[str, Optional[List[str]]]:
-    """Factory function for default question pool."""
     return {
         EvaluationType.INSTRUCTION.value: None,
         EvaluationType.PHYSICAL_LAWS.value: [
@@ -69,28 +65,22 @@ def get_default_question_pool() -> Dict[str, Optional[List[str]]]:
 
 @dataclass
 class EvaluationConfig:
-    """Configuration for evaluation prompts and scoring criteria."""
     PROMPT_TEMPLATES: Dict[str, str] = field(default_factory=get_default_prompt_templates)
     QUESTION_POOL: Dict[str, Optional[List[str]]] = field(default_factory=get_default_question_pool)
 
 
 class ResultsPrinter:
-    """Handles formatted output of evaluation results."""
-    
     def __init__(self):
         self.console = Console()
         
     def print_header(self, text: str):
-        """Print a styled header."""
         self.console.print(f"\n[bold blue]{text}[/bold blue]")
-        
+
     def print_score(self, category: str, score: float, indent: int = 0):
-        """Print a score with proper formatting."""
         indent_str = " " * indent
         self.console.print(f"{indent_str}[cyan]{category}:[/cyan] [yellow]{score:.2f}[/yellow]")
-        
+
     def create_results_table(self, category: str, scores: Dict[str, float]) -> Table:
-        """Create a rich table for displaying results."""
         table = Table(title=f"{category} Results", show_header=True, header_style="bold magenta")
         table.add_column("Metric", style="cyan")
         table.add_column("Score", justify="right", style="yellow")
@@ -101,7 +91,6 @@ class ResultsPrinter:
         return table
         
     def print_summary_panel(self, total_score: float, num_categories: int):
-        """Print a panel with summary information."""
         panel = Panel(
             f"[bold green]Total Score: {total_score:.2f}[/bold green]\n",
             # f"[blue]Average per category: {total_score/num_categories:.2f}[/blue]",
@@ -112,8 +101,6 @@ class ResultsPrinter:
 
 
 class WorldModelEvaluator:
-    """Evaluates world model benchmark videos using VILA model."""
-    
     def __init__(self, judge_path: str, video_dir: str, config: EvaluationConfig):
         self.judge = self._load_judge(judge_path)
         self.video_dir = Path(video_dir)
@@ -123,12 +110,10 @@ class WorldModelEvaluator:
 
     @staticmethod
     def _load_judge(judge_path: str):
-        """Load the VILA judge model."""
         import llava
         return llava.load(judge_path)
 
     def _load_video(self, video_name: str) -> Optional['llava.Video']:
-        """Load a video file for evaluation."""
         video_path = self.video_dir / f"{video_name}.mp4"
         if not video_path.exists():
             self.logger.warning(f"Video not found: {video_path}")
@@ -137,7 +122,6 @@ class WorldModelEvaluator:
         return llava.Video(str(video_path))
 
     def evaluate_video(self, video: 'llava.Video', prompt: str, cot: bool = True) -> str:
-        """Generate evaluation content for a video."""
         if not cot:
             prompt = prompt.replace(
                 "Let's think step-by-step and conclude with", "Answer with"
@@ -188,12 +172,11 @@ class WorldModelEvaluator:
 
 
 def save_results(results: Dict, save_path: str):
-    """Save evaluation results to a file."""
     dump(results, save_path, indent=4)
     Console().print(f"[green]Results saved to: {save_path}[/green]")
 
+
 class RichLogHandler(logging.Handler):
-    """Custom logging handler that uses Rich for formatting."""
     def __init__(self):
         super().__init__()
         self.console = Console()
@@ -205,6 +188,7 @@ class RichLogHandler(logging.Handler):
             self.console.print(f"[{style}]{msg}[/{style}]")
         except Exception:
             self.handleError(record)
+
 
 def main():
     import argparse
@@ -220,21 +204,14 @@ def main():
     parser.add_argument("--end", type=int, default=0, help="End index (0 = all)")
 
     args = parser.parse_args()
-    
-    # Setup logging with custom Rich handler
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        handlers=[RichLogHandler()]
-    )
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[RichLogHandler()])
     logger = logging.getLogger(__name__)
 
-    # Initialize evaluator
     config = EvaluationConfig()
     evaluator = WorldModelEvaluator(args.judge, args.video_dir, config)
     printer = ResultsPrinter()
-    
-    # Load validation set with status message
+
     printer.console.print("[bold]Loading validation set...[/bold]")
     validation_set = load("./worldmodelbench.json")
     if args.end > 0:
@@ -242,21 +219,16 @@ def main():
     elif args.start > 0:
         validation_set = validation_set[args.start:]
 
-    # Check for existing results
     save_path = f"{args.save_name}_cot.json" if args.cot else f"{args.save_name}.json"
     if os.path.exists(save_path):
         printer.console.print("[bold yellow]Loading existing results...[/bold yellow]")
         results = load(save_path)
-        try:
-            preds, accs = results["preds"], results["accs"]
-        except KeyError:
-            raise KeyError("Expected keys not found in results file")
+        preds, accs = results["preds"], results["accs"]
     else:
         printer.console.print("[bold green]Starting new evaluation...[/bold green]")
         preds = {}
         accs = defaultdict(list)
         
-        # Create a single progress instance for all operations
         with Progress(
             "[progress.description]{task.description}",
             BarColumn(),
@@ -264,17 +236,15 @@ def main():
             TimeRemainingColumn(),
             console=printer.console
         ) as progress:
-            # Main task for video processing
             video_task = progress.add_task("Processing videos", total=len(validation_set))
 
-            for vid, v_i in tqdm(enumerate(validation_set), total=len(validation_set)):
+            for v_i in tqdm(validation_set, total=len(validation_set)):
                 video_name = Path(v_i["first_frame"]).stem
                 video = evaluator._load_video(video_name)
                 if not video:
                     progress.advance(video_task)
                     continue
                 
-                # Evaluation task
                 eval_task = progress.add_task(
                     f"Evaluating {video_name}",
                     total=len(EvaluationType)
@@ -287,22 +257,18 @@ def main():
                     
                     if questions:
                         accs_i = []
-                        # Questions task
                         question_task = progress.add_task(
                             f"Processing {eval_type.value} questions",
                             total=len(questions)
                         )
-                        
+
                         for question in questions:
-                            format_kwargs = {
-                                f"{eval_type.value}": question.lower()
-                            }
-                            prompt = prompt_template.format(**format_kwargs)
+                            prompt = prompt_template.format(**{eval_type.value: question.lower()})
                             pred = evaluator.evaluate_video(video, prompt, args.cot)
                             preds_i.append(pred)
                             accs_i.append("no" in pred.lower())
                             progress.advance(question_task)
-                            
+
                         progress.remove_task(question_task)
                         accs[eval_type.value].extend(accs_i)
                     else:
@@ -315,25 +281,20 @@ def main():
                             logger.warning(f"Could not parse score from prediction: {pred}")
                             score = 0
                         accs[eval_type.value].append(score)
-                    
-                    if video_name not in preds:
-                        preds[video_name] = {}
-                    preds[video_name][eval_type.value] = preds_i
+
+                    preds.setdefault(video_name, {})[eval_type.value] = preds_i
                     progress.advance(eval_task)
                 
                 progress.remove_task(eval_task)
                 progress.advance(video_task)
 
-        # Save results if requested
         if not args.no_save:
             results = {"model_name": args.model_name, "preds": preds, "accs": accs}
             save_results(results, save_path)
 
-    # Process and display results
     printer.console.print("\n[bold]Final Evaluation Results[/bold]")
     total_score = evaluator.process_results(preds, accs)
 
 
 if __name__ == "__main__":
     main()
-

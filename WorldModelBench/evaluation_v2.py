@@ -15,7 +15,6 @@ import re
 
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
 from rich.progress import Progress, BarColumn, TimeRemainingColumn
 import numpy as np
 from mmengine import load, dump
@@ -141,6 +140,21 @@ def parse_score(pred: str) -> float:
         if 0 <= val <= MAX_SCORE_PER_QUESTION:
             return val
     return 0.0
+
+
+def _build_prompts(eval_type: EvaluationType, config: 'EvaluationConfig', video_item: dict) -> list[str]:
+    """Build the list of prompts for a given evaluation type and video."""
+    template = config.PROMPT_TEMPLATES.get(eval_type.value)
+    questions = config.QUESTION_POOL[eval_type.value]
+
+    if eval_type == EvaluationType.INSTRUCTION:
+        return [template.format(instruction=video_item["text_instruction"])]
+    if eval_type == EvaluationType.PHYSICAL_LAWS:
+        return [template.format(physical_laws=q.lower()) for q in questions]
+    if eval_type == EvaluationType.COMMON_SENSE:
+        # Each question is already a full prompt
+        return list(questions)
+    return []
 
 
 # --- Results Display ---
@@ -277,7 +291,6 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[RichLogHandler()])
-    logger = logging.getLogger(__name__)
 
     config = EvaluationConfig()
     evaluator = WorldModelEvaluator(args.judge, args.video_dir, config)
@@ -319,31 +332,12 @@ def main():
                 eval_task = progress.add_task(f"Evaluating {video_name}", total=len(EvaluationType))
 
                 for eval_type in EvaluationType:
+                    prompts = _build_prompts(eval_type, config, v_i)
                     preds_i = []
-                    template = config.PROMPT_TEMPLATES.get(eval_type.value)
-                    questions = config.QUESTION_POOL[eval_type.value]
-
-                    if eval_type == EvaluationType.INSTRUCTION:
-                        # Single question, use template directly
-                        prompt = template.format(instruction=v_i["text_instruction"])
+                    for prompt in prompts:
                         pred = evaluator.evaluate_video(video, prompt, args.cot)
                         preds_i.append(pred)
                         accs[eval_type.value].append(parse_score(pred))
-
-                    elif eval_type == EvaluationType.PHYSICAL_LAWS:
-                        # 5 sub-questions, each scored 0-5
-                        for question in questions:
-                            prompt = template.format(physical_laws=question.lower())
-                            pred = evaluator.evaluate_video(video, prompt, args.cot)
-                            preds_i.append(pred)
-                            accs[eval_type.value].append(parse_score(pred))
-
-                    elif eval_type == EvaluationType.COMMON_SENSE:
-                        # Each question IS a full prompt (aesthetics / temporal)
-                        for full_prompt in questions:
-                            pred = evaluator.evaluate_video(video, full_prompt, args.cot)
-                            preds_i.append(pred)
-                            accs[eval_type.value].append(parse_score(pred))
 
                     preds.setdefault(video_name, {})[eval_type.value] = preds_i
                     progress.advance(eval_task)
@@ -351,7 +345,7 @@ def main():
                 progress.remove_task(eval_task)
                 progress.advance(video_task)
 
-        if not getattr(args, "no_save", False):
+        if not args.no_save:
             results = {"model_name": args.model_name, "version": "v2", "preds": preds, "accs": accs}
             dump(results, save_path, indent=4)
             console.print(f"[green]Results saved to: {save_path}[/green]")
