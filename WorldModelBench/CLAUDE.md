@@ -10,6 +10,16 @@ WorldModelBench evaluates video generation models as world models. It uses a VIL
 
 生成output比如视频，log都 应该带时间戳。 
 
+
+eval 之前 用 vila 环境
+
+Install the necessary Python packages in the environment.
+```
+./environment_setup.sh vila
+```
+
+
+
 ## 经验教训沉淀
 
 每次遇到问题或完成重要改动后，要在[PROGRESS.md](./PROGRESS.md) 中记录:

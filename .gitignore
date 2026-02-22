@@ -21,6 +21,7 @@ models/
 *.csv
 *.json
 .claude/*
+wandb/
 !.claude/settings.json
 WorldModelBench/outputs/*
 WorldModelBench/vila-ewm-qwen2-1.5b/
