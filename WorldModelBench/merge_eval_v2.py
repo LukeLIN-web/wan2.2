@@ -2,9 +2,10 @@
 """Merge per-GPU v2 evaluation shards into a single results file."""
 import argparse
 import json
-import numpy as np
 from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
 
 
 def main():
@@ -53,13 +54,12 @@ def main():
         num_subs = len(sub_names)
         sub_means = []
         for j, name in enumerate(sub_names):
-            sub = [values[k] for k in range(j, len(values), num_subs)]
-            m = float(np.mean(sub))
+            m = float(np.mean(values[j::num_subs]))
             scores[f"{prefix}_{name.lower()}"] = m
             sub_means.append(m)
         scores[dim_key] = float(np.mean(sub_means))
 
-    # Overall = weighted mean (1 instr + 5 physics + 2 cs = 8 judgments per video)
+    # Overall = flat mean across all judgments (1 instr + 5 physics + 2 cs per video)
     all_vals = (
         merged_accs.get("instruction", [])
         + merged_accs.get("physical_laws", [])

@@ -1,16 +1,17 @@
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 import logging
 import os
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, BarColumn, TimeRemainingColumn
+
 import numpy as np
 from mmengine import load, dump
-from collections import defaultdict
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, BarColumn, TimeRemainingColumn
+from rich.table import Table
 from tqdm import tqdm
 
 
@@ -90,12 +91,11 @@ class ResultsPrinter:
             
         return table
         
-    def print_summary_panel(self, total_score: float, num_categories: int):
+    def print_summary_panel(self, total_score: float):
         panel = Panel(
             f"[bold green]Total Score: {total_score:.2f}[/bold green]\n",
-            # f"[blue]Average per category: {total_score/num_categories:.2f}[/blue]",
             title="Evaluation Summary",
-            border_style="green"
+            border_style="green",
         )
         self.console.print(panel)
 
@@ -130,44 +130,43 @@ class WorldModelEvaluator:
             )
         return self.judge.generate_content([video, prompt])
 
+    # Sub-category names for multi-question dimensions
+    SUB_CATEGORIES = {
+        "physical_laws": ("newton", "mass", "fluid", "penetration", "gravity"),
+        "common_sense": ("framewise", "temporal"),
+    }
+
     def process_results(self, preds: Dict, accs: defaultdict) -> float:
         """Process and print evaluation results with rich formatting."""
         num_insts = len(preds)
-        total_score = 0
-        
-        category_mapping = {
-            2: [("framewise", "temporal")],
-            5: [("newton", "mass", "fluid", "penetration", "gravity")]
-        }
+        total_score = 0.0
 
         for category, scores in accs.items():
             self.printer.print_header(f"{category.replace('_', ' ').title()} Details")
             num_sub = len(scores) // num_insts
-            
+
             if num_sub == 1:
                 overall = np.mean(scores)
                 self.printer.print_score("Overall", overall)
                 total_score += overall
-            elif num_sub in category_mapping:
+            elif category in self.SUB_CATEGORIES:
+                sub_names = self.SUB_CATEGORIES[category]
                 sub_scores = {}
-                for i, sub in enumerate(category_mapping[num_sub][0]):
-                    sub_mean = np.mean(scores[i::num_sub])
-                    sub_scores[sub.title()] = sub_mean
-                
-                # Create and display results table
+                for i, name in enumerate(sub_names):
+                    sub_scores[name.title()] = np.mean(scores[i::num_sub])
+
                 table = self.printer.create_results_table(
-                    category.replace('_', ' ').title(),
-                    sub_scores
+                    category.replace('_', ' ').title(), sub_scores
                 )
                 self.printer.console.print(table)
-                
-                overall = np.sum(list(sub_scores.values()))
+
+                overall = sum(sub_scores.values())
                 self.printer.print_score("Overall", overall, indent=2)
                 total_score += overall
             else:
-                raise ValueError(f"Unexpected number of subcategories: {num_sub}")
+                raise ValueError(f"Unexpected category: {category}")
 
-        self.printer.print_summary_panel(total_score, len(accs))
+        self.printer.print_summary_panel(total_score)
         return total_score
 
 
@@ -210,9 +209,9 @@ def main():
 
     config = EvaluationConfig()
     evaluator = WorldModelEvaluator(args.judge, args.video_dir, config)
-    printer = ResultsPrinter()
+    console = evaluator.printer.console
 
-    printer.console.print("[bold]Loading validation set...[/bold]")
+    console.print("[bold]Loading validation set...[/bold]")
     validation_set = load("./worldmodelbench.json")
     if args.end > 0:
         validation_set = validation_set[args.start:args.end]
@@ -221,11 +220,11 @@ def main():
 
     save_path = f"{args.save_name}_cot.json" if args.cot else f"{args.save_name}.json"
     if os.path.exists(save_path):
-        printer.console.print("[bold yellow]Loading existing results...[/bold yellow]")
+        console.print("[bold yellow]Loading existing results...[/bold yellow]")
         results = load(save_path)
         preds, accs = results["preds"], results["accs"]
     else:
-        printer.console.print("[bold green]Starting new evaluation...[/bold green]")
+        console.print("[bold green]Starting new evaluation...[/bold green]")
         preds = {}
         accs = defaultdict(list)
         
@@ -234,7 +233,7 @@ def main():
             BarColumn(),
             "[progress.percentage]{task.percentage:>3.0f}%",
             TimeRemainingColumn(),
-            console=printer.console
+            console=console
         ) as progress:
             video_task = progress.add_task("Processing videos", total=len(validation_set))
 
@@ -292,7 +291,7 @@ def main():
             results = {"model_name": args.model_name, "preds": preds, "accs": accs}
             save_results(results, save_path)
 
-    printer.console.print("\n[bold]Final Evaluation Results[/bold]")
+    console.print("\n[bold]Final Evaluation Results[/bold]")
     total_score = evaluator.process_results(preds, accs)
 
 

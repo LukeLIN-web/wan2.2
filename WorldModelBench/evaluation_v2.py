@@ -5,6 +5,7 @@ Changes from v1:
 - Total raw score: 40 (1×5 + 5×5 + 2×5), normalized to 10-point scale
 - Compatible with v1 judge models (VILA) and stronger VLMs
 """
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -13,12 +14,11 @@ import logging
 import os
 import re
 
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, BarColumn, TimeRemainingColumn
 import numpy as np
 from mmengine import load, dump
-from collections import defaultdict
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TimeRemainingColumn
+from rich.table import Table
 from tqdm import tqdm
 
 
@@ -160,31 +160,31 @@ def _build_prompts(eval_type: EvaluationType, config: 'EvaluationConfig', video_
 # --- Results Display ---
 
 class ResultsPrinter:
+    # Sub-category names for multi-question dimensions
+    SUB_NAMES = {
+        EvaluationType.PHYSICAL_LAWS.value: ["Newton", "Mass", "Fluid", "Penetration", "Gravity"],
+        EvaluationType.COMMON_SENSE.value: ["Aesthetics", "Temporal"],
+    }
+
     def __init__(self):
         self.console = Console()
 
     def print_results(self, accs: Dict[str, list], num_videos: int) -> Dict[str, float]:
-        sub_names = {
-            EvaluationType.PHYSICAL_LAWS.value: ["Newton", "Mass", "Fluid", "Penetration", "Gravity"],
-            EvaluationType.COMMON_SENSE.value: ["Aesthetics", "Temporal"],
-        }
-
         table = Table(title="Evaluation Results (0-5 scale)", show_header=True, header_style="bold magenta")
         table.add_column("Dimension", style="cyan")
         table.add_column("Sub-category", style="cyan")
         table.add_column("Mean", justify="right", style="yellow")
         table.add_column("/ Max", justify="right", style="dim")
 
-        dim_scores = {}  # per-dimension raw scores
+        dim_scores = {}
 
         for eval_type in EvaluationType:
             dim_name = eval_type.value.replace("_", " ").title()
             scores = accs[eval_type.value]
 
-            if eval_type.value in sub_names:
-                names = sub_names[eval_type.value]
+            if eval_type.value in self.SUB_NAMES:
+                names = self.SUB_NAMES[eval_type.value]
                 num_sub = len(names)
-                dim_max = num_sub * MAX_SCORE_PER_QUESTION
                 dim_sum = 0.0
                 for i, name in enumerate(names):
                     sub_mean = np.mean(scores[i::num_sub])
@@ -195,7 +195,7 @@ class ResultsPrinter:
                         name, f"{sub_mean:.2f}", f"/ {MAX_SCORE_PER_QUESTION}",
                     )
                 table.add_row("", "[bold]Subtotal[/bold]", f"[bold]{dim_sum:.2f}[/bold]",
-                              f"/ {dim_max}")
+                              f"/ {num_sub * MAX_SCORE_PER_QUESTION}")
                 dim_scores[dim_name] = dim_sum
             else:
                 mean = np.mean(scores)
@@ -203,31 +203,37 @@ class ResultsPrinter:
                 table.add_row(dim_name, "", f"{mean:.2f}", f"/ {MAX_SCORE_PER_QUESTION}")
 
         self.console.print(table)
+        self._print_summary(dim_scores)
+        return dim_scores
 
-        # Per-dimension summary
+    def _print_summary(self, dim_scores: Dict[str, float]):
+        """Print per-dimension summary table with totals and normalized score."""
         raw_total = sum(dim_scores[k] for k in ["Instruction", "Physical Laws", "Common Sense"])
-        summary_table = Table(title="Per-Dimension Summary", show_header=True, header_style="bold magenta")
-        summary_table.add_column("Dimension", style="cyan")
-        summary_table.add_column("Score", justify="right", style="yellow")
-        summary_table.add_column("Max", justify="right", style="dim")
-        summary_table.add_column("Pct", justify="right", style="green")
 
-        dim_max_map = {"Instruction": 5, "Physical Laws": 25, "Common Sense": 10}
-        for dim, max_val in dim_max_map.items():
-            val = dim_scores[dim]
-            summary_table.add_row(dim, f"{val:.2f}", str(max_val), f"{val / max_val * 100:.1f}%")
-        summary_table.add_row(
+        summary = Table(title="Per-Dimension Summary", show_header=True, header_style="bold magenta")
+        summary.add_column("Dimension", style="cyan")
+        summary.add_column("Score", justify="right", style="yellow")
+        summary.add_column("Max", justify="right", style="dim")
+        summary.add_column("Pct", justify="right", style="green")
+
+        # Derive max per dimension from SUB_NAMES (1 question if no subs, N if subs)
+        for eval_type in EvaluationType:
+            dim_name = eval_type.value.replace("_", " ").title()
+            num_questions = len(self.SUB_NAMES.get(eval_type.value, [None]))
+            max_val = num_questions * MAX_SCORE_PER_QUESTION
+            val = dim_scores[dim_name]
+            summary.add_row(dim_name, f"{val:.2f}", str(max_val), f"{val / max_val * 100:.1f}%")
+
+        summary.add_row(
             "[bold]Total[/bold]", f"[bold]{raw_total:.2f}[/bold]", f"[bold]{TOTAL_RAW_MAX}[/bold]",
             f"[bold]{raw_total / TOTAL_RAW_MAX * 100:.1f}%[/bold]",
         )
         normalized = raw_total / TOTAL_RAW_MAX * NORMALIZED_MAX
-        summary_table.add_row(
+        summary.add_row(
             "[bold green]Normalized[/bold green]", f"[bold green]{normalized:.2f}[/bold green]",
             f"[bold green]{NORMALIZED_MAX:.0f}[/bold green]", "",
         )
-        self.console.print(summary_table)
-
-        return dim_scores
+        self.console.print(summary)
 
 
 # --- Evaluator ---
