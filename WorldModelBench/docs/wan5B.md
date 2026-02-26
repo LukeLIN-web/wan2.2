@@ -40,7 +40,10 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 WorldModelBench/generate_vi
 - **单视频耗时**: ~1.5 min（50 steps × 1.44s/step + VAE decode）
 - **GPU**: 0, 1
 
-## 评测结果（CoT）
+## 评测结果（CoT，官方 v1 评分 max 10）
+
+> **注意**: 官方 v1 评分满分 10（Instruction 0-3 + Physics 5×binary + CommonSense 2×binary），区分度太小。
+> 后续 DPO 对比实验统一使用 **v2 评分（0-5 Likert × 8 questions，满分 40）**，详见 VideoDPO 实验记录。
 
 | 维度 | 分项 | 分数 |
 |---|---|---|
@@ -84,6 +87,18 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 WorldModelBench/generate_vi
 - Common Sense Frame 0.89 — 明显低于闭源 (0.96-0.99)，但仍为开源最高
 
 **注意**: 论文中 Physics 子维度名称有差异（Human 表用 "Mass"，Model Judger 表用 "Deform."），此处按 wan5B 评测输出使用 "Mass"。
+
+## 评测结果（v2 评分，0-5 Likert，max 40）
+
+来源: `evaloutputs/eval_v2_20260216_024105` (Wan2.2-TI2V-5B-r3-350, 350 videos)
+
+| 维度 | 平均分 | 满分 |
+|---|---:|---:|
+| Instruction Following | 2.43 | /5 |
+| Physical Laws (5 questions) | 6.17 | /25 |
+| Aesthetics | 2.80 | /5 |
+| Temporal Consistency | 2.46 | /5 |
+| **Total** | **13.85** | **/40** |
 
 ## 踩坑记录
 

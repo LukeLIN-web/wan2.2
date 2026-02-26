@@ -85,11 +85,6 @@ If your research or project builds upon [**Wan2.1**](https://github.com/Wan-Vide
 ## Run Wan2.2
 
 #### Installation
-Clone the repo:
-```sh
-git clone https://github.com/Wan-Video/Wan2.2.git
-cd Wan2.2
-```
 
 Install dependencies:
 ```sh
