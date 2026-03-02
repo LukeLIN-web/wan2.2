@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 WorldModelBench/generate_vi
 - **单视频耗时**: ~1.5 min（50 steps × 1.44s/step + VAE decode）
 - **GPU**: 0, 1
 
-## 评测结果（CoT，官方 v1 评分 max 10）
+## 评测结果（官方 v1 评分 max 10）
 
 > **注意**: 官方 v1 评分满分 10（Instruction 0-3 + Physics 5×binary + CommonSense 2×binary），区分度太小。
 > 后续 DPO 对比实验统一使用 **v2 评分（0-5 Likert × 8 questions，满分 40）**，详见 VideoDPO 实验记录。
@@ -59,32 +59,35 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 WorldModelBench/generate_vi
 | | Overall | 1.76 / 2 |
 | **Total** | | **8.65 / 10** |
 
-### 与论文 Model Judger 排名对比
+### 与论文 Human Annotations (Table 3) 排名对比
+
+*注: Wan2.2 的分数为我们自己跑的自动评测分数（非人类评测），其余基线为论文 Table 3 的人类评测分数。*
 
 | 排名 | 模型 | 类型 | Instr. | Frame | Temp. | Newton | Mass | Fluid | Penetr. | Grav. | Total |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | KLING | closed | 2.32 | 0.99 | 0.97 | 1.00 | 0.90 | 1.00 | 0.93 | 0.99 | 9.10 |
-| 2 | Minimax | closed | 2.28 | 0.99 | 0.93 | 1.00 | 0.86 | 0.99 | 0.88 | 0.99 | 8.92 |
-| 3 | Mochi-official | closed | 2.00 | 0.97 | 0.89 | 1.00 | 0.88 | 1.00 | 0.93 | 0.99 | 8.66 |
-| **4** | **Wan2.2-TI2V-5B** | **open** | **2.23** | **0.89** | **0.87** | **1.00** | **0.81** | **0.99** | **0.87** | **1.00** | **8.65** |
-| 5 | Runway | closed | 2.17 | 0.99 | 0.87 | 1.00 | 0.77 | 0.98 | 0.89 | 0.96 | 8.64 |
-| 6 | Luma | closed | 1.98 | 0.96 | 0.81 | 1.00 | 0.70 | 0.98 | 0.87 | 0.95 | 8.24 |
-| 7 | OpenSoraPlan-T2V | open | 1.72 | 0.83 | 0.85 | 1.00 | 0.77 | 0.99 | 0.91 | 0.98 | 8.04 |
-| 8 | Mochi | open | 2.06 | 0.78 | 0.68 | 0.99 | 0.63 | 0.99 | 0.79 | 0.98 | 7.91 |
-| 9 | CogVideoX-T2V | open | 2.03 | 0.75 | 0.60 | 0.99 | 0.58 | 0.99 | 0.73 | 0.98 | 7.65 |
+| 1 | KLING | closed | 2.36 | 0.94 | 0.92 | 0.93 | 0.88 | 0.96 | 0.89 | 0.93 | 8.82 |
+| **2** | **Wan2.2-TI2V-5B** | **open** | **2.23** | **0.89** | **0.87** | **1.00** | **0.81** | **0.99** | **0.87** | **1.00** | **8.65** |
+| 3 | Minimax | closed | 2.29 | 0.91 | 0.88 | 0.93 | 0.81 | 0.96 | 0.86 | 0.94 | 8.59 |
+| 4 | Mochi-official | closed | 2.01 | 0.89 | 0.83 | 0.94 | 0.82 | 0.99 | 0.92 | 0.98 | 8.37 |
+| 5 | Runway | closed | 2.15 | 0.87 | 0.78 | 0.91 | 0.69 | 0.94 | 0.82 | 0.91 | 8.08 |
+| 6 | Luma | closed | 2.01 | 0.81 | 0.76 | 0.89 | 0.62 | 0.95 | 0.77 | 0.90 | 7.72 |
+| 7 | Mochi | open | 2.22 | 0.63 | 0.63 | 0.94 | 0.58 | 0.97 | 0.71 | 0.94 | 7.62 |
+| 8 | OpenSoraPlan-T2V | open | 1.79 | 0.70 | 0.77 | 0.90 | 0.66 | 0.97 | 0.89 | 0.93 | 7.61 |
+| 9 | CogVideoX-T2V | open | 2.11 | 0.60 | 0.51 | 0.91 | 0.52 | 0.96 | 0.74 | 0.95 | 7.31 |
 
 ### 分析
 
-**总分**: 8.65，全场第 4、**开源第 1**，仅次 KLING/Minimax/Mochi-official，与 Mochi-official 仅差 0.01，超越 Runway (closed)。比此前最佳开源 OpenSoraPlan-T2V (8.04) 高 **+0.61**。
+**总分**: 8.65，全场第 2、**开源第 1**，仅次于 KLING (8.82)，超越 Minimax (8.59) 和 Mochi-official (8.37)。比此前最佳开源模型 Mochi (7.62) 高 **+1.03**。
 
 **强项**:
 - Newton 1.00、Gravity 1.00 — 并列全场最高
-- Instruction Following 2.23 — 开源最高，超越 Mochi-official (2.00)、Runway (2.17)
-- Fluid 0.99 — 持平开源最佳
+- Fluid 0.99 — 并列全场最高（与 Mochi-official 持平）
+- Instruction Following 2.23 — 开源最高，超越 Mochi (2.22)、Runway (2.15)
+- Common Sense Temp 0.87 — 开源明显第一，逼近闭源前二（0.88-0.92）
 
 **弱项**:
-- Penetration 0.87 — 低于 OpenSoraPlan (0.91)、闭源模型 (0.88-0.93)
-- Common Sense Frame 0.89 — 明显低于闭源 (0.96-0.99)，但仍为开源最高
+- Penetration 0.87 — 低于 KLING (0.89)、OpenSoraPlan (0.89) 等
+- Mass 0.81 — 并列第四，略低于 KLING (0.88)、Mochi-official (0.82)
 
 **注意**: 论文中 Physics 子维度名称有差异（Human 表用 "Mass"，Model Judger 表用 "Deform."），此处按 wan5B 评测输出使用 "Mass"。
 

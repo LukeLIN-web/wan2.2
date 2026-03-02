@@ -13,3 +13,4 @@ ftfy
 dashscope
 imageio-ffmpeg
 numpy>=1.23.5,<2
+einops==0.8.2
