@@ -172,6 +172,7 @@ class WanTI2V:
                  n_prompt="",
                  seed=-1,
                  offload_model=True,
+                 state_embedding=None,
                  intershot_kv_cache=None,
                  intershot_layers=None,
                  cache_strip_rope=False):
@@ -203,6 +204,8 @@ class WanTI2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            state_embedding (Tensor, optional):
+                State embedding tokens [B, K, dim] from StateEmbedder
             intershot_kv_cache (dict, optional):
                 KV cache from previous shot for inter-shot attention
             intershot_layers (set, optional):
@@ -228,6 +231,7 @@ class WanTI2V:
                 n_prompt=n_prompt,
                 seed=seed,
                 offload_model=offload_model,
+                state_embedding=state_embedding,
                 intershot_kv_cache=intershot_kv_cache,
                 intershot_layers=intershot_layers,
                 cache_strip_rope=cache_strip_rope)
@@ -366,6 +370,8 @@ class WanTI2V:
             mask1, mask2 = masks_like(noise, zero=False)
 
             arg_c = {'context': context, 'seq_len': seq_len}
+            if state_embedding is not None:
+                arg_c['state_embedding'] = state_embedding
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
             if offload_model or self.init_on_cpu:
@@ -430,6 +436,7 @@ class WanTI2V:
             n_prompt="",
             seed=-1,
             offload_model=True,
+            state_embedding=None,
             intershot_kv_cache=None,
             intershot_layers=None,
             cache_strip_rope=False):
@@ -460,6 +467,8 @@ class WanTI2V:
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            state_embedding (Tensor, optional):
+                State embedding tokens [B, K, dim] from StateEmbedder
             intershot_kv_cache (dict, optional):
                 KV cache from previous shot for inter-shot attention
             intershot_layers (set, optional):
@@ -567,6 +576,8 @@ class WanTI2V:
                 'context': [context[0]],
                 'seq_len': seq_len,
             }
+            if state_embedding is not None:
+                arg_c['state_embedding'] = state_embedding
 
             arg_null = {
                 'context': context_null,

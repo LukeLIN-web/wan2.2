@@ -469,6 +469,7 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
+        state_embedding=None,
         intershot_kv_cache=None,
         cache_kv=False,
         cache_frame_indices=None,
@@ -489,6 +490,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            state_embedding (Tensor, *optional*):
+                State embedding tokens from StateEmbedder, shape [B, K, dim].
+                Concatenated to text context for cross-attention conditioning.
             intershot_kv_cache (dict, optional):
                 {layer_idx: (K, V)} from previous shot
             cache_kv (bool):
@@ -546,6 +550,10 @@ class WanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+
+        # inject state embedding (cross-attn conditioning)
+        if state_embedding is not None:
+            context = torch.cat([context, state_embedding], dim=1)
 
         # arguments
         kwargs = dict(
