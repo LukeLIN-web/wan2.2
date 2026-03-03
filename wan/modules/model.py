@@ -123,13 +123,19 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs,
+                prev_kv=None, cache_kv=False, cache_frame_indices=None,
+                cache_strip_rope=False):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            prev_kv(tuple, optional): (K, V) from previous shot, each [B, L_cache, N, D]
+            cache_kv(bool): Whether to extract KV for caching
+            cache_frame_indices(list, optional): Temporal frame indices to cache
+            cache_strip_rope(bool): If True, cache K without RoPE (Plan B)
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -142,17 +148,55 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        q_rope = rope_apply(q, grid_sizes, freqs)
+        k_rope = rope_apply(k, grid_sizes, freqs)
+
+        # Extract frame KV for inter-shot caching
+        # Plan A (cache_strip_rope=False): cache K with RoPE
+        # Plan B (cache_strip_rope=True): cache K without RoPE (semantic-only)
+        cached_kv_out = None
+        if cache_kv and cache_frame_indices is not None:
+            cache_k_source = k if cache_strip_rope else k_rope
+            cached_kv_out = self._extract_frame_kv(
+                cache_k_source, v, grid_sizes, cache_frame_indices)
+
+        # Inject previous shot's KV cache
+        actual_k = k_rope
+        actual_v = v
+        actual_k_lens = seq_lens
+
+        if prev_kv is not None:
+            prev_k, prev_v = prev_kv
+            actual_k = torch.cat([prev_k, k_rope], dim=1)
+            actual_v = torch.cat([prev_v, v], dim=1)
+            actual_k_lens = seq_lens + prev_k.size(1)
+
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
+            q=q_rope,
+            k=actual_k,
+            v=actual_v,
+            k_lens=actual_k_lens,
             window_size=self.window_size)
 
         # output
         x = x.flatten(2)
         x = self.o(x)
-        return x
+        return x, cached_kv_out
+
+    def _extract_frame_kv(self, k, v, grid_sizes, frame_indices):
+        """Extract KV tokens for specific temporal frames."""
+        results_k, results_v = [], []
+        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+            hw = int(h * w)
+            indices = []
+            for fi in frame_indices:
+                if fi < f:
+                    start = int(fi * hw)
+                    indices.extend(range(start, start + hw))
+            idx_t = torch.tensor(indices, device=k.device, dtype=torch.long)
+            results_k.append(k[i].index_select(0, idx_t))
+            results_v.append(v[i].index_select(0, idx_t))
+        return (torch.stack(results_k), torch.stack(results_v))
 
 
 class WanCrossAttention(WanSelfAttention):
@@ -225,6 +269,10 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        prev_kv=None,
+        cache_kv=False,
+        cache_frame_indices=None,
+        cache_strip_rope=False,
     ):
         r"""
         Args:
@@ -233,6 +281,10 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            prev_kv(tuple, optional): Previous shot KV for inter-shot attention
+            cache_kv(bool): Whether to cache KV from this block
+            cache_frame_indices(list, optional): Frame indices to cache
+            cache_strip_rope(bool): If True, cache K without RoPE (Plan B)
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -240,9 +292,12 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
+        y, cached_kv = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
+            seq_lens, grid_sizes, freqs,
+            prev_kv=prev_kv, cache_kv=cache_kv,
+            cache_frame_indices=cache_frame_indices,
+            cache_strip_rope=cache_strip_rope)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -256,7 +311,7 @@ class WanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
-        return x
+        return x, cached_kv
 
 
 class Head(nn.Module):
@@ -414,6 +469,11 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
+        intershot_kv_cache=None,
+        cache_kv=False,
+        cache_frame_indices=None,
+        intershot_layers=None,
+        cache_strip_rope=False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -429,10 +489,20 @@ class WanModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            intershot_kv_cache (dict, optional):
+                {layer_idx: (K, V)} from previous shot
+            cache_kv (bool):
+                Whether to extract KV cache from this forward pass
+            cache_frame_indices (list, optional):
+                Temporal frame indices to cache
+            intershot_layers (set, optional):
+                Set of layer indices that participate in inter-shot attention
+            cache_strip_rope (bool):
+                If True, cache K without RoPE (Plan B: semantic-only matching)
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            List[Tensor] or (List[Tensor], dict):
+                Denoised video tensors. If cache_kv=True, also returns new KV cache dict.
         """
         if self.model_type == 'i2v':
             assert y is not None
@@ -486,14 +556,39 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        new_cache = {}
+        for block_idx, block in enumerate(self.blocks):
+            use_intershot = (intershot_layers is not None
+                             and block_idx in intershot_layers)
+
+            prev_kv = None
+            if use_intershot and intershot_kv_cache is not None:
+                prev_kv = intershot_kv_cache.get(block_idx)
+                if prev_kv is not None:
+                    pk, pv = prev_kv
+                    prev_kv = (pk.to(device=x.device),
+                               pv.to(device=x.device))
+
+            do_cache = cache_kv and use_intershot
+
+            x, cached_kv = block(
+                x, **kwargs,
+                prev_kv=prev_kv,
+                cache_kv=do_cache,
+                cache_frame_indices=cache_frame_indices,
+                cache_strip_rope=cache_strip_rope)
+
+            if cached_kv is not None:
+                new_cache[block_idx] = cached_kv
 
         # head
         x = self.head(x, e)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+
+        if cache_kv:
+            return [u.float() for u in x], new_cache
         return [u.float() for u in x]
 
     def unpatchify(self, x, grid_sizes):

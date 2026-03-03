@@ -171,7 +171,10 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 intershot_kv_cache=None,
+                 intershot_layers=None,
+                 cache_strip_rope=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -200,14 +203,16 @@ class WanTI2V:
                 Random seed for noise generation. If -1, use random seed.
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            intershot_kv_cache (dict, optional):
+                KV cache from previous shot for inter-shot attention
+            intershot_layers (set, optional):
+                Set of DiT layer indices for inter-shot attention
+            cache_strip_rope (bool):
+                If True, cache K without RoPE (Plan B)
 
         Returns:
-            torch.Tensor:
-                Generated video frames tensor. Dimensions: (C, N H, W) where:
-                - C: Color channels (3 for RGB)
-                - N: Number of frames (81)
-                - H: Frame height (from size)
-                - W: Frame width from size)
+            torch.Tensor or (torch.Tensor, dict):
+                Generated video frames. If intershot_layers is set, returns (video, kv_cache).
         """
         # i2v
         if img is not None:
@@ -222,7 +227,10 @@ class WanTI2V:
                 guide_scale=guide_scale,
                 n_prompt=n_prompt,
                 seed=seed,
-                offload_model=offload_model)
+                offload_model=offload_model,
+                intershot_kv_cache=intershot_kv_cache,
+                intershot_layers=intershot_layers,
+                cache_strip_rope=cache_strip_rope)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -421,7 +429,10 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            intershot_kv_cache=None,
+            intershot_layers=None,
+            cache_strip_rope=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -449,14 +460,16 @@ class WanTI2V:
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
+            intershot_kv_cache (dict, optional):
+                KV cache from previous shot for inter-shot attention
+            intershot_layers (set, optional):
+                Set of DiT layer indices for inter-shot attention
+            cache_strip_rope (bool):
+                If True, cache K without RoPE (Plan B)
 
         Returns:
-            torch.Tensor:
-                Generated video frames tensor. Dimensions: (C, N H, W) where:
-                - C: Color channels (3 for RGB)
-                - N: Number of frames (121)
-                - H: Frame height (from max_area)
-                - W: Frame width (from max_area)
+            torch.Tensor or (torch.Tensor, dict):
+                Generated video frames. If intershot_layers is set, returns (video, kv_cache).
         """
         # preprocess
         ih, iw = img.height, img.width
@@ -564,7 +577,14 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            # Inter-shot attention setup
+            use_intershot = intershot_layers is not None
+            new_kv_cache = None
+            if use_intershot:
+                F_patches = (F - 1) // self.vae_stride[0] + 1
+                cache_frame_indices = [0, F_patches - 1]
+
+            for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -577,8 +597,27 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
+                is_last_step = (step_idx == len(timesteps) - 1)
+
+                if use_intershot:
+                    do_cache = is_last_step
+                    result_c = self.model(
+                        latent_model_input, t=timestep, **arg_c,
+                        intershot_kv_cache=intershot_kv_cache,
+                        intershot_layers=intershot_layers,
+                        cache_kv=do_cache,
+                        cache_frame_indices=(
+                            cache_frame_indices if do_cache else None),
+                        cache_strip_rope=cache_strip_rope)
+                    if do_cache:
+                        noise_pred_cond = result_c[0][0]
+                        new_kv_cache = result_c[1]
+                    else:
+                        noise_pred_cond = result_c[0]
+                else:
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred_uncond = self.model(
@@ -616,4 +655,7 @@ class WanTI2V:
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        video_output = videos[0] if self.rank == 0 else None
+        if use_intershot:
+            return video_output, new_kv_cache
+        return video_output
