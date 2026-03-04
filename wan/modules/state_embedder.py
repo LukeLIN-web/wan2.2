@@ -117,7 +117,7 @@ _VOCAB_TABLES = {
 }
 
 MAX_CHARACTERS = 3
-NUM_STATE_TOKENS = 8  # output token count
+NUM_STATE_TOKENS = 32  # output token count (BLIP-2 scale, was 8)
 
 
 def _lookup(vocab_name: str, value: str) -> int:
@@ -279,12 +279,12 @@ class StateEmbedder(nn.Module):
         )
 
         # --- Slot embeddings (distinguish char0/1/2 vs scene tokens) ---
-        # Tokens 0-1: char0, 2-3: char1, 4-5: char2, 6-7: scene
+        # 3/4 tokens for characters (split evenly), 1/4 for scene
         self.slot_embeddings = nn.Embedding(4, dim)  # 4 slots
 
         # Build slot assignment: which slot each token belongs to
-        tokens_per_char = 2
-        tokens_scene = num_tokens - tokens_per_char * MAX_CHARACTERS  # 2
+        tokens_per_char = num_tokens // 4  # K=32→8/char, K=8→2/char
+        tokens_scene = num_tokens - tokens_per_char * MAX_CHARACTERS
         slot_ids = []
         for c in range(MAX_CHARACTERS):
             slot_ids.extend([c] * tokens_per_char)
