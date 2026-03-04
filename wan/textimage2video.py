@@ -175,7 +175,8 @@ class WanTI2V:
                  state_embedding=None,
                  intershot_kv_cache=None,
                  intershot_layers=None,
-                 cache_strip_rope=False):
+                 cache_strip_rope=False,
+                 cache_first_frame_only=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -234,7 +235,8 @@ class WanTI2V:
                 state_embedding=state_embedding,
                 intershot_kv_cache=intershot_kv_cache,
                 intershot_layers=intershot_layers,
-                cache_strip_rope=cache_strip_rope)
+                cache_strip_rope=cache_strip_rope,
+                cache_first_frame_only=cache_first_frame_only)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -439,7 +441,8 @@ class WanTI2V:
             state_embedding=None,
             intershot_kv_cache=None,
             intershot_layers=None,
-            cache_strip_rope=False):
+            cache_strip_rope=False,
+            cache_first_frame_only=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -593,7 +596,10 @@ class WanTI2V:
             new_kv_cache = None
             if use_intershot:
                 F_patches = (F - 1) // self.vae_stride[0] + 1
-                cache_frame_indices = [0, F_patches - 1]
+                if cache_first_frame_only:
+                    cache_frame_indices = [0]  # Phase 2b: first frame only for cumulative KV_global
+                else:
+                    cache_frame_indices = [0, F_patches - 1]  # Phase 2: first + last frame
 
             for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
