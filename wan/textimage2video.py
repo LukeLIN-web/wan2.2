@@ -176,7 +176,9 @@ class WanTI2V:
                  intershot_kv_cache=None,
                  intershot_layers=None,
                  cache_strip_rope=False,
-                 cache_first_frame_only=False):
+                 cache_first_frame_only=False,
+                 cache_tcrope_shift=0,
+                 intershot_gate_threshold=0.0):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -213,6 +215,12 @@ class WanTI2V:
                 Set of DiT layer indices for inter-shot attention
             cache_strip_rope (bool):
                 If True, cache K without RoPE (Plan B)
+            cache_tcrope_shift (int):
+                Temporal phase offset for TcRoPE on cached K (0 = no shift)
+            intershot_gate_threshold (float):
+                Timestep ratio threshold for gating intershot injection.
+                0.0 = inject at all steps (no gating).
+                E.g. 0.5 = only inject when t_ratio > 0.5 (early/high-noise steps).
 
         Returns:
             torch.Tensor or (torch.Tensor, dict):
@@ -236,7 +244,9 @@ class WanTI2V:
                 intershot_kv_cache=intershot_kv_cache,
                 intershot_layers=intershot_layers,
                 cache_strip_rope=cache_strip_rope,
-                cache_first_frame_only=cache_first_frame_only)
+                cache_first_frame_only=cache_first_frame_only,
+                cache_tcrope_shift=cache_tcrope_shift,
+                intershot_gate_threshold=intershot_gate_threshold)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -442,7 +452,9 @@ class WanTI2V:
             intershot_kv_cache=None,
             intershot_layers=None,
             cache_strip_rope=False,
-            cache_first_frame_only=False):
+            cache_first_frame_only=False,
+            cache_tcrope_shift=0,
+            intershot_gate_threshold=0.0):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -478,6 +490,14 @@ class WanTI2V:
                 Set of DiT layer indices for inter-shot attention
             cache_strip_rope (bool):
                 If True, cache K without RoPE (Plan B)
+            cache_tcrope_shift (int):
+                Temporal phase offset for TcRoPE on cached K (0 = no shift).
+                When > 0, cached K (pre-RoPE) gets RoPE applied with shifted
+                temporal frequencies before injection.
+            intershot_gate_threshold (float):
+                Timestep ratio threshold for gating intershot KV injection.
+                0.0 = inject at all steps (no gating).
+                E.g. 0.5 = only inject when t_ratio > 0.5 (early/high-noise steps).
 
         Returns:
             torch.Tensor or (torch.Tensor, dict):
@@ -618,14 +638,22 @@ class WanTI2V:
 
                 if use_intershot:
                     do_cache = is_last_step
+                    # Timestep-gated injection: only inject at early (high-noise) steps
+                    t_ratio = t.item() / 1000.0
+                    inject_this_step = (
+                        intershot_gate_threshold <= 0
+                        or t_ratio > intershot_gate_threshold
+                    )
+                    kv_to_inject = intershot_kv_cache if inject_this_step else None
                     result_c = self.model(
                         latent_model_input, t=timestep, **arg_c,
-                        intershot_kv_cache=intershot_kv_cache,
+                        intershot_kv_cache=kv_to_inject,
                         intershot_layers=intershot_layers,
                         cache_kv=do_cache,
                         cache_frame_indices=(
                             cache_frame_indices if do_cache else None),
-                        cache_strip_rope=cache_strip_rope)
+                        cache_strip_rope=cache_strip_rope,
+                        cache_tcrope_shift=cache_tcrope_shift)
                     if do_cache:
                         noise_pred_cond = result_c[0][0]
                         new_kv_cache = result_c[1]

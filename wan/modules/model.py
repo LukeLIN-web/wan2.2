@@ -66,6 +66,59 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+@torch.amp.autocast('cuda', enabled=False)
+def rope_apply_cached_kv(pk, grid_sizes, freqs, temporal_shift):
+    """Apply RoPE to cached (pre-RoPE) K with a temporal phase shift (TcRoPE).
+
+    The cached K has shape [B, num_cached_tokens, num_heads, head_dim].
+    We infer num_cached_frames from the token count and spatial dims (H, W)
+    taken from grid_sizes. The temporal RoPE frequencies are shifted by
+    `temporal_shift` positions, making the model perceive cached frames as
+    coming from a different temporal phase.
+
+    Args:
+        pk: Cached pre-RoPE K, shape [B, L_cache, N, D]
+        grid_sizes: Current grid sizes [B, 3] — we use (H, W) from here
+        freqs: Full RoPE frequency table [max_seq, C/num_heads/2]
+        temporal_shift: Integer phase offset for temporal frequencies
+    Returns:
+        pk with RoPE applied (phase-shifted), same shape
+    """
+    n = pk.size(2)
+    c = pk.size(3) // 2
+
+    # split freqs into temporal, H, W
+    freq_parts = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (f_cur, h, w) in enumerate(grid_sizes.tolist()):
+        hw = int(h * w)
+        num_cached_tokens = pk.size(1)
+        num_cf = num_cached_tokens // hw
+        if num_cf == 0:
+            output.append(pk[i])
+            continue
+
+        seq_len = num_cf * hw
+        pk_i = torch.view_as_complex(
+            pk[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+
+        j = temporal_shift
+        freqs_i = torch.cat([
+            freq_parts[0][j:j + num_cf].view(num_cf, 1, 1, -1).expand(num_cf, int(h), int(w), -1),
+            freq_parts[1][:int(h)].view(1, int(h), 1, -1).expand(num_cf, int(h), int(w), -1),
+            freq_parts[2][:int(w)].view(1, 1, int(w), -1).expand(num_cf, int(h), int(w), -1),
+        ], dim=-1).reshape(seq_len, 1, -1)
+
+        pk_i = torch.view_as_real(pk_i * freqs_i).flatten(2)
+        # If there are extra padding tokens beyond seq_len, keep them unchanged
+        if num_cached_tokens > seq_len:
+            pk_i = torch.cat([pk_i, pk[i, seq_len:]])
+        output.append(pk_i)
+
+    return torch.stack(output).float()
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -125,7 +178,7 @@ class WanSelfAttention(nn.Module):
 
     def forward(self, x, seq_lens, grid_sizes, freqs,
                 prev_kv=None, cache_kv=False, cache_frame_indices=None,
-                cache_strip_rope=False):
+                cache_strip_rope=False, cache_tcrope_shift=0):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -136,6 +189,9 @@ class WanSelfAttention(nn.Module):
             cache_kv(bool): Whether to extract KV for caching
             cache_frame_indices(list, optional): Temporal frame indices to cache
             cache_strip_rope(bool): If True, cache K without RoPE (Plan B)
+            cache_tcrope_shift(int): Temporal phase offset for TcRoPE on cached K.
+                When > 0 and prev_kv contains pre-RoPE K, applies RoPE with
+                shifted temporal frequencies before injection.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -167,6 +223,10 @@ class WanSelfAttention(nn.Module):
 
         if prev_kv is not None:
             prev_k, prev_v = prev_kv
+            # TcRoPE: apply RoPE with temporal phase shift to pre-RoPE cached K
+            if cache_tcrope_shift > 0:
+                prev_k = rope_apply_cached_kv(
+                    prev_k, grid_sizes, freqs, cache_tcrope_shift)
             actual_k = torch.cat([prev_k, k_rope], dim=1)
             actual_v = torch.cat([prev_v, v], dim=1)
             actual_k_lens = seq_lens + prev_k.size(1)
@@ -273,6 +333,7 @@ class WanAttentionBlock(nn.Module):
         cache_kv=False,
         cache_frame_indices=None,
         cache_strip_rope=False,
+        cache_tcrope_shift=0,
     ):
         r"""
         Args:
@@ -285,6 +346,7 @@ class WanAttentionBlock(nn.Module):
             cache_kv(bool): Whether to cache KV from this block
             cache_frame_indices(list, optional): Frame indices to cache
             cache_strip_rope(bool): If True, cache K without RoPE (Plan B)
+            cache_tcrope_shift(int): Temporal phase offset for TcRoPE on cached K
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -297,7 +359,8 @@ class WanAttentionBlock(nn.Module):
             seq_lens, grid_sizes, freqs,
             prev_kv=prev_kv, cache_kv=cache_kv,
             cache_frame_indices=cache_frame_indices,
-            cache_strip_rope=cache_strip_rope)
+            cache_strip_rope=cache_strip_rope,
+            cache_tcrope_shift=cache_tcrope_shift)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -475,6 +538,7 @@ class WanModel(ModelMixin, ConfigMixin):
         cache_frame_indices=None,
         intershot_layers=None,
         cache_strip_rope=False,
+        cache_tcrope_shift=0,
     ):
         r"""
         Forward pass through the diffusion model
@@ -503,6 +567,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 Set of layer indices that participate in inter-shot attention
             cache_strip_rope (bool):
                 If True, cache K without RoPE (Plan B: semantic-only matching)
+            cache_tcrope_shift (int):
+                Temporal phase offset for TcRoPE on cached K (0 = no shift)
 
         Returns:
             List[Tensor] or (List[Tensor], dict):
@@ -584,7 +650,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 prev_kv=prev_kv,
                 cache_kv=do_cache,
                 cache_frame_indices=cache_frame_indices,
-                cache_strip_rope=cache_strip_rope)
+                cache_strip_rope=cache_strip_rope,
+                cache_tcrope_shift=cache_tcrope_shift if use_intershot else 0)
 
             if cached_kv is not None:
                 new_cache[block_idx] = cached_kv
