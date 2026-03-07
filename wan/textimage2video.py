@@ -178,7 +178,9 @@ class WanTI2V:
                  cache_strip_rope=False,
                  cache_first_frame_only=False,
                  cache_tcrope_shift=0,
-                 intershot_gate_threshold=0.0):
+                 intershot_gate_threshold=0.0,
+                 noise_blend_latent=None,
+                 noise_blend_alpha=0.0):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -246,7 +248,9 @@ class WanTI2V:
                 cache_strip_rope=cache_strip_rope,
                 cache_first_frame_only=cache_first_frame_only,
                 cache_tcrope_shift=cache_tcrope_shift,
-                intershot_gate_threshold=intershot_gate_threshold)
+                intershot_gate_threshold=intershot_gate_threshold,
+                noise_blend_latent=noise_blend_latent,
+                noise_blend_alpha=noise_blend_alpha)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -454,7 +458,9 @@ class WanTI2V:
             cache_strip_rope=False,
             cache_first_frame_only=False,
             cache_tcrope_shift=0,
-            intershot_gate_threshold=0.0):
+            intershot_gate_threshold=0.0,
+            noise_blend_latent=None,
+            noise_blend_alpha=0.0):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -537,6 +543,19 @@ class WanTI2V:
             dtype=torch.float32,
             generator=seed_g,
             device=self.device)
+
+        # Noise blending: mix low-freq of previous shot's last-frame latent
+        if noise_blend_latent is not None and noise_blend_alpha > 0:
+            nbl = noise_blend_latent  # [C, 1, H_lat, W_lat]
+            nbl = nbl.squeeze(1).unsqueeze(0).float()  # [1, C, H, W]
+            k = 4
+            nbl = torch.nn.functional.avg_pool2d(nbl, kernel_size=k, stride=k)
+            nbl = torch.nn.functional.interpolate(
+                nbl, size=(noise.shape[2], noise.shape[3]), mode='nearest')
+            nbl = nbl.squeeze(0).unsqueeze(1)  # [C, 1, H, W]
+            nbl = nbl.expand_as(noise)  # [C, T, H, W]
+            noise = (1 - noise_blend_alpha) * noise + noise_blend_alpha * nbl
+            del nbl
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
