@@ -334,6 +334,10 @@ class WanAttentionBlock(nn.Module):
         cache_frame_indices=None,
         cache_strip_rope=False,
         cache_tcrope_shift=0,
+        face_context=None,
+        face_context_lens=None,
+        style_shift=None,
+        style_scale=None,
     ):
         r"""
         Args:
@@ -347,6 +351,14 @@ class WanAttentionBlock(nn.Module):
             cache_frame_indices(list, optional): Frame indices to cache
             cache_strip_rope(bool): If True, cache K without RoPE (Plan B)
             cache_tcrope_shift(int): Temporal phase offset for TcRoPE on cached K
+            face_context(Tensor, optional): Context with face tokens appended,
+                shape [B, L_text + L_face, C]. Used only in face injection layers.
+            face_context_lens(Tensor, optional): Corresponding context lengths
+                for face_context.
+            style_shift(Tensor, optional): Additive shift for self-attn input,
+                shape [B, C]. From StyleAdapter, broadcast over seq_len.
+            style_scale(Tensor, optional): Additive scale for self-attn input,
+                shape [B, C]. From StyleAdapter, broadcast over seq_len.
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -354,8 +366,14 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
+        sa_input = self.norm1(x).float()
+        sa_scale = 1 + e[1].squeeze(2)
+        sa_shift = e[0].squeeze(2)
+        if style_shift is not None:
+            sa_shift = sa_shift + style_shift.float().unsqueeze(1)
+            sa_scale = sa_scale + style_scale.float().unsqueeze(1)
         y, cached_kv = self.self_attn(
-            self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
+            (sa_input * sa_scale + sa_shift).to(x.dtype),
             seq_lens, grid_sizes, freqs,
             prev_kv=prev_kv, cache_kv=cache_kv,
             cache_frame_indices=cache_frame_indices,
@@ -373,7 +391,10 @@ class WanAttentionBlock(nn.Module):
                 x = x + y * e[5].squeeze(2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        # Use face-augmented context if provided for this block
+        ctx = face_context if face_context is not None else context
+        ctx_lens = face_context_lens if face_context_lens is not None else context_lens
+        x = cross_attn_ffn(x, ctx, ctx_lens, e)
         return x, cached_kv
 
 
@@ -533,12 +554,16 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         y=None,
         state_embedding=None,
+        face_embedding=None,
+        face_inject_layers=None,
         intershot_kv_cache=None,
         cache_kv=False,
         cache_frame_indices=None,
         intershot_layers=None,
         cache_strip_rope=False,
         cache_tcrope_shift=0,
+        style_modulation=None,
+        style_inject_layers=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -557,6 +582,11 @@ class WanModel(ModelMixin, ConfigMixin):
             state_embedding (Tensor, *optional*):
                 State embedding tokens from StateEmbedder, shape [B, K, dim].
                 Concatenated to text context for cross-attention conditioning.
+            face_embedding (Tensor, *optional*):
+                Gated face identity tokens from FaceEmbedder, shape [B, K_face, dim].
+                Injected into cross-attention context only in face_inject_layers.
+            face_inject_layers (set, *optional*):
+                Set of layer indices where face tokens are injected (default: {15..20}).
             intershot_kv_cache (dict, optional):
                 {layer_idx: (K, V)} from previous shot
             cache_kv (bool):
@@ -569,6 +599,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 If True, cache K without RoPE (Plan B: semantic-only matching)
             cache_tcrope_shift (int):
                 Temporal phase offset for TcRoPE on cached K (0 = no shift)
+            style_modulation (list, optional):
+                List of (Δshift, Δscale) tuples from StyleAdapter, one per style layer.
+                Each Δshift/Δscale has shape [B, dim].
+            style_inject_layers (set, optional):
+                Set of layer indices for style injection (default: {0..10}).
 
         Returns:
             List[Tensor] or (List[Tensor], dict):
@@ -621,6 +656,25 @@ class WanModel(ModelMixin, ConfigMixin):
         if state_embedding is not None:
             context = torch.cat([context, state_embedding], dim=1)
 
+        # build face-augmented context (used only in face_inject_layers)
+        _face_context = None
+        _face_context_lens = None
+        if face_embedding is not None:
+            from .face_embedder import FACE_INJECT_LAYERS
+            _face_inject = face_inject_layers if face_inject_layers is not None else FACE_INJECT_LAYERS
+            _face_context = torch.cat([context, face_embedding], dim=1)
+        else:
+            _face_inject = set()
+
+        # build style modulation lookup (used only in style_inject_layers)
+        if style_modulation is not None:
+            from .style_adapter import STYLE_INJECT_LAYERS
+            _style_inject = style_inject_layers if style_inject_layers is not None else STYLE_INJECT_LAYERS
+            _style_inject_min = min(_style_inject)
+        else:
+            _style_inject = set()
+            _style_inject_min = 0
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -645,13 +699,28 @@ class WanModel(ModelMixin, ConfigMixin):
 
             do_cache = cache_kv and use_intershot
 
+            # Pass face-augmented context only to face injection layers
+            face_kw = {}
+            if block_idx in _face_inject:
+                face_kw = dict(face_context=_face_context,
+                               face_context_lens=_face_context_lens)
+
+            # Pass style modulation only to style injection layers
+            style_kw = {}
+            if block_idx in _style_inject:
+                layer_offset = block_idx - _style_inject_min
+                style_kw = dict(style_shift=style_modulation[layer_offset][0],
+                                style_scale=style_modulation[layer_offset][1])
+
             x, cached_kv = block(
                 x, **kwargs,
                 prev_kv=prev_kv,
                 cache_kv=do_cache,
                 cache_frame_indices=cache_frame_indices,
                 cache_strip_rope=cache_strip_rope,
-                cache_tcrope_shift=cache_tcrope_shift if use_intershot else 0)
+                cache_tcrope_shift=cache_tcrope_shift if use_intershot else 0,
+                **face_kw,
+                **style_kw)
 
             if cached_kv is not None:
                 new_cache[block_idx] = cached_kv
