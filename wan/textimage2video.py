@@ -18,6 +18,42 @@ from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
+
+
+def _compute_adaptive_alpha(base_alpha, t_ratio, schedule):
+    """Compute timestep-adaptive alpha for identity injection.
+
+    Args:
+        base_alpha: Base (max) alpha value.
+        t_ratio: Timestep ratio in [0, 1]. 1.0 = early (high noise), 0.0 = late (clean).
+        schedule: Schedule name string:
+            - 'constant': No adaptation, always base_alpha.
+            - 'early_ramp': Linear ramp, high early, zero late. Good for structural (RefAttn).
+            - 'mid_peak': Sine peak at t_ratio=0.5. Balanced injection.
+            - 'late_ramp': Linear ramp, zero early, high late. Good for pixel-level (PredX0).
+            - 'u_shape': High at edges (early+late), low in middle. Double emphasis.
+            - 'early_cosine': Cosine decay from early to late. Smooth structural.
+            - 'late_cosine': Cosine ramp from zero to max. Smooth pixel-level.
+
+    Returns:
+        float: Scaled alpha value.
+    """
+    if schedule is None or schedule == 'constant':
+        return base_alpha
+    if schedule == 'early_ramp':
+        return base_alpha * t_ratio
+    if schedule == 'late_ramp':
+        return base_alpha * (1.0 - t_ratio)
+    if schedule == 'mid_peak':
+        return base_alpha * math.sin(math.pi * t_ratio)
+    if schedule == 'u_shape':
+        return base_alpha * (4.0 * (t_ratio - 0.5) ** 2)
+    if schedule == 'early_cosine':
+        return base_alpha * 0.5 * (1.0 + math.cos(math.pi * (1.0 - t_ratio)))
+    if schedule == 'late_cosine':
+        return base_alpha * 0.5 * (1.0 + math.cos(math.pi * t_ratio))
+    # Unknown schedule, fallback to constant
+    return base_alpha
 from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
@@ -177,6 +213,7 @@ class WanTI2V:
                  intershot_layers=None,
                  cache_strip_rope=False,
                  cache_first_frame_only=False,
+                 cache_frame_indices_override=None,
                  cache_tcrope_shift=0,
                  intershot_gate_threshold=0.0,
                  noise_blend_latent=None,
@@ -255,6 +292,7 @@ class WanTI2V:
                 intershot_layers=intershot_layers,
                 cache_strip_rope=cache_strip_rope,
                 cache_first_frame_only=cache_first_frame_only,
+                cache_frame_indices_override=cache_frame_indices_override,
                 cache_tcrope_shift=cache_tcrope_shift,
                 intershot_gate_threshold=intershot_gate_threshold,
                 noise_blend_latent=noise_blend_latent,
@@ -469,6 +507,7 @@ class WanTI2V:
             intershot_layers=None,
             cache_strip_rope=False,
             cache_first_frame_only=False,
+            cache_frame_indices_override=None,
             cache_tcrope_shift=0,
             intershot_gate_threshold=0.0,
             noise_blend_latent=None,
@@ -663,7 +702,9 @@ class WanTI2V:
             new_kv_cache = None
             if use_intershot:
                 F_patches = (F - 1) // self.vae_stride[0] + 1
-                if cache_first_frame_only:
+                if cache_frame_indices_override is not None:
+                    cache_frame_indices = cache_frame_indices_override
+                elif cache_first_frame_only:
                     cache_frame_indices = [0]  # Phase 2b: first frame only for cumulative KV_global
                 else:
                     cache_frame_indices = [0, F_patches - 1]  # Phase 2: first + last frame
@@ -710,6 +751,8 @@ class WanTI2V:
                             # Find nearest cached step
                             cached_steps = sorted(all_cache.keys())
                             nearest = min(cached_steps, key=lambda s: abs(s - step_idx))
+                            predx0_base_alpha = predx0_config.get('alpha', 0.05)
+                            predx0_schedule = predx0_config.get('alpha_schedule')
                             step_predx0 = {
                                 'mode': 'inject',
                                 'layers': predx0_config['layers'],
@@ -717,8 +760,22 @@ class WanTI2V:
                                 'step_cache': all_cache[nearest],
                                 'inject_indices': predx0_config['inject_indices'],
                                 'inject_weights': predx0_config['inject_weights'],
-                                'alpha': predx0_config.get('alpha', 0.05),
+                                'alpha': _compute_adaptive_alpha(
+                                    predx0_base_alpha,
+                                    t.item() / 1000.0,
+                                    predx0_schedule),
                             }
+
+                # Adaptive alpha for ref_attn_config
+                if ref_attn_config is not None:
+                    ref_schedule = ref_attn_config.get('alpha_schedule')
+                    if ref_schedule is not None and ref_schedule != 'constant':
+                        ref_base = ref_attn_config.get('_base_alpha')
+                        if ref_base is None:
+                            ref_base = ref_attn_config.get('alpha', 0.3)
+                            ref_attn_config['_base_alpha'] = ref_base
+                        ref_attn_config['alpha'] = _compute_adaptive_alpha(
+                            ref_base, t.item() / 1000.0, ref_schedule)
 
                 if use_intershot:
                     do_cache = is_last_step
