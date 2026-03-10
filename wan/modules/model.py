@@ -338,6 +338,8 @@ class WanAttentionBlock(nn.Module):
         face_context_lens=None,
         style_shift=None,
         style_scale=None,
+        predx0_hook=None,
+        ref_attn_hook=None,
     ):
         r"""
         Args:
@@ -359,6 +361,12 @@ class WanAttentionBlock(nn.Module):
                 shape [B, C]. From StyleAdapter, broadcast over seq_len.
             style_scale(Tensor, optional): Additive scale for self-attn input,
                 shape [B, C]. From StyleAdapter, broadcast over seq_len.
+            predx0_hook(callable, optional): Called after self-attention residual,
+                before cross-attention. Receives x, returns modified x.
+                Used for Pred-x0 feature caching/injection.
+            ref_attn_hook(callable, optional): Called after predx0_hook,
+                before cross-attention. Computes reference cross-attention
+                using cached Shot 0 K,V and adds as scaled residual.
         """
         assert e.dtype == torch.float32
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -381,6 +389,14 @@ class WanAttentionBlock(nn.Module):
             cache_tcrope_shift=cache_tcrope_shift)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
+
+        # Pred-x0 hook: after self-attn residual, before cross-attn
+        if predx0_hook is not None:
+            x = predx0_hook(x)
+
+        # Reference attention hook: separate cross-attn with Shot 0 K,V
+        if ref_attn_hook is not None:
+            x = ref_attn_hook(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
@@ -428,6 +444,50 @@ class Head(nn.Module):
                 self.head(
                     self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
         return x
+
+
+def _build_predx0_hook(predx0_config, block_idx, device):
+    """Build a hook for Pred-x0 feature caching or injection at a specific block."""
+    mode = predx0_config.get('mode')
+
+    if mode == 'cache':
+        cache_indices = predx0_config['cache_indices'].to(device)
+        step_cache = predx0_config['_step_cache']
+
+        def cache_hook(x):
+            step_cache[block_idx] = x[0, cache_indices, :].detach().float().cpu()
+            return x
+
+        return cache_hook
+
+    if mode == 'inject':
+        step_cache = predx0_config.get('step_cache')
+        if step_cache is None or block_idx not in step_cache:
+            return None
+
+        cached_feat = step_cache[block_idx].to(device=device)
+        inject_indices = predx0_config['inject_indices'].to(device)
+        inject_weights = predx0_config['inject_weights'].to(device)
+        alpha = predx0_config.get('alpha', 0.05)
+        n_face = len(predx0_config['cache_indices'])
+
+        # Identity-normalized: subtract mean across face tokens
+        identity = cached_feat - cached_feat.mean(dim=0, keepdim=True)
+
+        # Expand identity to all non-first frames
+        n_frames_inject = len(inject_indices) // n_face
+        identity_expanded = identity.unsqueeze(0).expand(
+            n_frames_inject, -1, -1
+        ).reshape(-1, identity.size(-1))
+
+        def inject_hook(x):
+            delta = alpha * inject_weights.unsqueeze(-1) * identity_expanded.to(x.dtype)
+            x[:, inject_indices, :] = x[:, inject_indices, :] + delta
+            return x
+
+        return inject_hook
+
+    return None
 
 
 class WanModel(ModelMixin, ConfigMixin):
@@ -564,6 +624,8 @@ class WanModel(ModelMixin, ConfigMixin):
         cache_tcrope_shift=0,
         style_modulation=None,
         style_inject_layers=None,
+        predx0_config=None,
+        ref_attn_config=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -604,6 +666,21 @@ class WanModel(ModelMixin, ConfigMixin):
                 Each Δshift/Δscale has shape [B, dim].
             style_inject_layers (set, optional):
                 Set of layer indices for style injection (default: {0..10}).
+            predx0_config (dict, optional):
+                Pred-x0 feature injection config. Keys:
+                - mode: 'cache' or 'inject'
+                - layers: set of layer indices
+                - cache_indices: LongTensor, frame-0 face token indices
+                - _step_cache: mutable dict, populated during cache mode
+                - step_cache: dict {layer: tensor}, features to inject
+                - inject_indices: LongTensor, non-first-frame face indices
+                - inject_weights: FloatTensor, soft Gaussian mask
+                - alpha: float, blend weight
+            ref_attn_config (dict, optional):
+                Reference attention config for cross-shot identity. Keys:
+                - layers: set of layer indices (default: {15..20})
+                - kv_cache: dict {layer_idx: (K, V)}, cached Shot 0 K,V
+                - alpha: float, blending strength (default: 0.3)
 
         Returns:
             List[Tensor] or (List[Tensor], dict):
@@ -712,6 +789,21 @@ class WanModel(ModelMixin, ConfigMixin):
                 style_kw = dict(style_shift=style_modulation[layer_offset][0],
                                 style_scale=style_modulation[layer_offset][1])
 
+            # Pred-x0 feature hook
+            predx0_hook = None
+            if predx0_config is not None and block_idx in predx0_config.get('layers', set()):
+                predx0_hook = _build_predx0_hook(predx0_config, block_idx, device)
+
+            # Reference attention hook
+            ref_hook = None
+            if ref_attn_config is not None and block_idx in ref_attn_config.get('layers', set()):
+                ref_kv = ref_attn_config.get('kv_cache', {}).get(block_idx)
+                if ref_kv is not None:
+                    from ..ref_attention import build_ref_attn_hook
+                    ref_hook = build_ref_attn_hook(
+                        block, ref_kv[0], ref_kv[1],
+                        alpha=ref_attn_config.get('alpha', 0.3))
+
             x, cached_kv = block(
                 x, **kwargs,
                 prev_kv=prev_kv,
@@ -720,7 +812,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 cache_strip_rope=cache_strip_rope,
                 cache_tcrope_shift=cache_tcrope_shift if use_intershot else 0,
                 **face_kw,
-                **style_kw)
+                **style_kw,
+                predx0_hook=predx0_hook,
+                ref_attn_hook=ref_hook)
 
             if cached_kv is not None:
                 new_cache[block_idx] = cached_kv

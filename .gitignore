@@ -29,3 +29,4 @@ WorldModelBench/vila-ewm-qwen2-1.5b/
 WorldModelBench/images/
 *.tex
 *.jsonl
+models

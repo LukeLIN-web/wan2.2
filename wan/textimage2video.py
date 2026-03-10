@@ -180,7 +180,10 @@ class WanTI2V:
                  cache_tcrope_shift=0,
                  intershot_gate_threshold=0.0,
                  noise_blend_latent=None,
-                 noise_blend_alpha=0.0):
+                 noise_blend_alpha=0.0,
+                 style_modulation=None,
+                 predx0_config=None,
+                 ref_attn_config=None):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -223,6 +226,11 @@ class WanTI2V:
                 Timestep ratio threshold for gating intershot injection.
                 0.0 = inject at all steps (no gating).
                 E.g. 0.5 = only inject when t_ratio > 0.5 (early/high-noise steps).
+            predx0_config (dict, optional):
+                Pred-x0 feature injection config. See WanModel.forward docstring.
+            ref_attn_config (dict, optional):
+                Reference attention config for cross-shot identity preservation.
+                See WanModel.forward docstring.
 
         Returns:
             torch.Tensor or (torch.Tensor, dict):
@@ -250,7 +258,10 @@ class WanTI2V:
                 cache_tcrope_shift=cache_tcrope_shift,
                 intershot_gate_threshold=intershot_gate_threshold,
                 noise_blend_latent=noise_blend_latent,
-                noise_blend_alpha=noise_blend_alpha)
+                noise_blend_alpha=noise_blend_alpha,
+                style_modulation=style_modulation,
+                predx0_config=predx0_config,
+                ref_attn_config=ref_attn_config)
         # t2v
         return self.t2v(
             input_prompt=input_prompt,
@@ -274,7 +285,8 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            state_embedding=None):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -460,7 +472,10 @@ class WanTI2V:
             cache_tcrope_shift=0,
             intershot_gate_threshold=0.0,
             noise_blend_latent=None,
-            noise_blend_alpha=0.0):
+            noise_blend_alpha=0.0,
+            style_modulation=None,
+            predx0_config=None,
+            ref_attn_config=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -504,6 +519,17 @@ class WanTI2V:
                 Timestep ratio threshold for gating intershot KV injection.
                 0.0 = inject at all steps (no gating).
                 E.g. 0.5 = only inject when t_ratio > 0.5 (early/high-noise steps).
+            ref_attn_config (dict, optional):
+                Reference attention config for cross-shot identity preservation.
+                See WanModel.forward docstring.
+            predx0_config (dict, optional):
+                Pred-x0 feature injection config with keys:
+                - mode: 'cache' or 'inject'
+                - layers: set of DiT layer indices
+                - cache_indices/inject_indices/inject_weights: token masks
+                - alpha: blend weight (inject mode)
+                - cache_stride: cache every N steps (cache mode)
+                - _all_cache: populated by cache mode, used by inject mode
 
         Returns:
             torch.Tensor or (torch.Tensor, dict):
@@ -620,6 +646,8 @@ class WanTI2V:
             }
             if state_embedding is not None:
                 arg_c['state_embedding'] = state_embedding
+            if style_modulation is not None:
+                arg_c['style_modulation'] = style_modulation
 
             arg_null = {
                 'context': context_null,
@@ -640,6 +668,14 @@ class WanTI2V:
                 else:
                     cache_frame_indices = [0, F_patches - 1]  # Phase 2: first + last frame
 
+            # Pred-x0 feature injection setup
+            use_predx0 = predx0_config is not None
+            predx0_mode = predx0_config.get('mode') if use_predx0 else None
+            predx0_all_cache = {}
+            if use_predx0 and predx0_mode == 'cache':
+                predx0_config['_all_cache'] = predx0_all_cache
+            predx0_cache_stride = predx0_config.get('cache_stride', 5) if use_predx0 else 5
+
             for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -654,6 +690,35 @@ class WanTI2V:
                 timestep = temp_ts.unsqueeze(0)
 
                 is_last_step = (step_idx == len(timesteps) - 1)
+
+                # Pred-x0: build per-step config for conditional forward
+                step_predx0 = None
+                if use_predx0:
+                    if predx0_mode == 'cache':
+                        # Cache at sparse steps + last step
+                        if step_idx % predx0_cache_stride == 0 or is_last_step:
+                            step_cache = {}
+                            step_predx0 = {
+                                'mode': 'cache',
+                                'layers': predx0_config['layers'],
+                                'cache_indices': predx0_config['cache_indices'],
+                                '_step_cache': step_cache,
+                            }
+                    elif predx0_mode == 'inject':
+                        all_cache = predx0_config.get('_all_cache', {})
+                        if all_cache:
+                            # Find nearest cached step
+                            cached_steps = sorted(all_cache.keys())
+                            nearest = min(cached_steps, key=lambda s: abs(s - step_idx))
+                            step_predx0 = {
+                                'mode': 'inject',
+                                'layers': predx0_config['layers'],
+                                'cache_indices': predx0_config['cache_indices'],
+                                'step_cache': all_cache[nearest],
+                                'inject_indices': predx0_config['inject_indices'],
+                                'inject_weights': predx0_config['inject_weights'],
+                                'alpha': predx0_config.get('alpha', 0.05),
+                            }
 
                 if use_intershot:
                     do_cache = is_last_step
@@ -672,7 +737,9 @@ class WanTI2V:
                         cache_frame_indices=(
                             cache_frame_indices if do_cache else None),
                         cache_strip_rope=cache_strip_rope,
-                        cache_tcrope_shift=cache_tcrope_shift)
+                        cache_tcrope_shift=cache_tcrope_shift,
+                        predx0_config=step_predx0,
+                        ref_attn_config=ref_attn_config)
                     if do_cache:
                         noise_pred_cond = result_c[0][0]
                         new_kv_cache = result_c[1]
@@ -680,7 +747,14 @@ class WanTI2V:
                         noise_pred_cond = result_c[0]
                 else:
                     noise_pred_cond = self.model(
-                        latent_model_input, t=timestep, **arg_c)[0]
+                        latent_model_input, t=timestep, **arg_c,
+                        predx0_config=step_predx0,
+                        ref_attn_config=ref_attn_config)[0]
+
+                # Pred-x0: collect cached features
+                if step_predx0 is not None and predx0_mode == 'cache' and '_step_cache' in step_predx0:
+                    if step_predx0['_step_cache']:
+                        predx0_all_cache[step_idx] = step_predx0['_step_cache']
 
                 if offload_model:
                     torch.cuda.empty_cache()
