@@ -216,6 +216,7 @@ class WanTI2V:
                  cache_frame_indices_override=None,
                  cache_tcrope_shift=0,
                  intershot_gate_threshold=0.0,
+                 intershot_head_mask=None,
                  noise_blend_latent=None,
                  noise_blend_alpha=0.0,
                  style_modulation=None,
@@ -263,6 +264,8 @@ class WanTI2V:
                 Timestep ratio threshold for gating intershot injection.
                 0.0 = inject at all steps (no gating).
                 E.g. 0.5 = only inject when t_ratio > 0.5 (early/high-noise steps).
+            intershot_head_mask (dict, optional):
+                {layer_idx: BoolTensor[num_heads]} for head-wise AnchorKV injection.
             predx0_config (dict, optional):
                 Pred-x0 feature injection config. See WanModel.forward docstring.
             ref_attn_config (dict, optional):
@@ -295,6 +298,7 @@ class WanTI2V:
                 cache_frame_indices_override=cache_frame_indices_override,
                 cache_tcrope_shift=cache_tcrope_shift,
                 intershot_gate_threshold=intershot_gate_threshold,
+                intershot_head_mask=intershot_head_mask,
                 noise_blend_latent=noise_blend_latent,
                 noise_blend_alpha=noise_blend_alpha,
                 style_modulation=style_modulation,
@@ -510,6 +514,7 @@ class WanTI2V:
             cache_frame_indices_override=None,
             cache_tcrope_shift=0,
             intershot_gate_threshold=0.0,
+            intershot_head_mask=None,
             noise_blend_latent=None,
             noise_blend_alpha=0.0,
             style_modulation=None,
@@ -795,6 +800,7 @@ class WanTI2V:
                             cache_frame_indices if do_cache else None),
                         cache_strip_rope=cache_strip_rope,
                         cache_tcrope_shift=cache_tcrope_shift,
+                        intershot_head_mask=intershot_head_mask if inject_this_step else None,
                         predx0_config=step_predx0,
                         ref_attn_config=ref_attn_config)
                     if do_cache:

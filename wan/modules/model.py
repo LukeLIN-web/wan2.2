@@ -178,7 +178,8 @@ class WanSelfAttention(nn.Module):
 
     def forward(self, x, seq_lens, grid_sizes, freqs,
                 prev_kv=None, cache_kv=False, cache_frame_indices=None,
-                cache_strip_rope=False, cache_tcrope_shift=0):
+                cache_strip_rope=False, cache_tcrope_shift=0,
+                prev_kv_head_mask=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -192,6 +193,8 @@ class WanSelfAttention(nn.Module):
             cache_tcrope_shift(int): Temporal phase offset for TcRoPE on cached K.
                 When > 0 and prev_kv contains pre-RoPE K, applies RoPE with
                 shifted temporal frequencies before injection.
+            prev_kv_head_mask(Tensor, optional): Boolean mask [num_heads] selecting
+                which heads receive injected KV. Non-selected heads' KV is zeroed.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -206,6 +209,17 @@ class WanSelfAttention(nn.Module):
 
         q_rope = rope_apply(q, grid_sizes, freqs)
         k_rope = rope_apply(k, grid_sizes, freqs)
+
+        # Head importance profiling: record per-head face attention affinity
+        if hasattr(self, '_profile_bbox_indices') and self._profile_bbox_indices is not None:
+            with torch.no_grad():
+                bbox_idx = self._profile_bbox_indices.to(q_rope.device)
+                hw = int(grid_sizes[0, 1].item() * grid_sizes[0, 2].item())
+                q_f0 = q_rope[0, :hw].float()       # [H*W, n, d]
+                k_bbox = k_rope[0, bbox_idx].float()  # [num_bbox, n, d]
+                # Per-head mean dot product: higher = head attends more to face
+                scores = torch.einsum('qnd,knd->nqk', q_f0, k_bbox) / math.sqrt(d)
+                self._profile_importance = scores.mean(dim=(1, 2)).cpu()  # [n]
 
         # Extract frame KV for inter-shot caching
         # Plan A (cache_strip_rope=False): cache K with RoPE
@@ -227,6 +241,12 @@ class WanSelfAttention(nn.Module):
             if cache_tcrope_shift > 0:
                 prev_k = rope_apply_cached_kv(
                     prev_k, grid_sizes, freqs, cache_tcrope_shift)
+            # Head-wise injection mask: zero out non-selected heads
+            if prev_kv_head_mask is not None:
+                mask = prev_kv_head_mask.view(1, 1, n, 1).to(
+                    device=prev_k.device, dtype=prev_k.dtype)
+                prev_k = prev_k * mask
+                prev_v = prev_v * mask
             actual_k = torch.cat([prev_k, k_rope], dim=1)
             actual_v = torch.cat([prev_v, v], dim=1)
             actual_k_lens = seq_lens + prev_k.size(1)
@@ -334,6 +354,7 @@ class WanAttentionBlock(nn.Module):
         cache_frame_indices=None,
         cache_strip_rope=False,
         cache_tcrope_shift=0,
+        prev_kv_head_mask=None,
         face_context=None,
         face_context_lens=None,
         style_shift=None,
@@ -353,6 +374,8 @@ class WanAttentionBlock(nn.Module):
             cache_frame_indices(list, optional): Frame indices to cache
             cache_strip_rope(bool): If True, cache K without RoPE (Plan B)
             cache_tcrope_shift(int): Temporal phase offset for TcRoPE on cached K
+            prev_kv_head_mask(Tensor, optional): Boolean mask [num_heads] for
+                head-wise KV injection. Non-selected heads' cached KV is zeroed.
             face_context(Tensor, optional): Context with face tokens appended,
                 shape [B, L_text + L_face, C]. Used only in face injection layers.
             face_context_lens(Tensor, optional): Corresponding context lengths
@@ -386,7 +409,8 @@ class WanAttentionBlock(nn.Module):
             prev_kv=prev_kv, cache_kv=cache_kv,
             cache_frame_indices=cache_frame_indices,
             cache_strip_rope=cache_strip_rope,
-            cache_tcrope_shift=cache_tcrope_shift)
+            cache_tcrope_shift=cache_tcrope_shift,
+            prev_kv_head_mask=prev_kv_head_mask)
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -622,6 +646,7 @@ class WanModel(ModelMixin, ConfigMixin):
         intershot_layers=None,
         cache_strip_rope=False,
         cache_tcrope_shift=0,
+        intershot_head_mask=None,
         style_modulation=None,
         style_inject_layers=None,
         predx0_config=None,
@@ -661,6 +686,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 If True, cache K without RoPE (Plan B: semantic-only matching)
             cache_tcrope_shift (int):
                 Temporal phase offset for TcRoPE on cached K (0 = no shift)
+            intershot_head_mask (dict, optional):
+                {layer_idx: BoolTensor[num_heads]} selecting which heads receive
+                injected AnchorKV. Non-selected heads' cached KV is zeroed out.
             style_modulation (list, optional):
                 List of (Δshift, Δscale) tuples from StyleAdapter, one per style layer.
                 Each Δshift/Δscale has shape [B, dim].
@@ -804,6 +832,11 @@ class WanModel(ModelMixin, ConfigMixin):
                         block, ref_kv[0], ref_kv[1],
                         alpha=ref_attn_config.get('alpha', 0.3))
 
+            # Head-wise injection mask for this layer
+            layer_head_mask = None
+            if intershot_head_mask is not None and block_idx in intershot_head_mask:
+                layer_head_mask = intershot_head_mask[block_idx]
+
             x, cached_kv = block(
                 x, **kwargs,
                 prev_kv=prev_kv,
@@ -811,6 +844,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 cache_frame_indices=cache_frame_indices,
                 cache_strip_rope=cache_strip_rope,
                 cache_tcrope_shift=cache_tcrope_shift if use_intershot else 0,
+                prev_kv_head_mask=layer_head_mask,
                 **face_kw,
                 **style_kw,
                 predx0_hook=predx0_hook,
