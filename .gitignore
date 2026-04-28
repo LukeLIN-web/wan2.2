@@ -29,3 +29,4 @@ wandb/
 humanize/dpo_v0/out/
 humanize/dpo_v0/latents/
 humanize/dpo_v0/cache/
+wandbtoken
