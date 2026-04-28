@@ -6,7 +6,7 @@
 
 ## 2026-04-28 — DPO trainer 接 wandb
 
-**Commit**: `PENDING`
+**Commit**: `0f88d69`
 
 - `train_dpo_i2v.py`: 新增 `--wandb-{project,entity,mode,run-name}` 四个 CLI；`_wandb_init` 仅在 rank0 调用，import / init / log / finish 全 try-except，wandb 任何失败都不影响训练。
 - 每 `--log-every` 步 `wandb.log({loss, t_raw, logit, delta, mse_pi/ref_{w,l}, c_w, vram_peak})`；收尾把 `manifest` 全写到 `wandb.summary` 再 `finish()`。
