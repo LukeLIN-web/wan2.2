@@ -219,6 +219,23 @@ def streaming_canonical_hash(
     using a freshly-zeroed per-key hasher. Tensor bytes are released after
     the hasher updates, so peak memory is bounded by one tensor.
 
+    Example (typical caller — pre-sort once, then yield)::
+
+        def _walk(state_dict):
+            for key in sorted(state_dict.keys()):
+                yield key, state_dict[key]
+
+        merged_sha, sidecar_sha, n = streaming_canonical_hash(
+            _walk(state_dict),
+            run_dir / "sidecar.jsonl",
+        )
+
+    Producing keys in any order other than ``sorted(state_dict.keys())``
+    will produce a different ``merged_sha`` even for the same tensors --
+    that is the contract, not a bug. If the caller is reading from a
+    safetensors index whose ``weight_map`` is already alphabetical, the
+    pre-sort is a defensive no-op and is still cheap to add.
+
     Returns ``(merged_state_sha256, sidecar_sha256, tensor_count)``. The
     sidecar SHA-256 is computed by re-reading the file after closing it,
     which keeps the on-disk artifact and the stamped hash in lockstep
