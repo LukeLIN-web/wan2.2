@@ -205,8 +205,27 @@ def encode_pair_role(
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    ap.add_argument("--tier", choices=["tier_a", "tier_b_first_n"], default="tier_a")
+    ap.add_argument(
+        "--tier",
+        choices=["tier_a", "tier_b_first_n", "tier_b_round4_1k"],
+        default="tier_a",
+        help="tier_b_round4_1k reads pair_ids from --subset-pair-ids-json's "
+             "'tier_b_round4_1k.pair_ids' field (round-4 task #19 output) and "
+             "asserts pair_ids sha256[:16] == --pair-ids-sha256-pin.",
+    )
     ap.add_argument("--tier-b-n", type=int, default=200, help="if --tier tier_b_first_n, encode the first N pair_ids")
+    ap.add_argument(
+        "--subset-pair-ids-json",
+        type=pathlib.Path,
+        default=None,
+        help="Required when --tier tier_b_round4_1k: path to T3_round4_tier_b_1k.json (round-4 #19 output).",
+    )
+    ap.add_argument(
+        "--pair-ids-sha256-pin",
+        type=str,
+        default=None,
+        help="Required when --tier tier_b_round4_1k: expected sha256[:16] of newline-canonical pair_ids.",
+    )
     ap.add_argument("--out-root", type=pathlib.Path, default=HUMANIZE_DIR / "latents")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -221,8 +240,22 @@ def main(argv: list[str]) -> int:
     post_t2 = {r["pair_id"]: r for r in json.loads(POST_T2_PAIR_JSON.read_bytes())}
     if args.tier == "tier_a":
         pair_ids = list(subset["tier_a"]["pair_ids"])
-    else:
+    elif args.tier == "tier_b_first_n":
         pair_ids = list(subset["tier_b"]["pair_ids"])[: args.tier_b_n]
+    else:  # tier_b_round4_1k
+        if args.subset_pair_ids_json is None or args.pair_ids_sha256_pin is None:
+            raise SystemExit(
+                "--tier tier_b_round4_1k requires --subset-pair-ids-json AND --pair-ids-sha256-pin"
+            )
+        round4_data = json.loads(args.subset_pair_ids_json.read_bytes())
+        pair_ids = list(round4_data["tier_b_round4_1k"]["pair_ids"])
+        canonical = ("\n".join(pair_ids) + "\n").encode("utf-8")
+        fresh = hashlib.sha256(canonical).hexdigest()[:16]
+        if fresh != args.pair_ids_sha256_pin:
+            raise SystemExit(
+                f"pair_ids pin drift: fresh={fresh}, expected={args.pair_ids_sha256_pin}"
+            )
+        print(f"pair_ids pin OK: {fresh} (n_pairs={len(pair_ids)})")
     print(f"selected tier={args.tier}, pairs={len(pair_ids)}")
 
     print(f"hashing VAE at {VAE_PATH} ...")
