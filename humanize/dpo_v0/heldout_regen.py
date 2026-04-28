@@ -49,6 +49,16 @@ from typing import Callable, Optional
 
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+# rl8 task #16 manifest_writer (commit e096edf, schema version 1).
+# Adopted: assert_recipe_pins (3-way pin assert returning full pins dict)
+# + atomic_write_json (deterministic key order, .tmp + rename).
+from manifest_writer import (  # noqa: E402
+    MANIFEST_SCHEMA_VERSION as _MANIFEST_WRITER_SCHEMA_VERSION,
+    assert_recipe_pins as _mw_assert_recipe_pins,
+    atomic_write_json as _mw_atomic_write_json,
+)
 
 EXPECTED_RECIPE_ID = "6bef6e104cdd3442"  # AC-3.1, frozen in task-6 round 1
 EXPECTED_HELDOUT_PROMPTS = 42  # round-0 audit §3
@@ -60,20 +70,15 @@ EXPECTED_HELDOUT_PAIRS = 579
 
 
 def assert_recipe_pin(recipes_dir: pathlib.Path, expected: str = EXPECTED_RECIPE_ID) -> str:
-    yaml_path = recipes_dir / "wan22_i2v_a14b__round2_v0.yaml"
-    pin_path = recipes_dir / "recipe_id"
-    if not yaml_path.exists() or not pin_path.exists():
-        raise FileNotFoundError(
-            f"recipe artifacts missing: yaml={yaml_path.exists()}, pin={pin_path.exists()} "
-            f"(under {recipes_dir})"
-        )
-    fresh = hashlib.sha256(yaml_path.read_bytes()).hexdigest()[:16]
-    on_disk = pin_path.read_text(encoding="ascii").strip()
-    if not (fresh == on_disk == expected):
-        raise RuntimeError(
-            f"recipe pin drift: fresh={fresh}, on_disk={on_disk}, expected={expected}"
-        )
-    return on_disk
+    """Thin wrapper around manifest_writer.assert_recipe_pins (3-way assert).
+
+    Returns the recipe_id string for backward compatibility with the
+    earlier 2-way wrapper. Callers wanting the full pins dict (for
+    splatting into a manifest) should call ``_mw_assert_recipe_pins``
+    directly.
+    """
+    pins = _mw_assert_recipe_pins(recipes_dir, expected_recipe_id=expected)
+    return pins["recipe_id"]
 
 
 def load_heldout_records(t0_t3_root: pathlib.Path) -> list[dict]:
@@ -126,10 +131,39 @@ def _prompt_id(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
 
 
+def _resolve_cond_image_path(
+    primary: str,
+    fallback_root: Optional[pathlib.Path],
+) -> str:
+    """Resolve a canonical T2 image path, with optional cross-machine fallback.
+
+    Mirrors the trainer's ``--cond-image-fallback-root`` semantics from
+    rl1 commit ``0030832`` (round-3 attempt 5): if the primary absolute
+    path exists, return it; otherwise look for ``<fallback_root>/<basename>``
+    and return that if present. The fallback is basename-keyed because
+    the canonical manifest paths come from the dev box and may live
+    under different prefixes on juyi-finetune / juyi-videorl.
+
+    Returns the resolved path string. If neither primary nor fallback
+    exists, returns the primary path unchanged so the downstream
+    inference_smoke loader fails loudly with the real error rather than
+    a synthesized one (caller can always pre-check existence if needed).
+    """
+    if pathlib.Path(primary).exists():
+        return primary
+    if fallback_root is None:
+        return primary
+    candidate = fallback_root / pathlib.Path(primary).name
+    if candidate.exists():
+        return str(candidate)
+    return primary
+
+
 def select_canonical_groups(
     records: list[dict],
     image_manifest: dict,
     rule: str = "first_alpha",
+    cond_image_fallback_root: Optional[pathlib.Path] = None,
 ) -> list[HeldoutPrompt]:
     """For each unique prompt, pick one canonical group + its T2 image.
 
@@ -179,6 +213,7 @@ def select_canonical_groups(
         cond_image_path = entry["image_path"]
         if not cond_image_path:
             raise ValueError(f"group {group_id}: empty image_path in T2 manifest")
+        cond_image_path = _resolve_cond_image_path(cond_image_path, cond_image_fallback_root)
 
         selections.append(
             HeldoutPrompt(
@@ -201,13 +236,13 @@ def select_canonical_groups(
 
 def canonical_generation_config(
     seed: int,
-    sampler: str = "unipc",
+    sampler: str = "uni_pc",
     inference_steps: int = 50,
     guidance_scale: float = 5.0,
     negative_prompt: str = "",
     resolution: tuple[int, int] = (832, 480),
     num_frames: int = 81,
-    dtype: str = "bfloat16",
+    dtype: str = "bf16",
     judge_preprocessing: str = "phygroundata.md#section-8",
 ) -> dict:
     """The single shared generation_config dict.
@@ -248,6 +283,35 @@ def serialize_generation_config(cfg: dict) -> bytes:
 InferenceAdapter = Callable[[str, str, str, bytes, pathlib.Path, dict], dict]
 
 
+# Filenames inference_smoke.py is expected to drop in its out_dir
+# (per rl5 schema in #dpo:5db9718b msg `a76f4c8e`). The `ckpt_shas`
+# block lives at the top level of either file; we look at both.
+_INFERENCE_SMOKE_MANIFEST_NAMES = ("manifest.json", "run_manifest.json")
+
+
+def _extract_ckpt_shas(out_dir: pathlib.Path) -> Optional[dict]:
+    """Read inference_smoke.py's per-run manifest and surface ``ckpt_shas``.
+
+    Returns ``None`` if no manifest exists yet (e.g. dry-run, or the
+    inference smoke step did not write one). Caller decides whether the
+    absence is a hard fail (M6 production) or expected (dry_run / smoke
+    pre-launch). Per AC-7.3, ``ckpt_shas`` is the authoritative
+    "what was actually loaded" record (rl5 `a76f4c8e` option B).
+    """
+    for name in _INFERENCE_SMOKE_MANIFEST_NAMES:
+        path = out_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_bytes())
+        except json.JSONDecodeError:
+            continue
+        shas = data.get("ckpt_shas")
+        if isinstance(shas, dict):
+            return shas
+    return None
+
+
 def subprocess_inference_adapter(
     inference_smoke_py: pathlib.Path,
     python_executable: str = sys.executable,
@@ -255,14 +319,24 @@ def subprocess_inference_adapter(
 ) -> InferenceAdapter:
     """Adapter that shells out to ``inference_smoke.py`` per sample.
 
-    Contract assumed of ``inference_smoke.py`` (rl5, task #7):
-      - CLI flags: ``--baseline_ckpt`` / ``--trained_lora`` / ``--low_noise_ckpt``
-        (one of the first two depending on run_kind) plus ``--prompt``,
-        ``--cond_image``, ``--out_dir``, ``--gen_config_json``, ``--seed``.
-      - Reads gen_config_json bytes, asserts they're parseable, applies
-        them as the generation_config, writes the resulting sample +
-        per-run manifest JSON under out_dir.
-      - Exits 0 on success, non-zero on failure (OOM/dtype/device).
+    CLI contract locked by rl5 (task #7, msg ``5e8993eb``):
+
+        inference_smoke.py
+          --mode {both, baseline, trained}        # M6 uses baseline | trained
+          --baseline_ckpt PATH                     # required for mode in {both, baseline}
+          --trained_lora PATH                      # required for mode in {both, trained}
+          --low_noise_ckpt PATH                    # REQUIRED ALWAYS (frozen low-noise expert)
+          --upstream PATH                          # VAE/T5/tokenizer source root
+          --recipe_yaml PATH                       # recipe_id pin assert source
+          --prompt TEXT | --prompt_file PATH
+          --cond_image PATH
+          --out_dir PATH
+          --seed INT
+          --gen_config_json PATH                   # single source of truth for generation_config
+
+    M6 invokes one prompt at a time, ``--mode baseline`` then
+    ``--mode trained``, with the same ``--gen_config_json`` so
+    byte-identicality is enforced by the file itself, not by hand-copying.
 
     If rl5 lands a different CLI shape, swap this adapter for a Python
     API one (see ``python_api_inference_adapter`` below) without
@@ -283,29 +357,37 @@ def subprocess_inference_adapter(
         prompt_path = out_dir / "prompt.txt"
         prompt_path.write_text(prompt, encoding="utf-8")
 
+        # low_noise_ckpt is required for every M6 invocation.
+        if "low_noise_ckpt" not in ckpt_args:
+            raise KeyError(
+                "M6 inference requires ckpt_args['low_noise_ckpt'] (frozen low-noise expert), "
+                "per rl5 inference_smoke.py CLI lock (msg 5e8993eb)."
+            )
+
         cmd = [
             python_executable,
             str(inference_smoke_py),
+            "--mode", run_kind,
             "--prompt", prompt,
             "--cond_image", cond_image_path,
             "--out_dir", str(out_dir),
             "--gen_config_json", str(gen_cfg_path),
             "--seed", str(json.loads(gen_config_bytes)["seed"]),
+            "--low_noise_ckpt", ckpt_args["low_noise_ckpt"],
         ]
+        if "upstream" in ckpt_args:
+            cmd += ["--upstream", ckpt_args["upstream"]]
+        if "recipe_yaml" in ckpt_args:
+            cmd += ["--recipe_yaml", ckpt_args["recipe_yaml"]]
+
         if run_kind == "baseline":
             if "baseline_ckpt" not in ckpt_args:
                 raise KeyError("baseline run requires ckpt_args['baseline_ckpt']")
             cmd += ["--baseline_ckpt", ckpt_args["baseline_ckpt"]]
-            if "low_noise_ckpt" in ckpt_args:
-                cmd += ["--low_noise_ckpt", ckpt_args["low_noise_ckpt"]]
         elif run_kind == "trained":
             if "trained_lora" not in ckpt_args:
                 raise KeyError("trained run requires ckpt_args['trained_lora']")
             cmd += ["--trained_lora", ckpt_args["trained_lora"]]
-            if "baseline_ckpt" in ckpt_args:
-                cmd += ["--baseline_ckpt", ckpt_args["baseline_ckpt"]]
-            if "low_noise_ckpt" in ckpt_args:
-                cmd += ["--low_noise_ckpt", ckpt_args["low_noise_ckpt"]]
         else:
             raise ValueError(f"unknown run_kind: {run_kind!r}")
 
@@ -328,6 +410,7 @@ def subprocess_inference_adapter(
             "out_dir": str(out_dir),
             "wall_seconds": round(wall, 2),
             "cmd": cmd,
+            "ckpt_shas": _extract_ckpt_shas(out_dir),
         }
 
     return adapter
@@ -336,19 +419,22 @@ def subprocess_inference_adapter(
 def python_api_inference_adapter(run_one_sample: Callable) -> InferenceAdapter:
     """Adapter that calls into rl5's ``inference_smoke.run_one_sample`` directly.
 
-    Expected signature (TBD — pending rl5 task #7 round-1 commit)::
+    Expected signature (per rl5 task #7 lock, msg ``5e8993eb``)::
 
         run_one_sample(
-            run_kind: str,            # "baseline" | "trained"
-            prompt: str,
-            cond_image_path: str,
-            gen_config: dict,
-            out_dir: pathlib.Path,
-            **ckpt_args,              # baseline_ckpt / trained_lora / low_noise_ckpt
-        ) -> dict                     # per-run manifest
+            mode: Literal["baseline", "trained"],
+            *, baseline_ckpt, trained_lora, low_noise_ckpt, upstream,
+            prompt, cond_image, out_dir, seed, gen_config: dict, recipe_yaml,
+        ) -> dict     # returns manifest stamp incl. ``ckpt_shas``
 
     Once rl5 lands the function, swap the adapter via the orchestrator's
     ``--adapter python_api`` flag (see ``main()``).
+
+    The subprocess adapter remains the operational default — Python API
+    is opt-in. This is intentional: the process boundary is an escape
+    valve for deploy issues (env divergence, accidental CUDA-context
+    leakage, partial OOM recovery) where the in-process adapter would
+    take down the orchestrator with the failed sample. Keep both.
     """
 
     def adapter(
@@ -365,12 +451,14 @@ def python_api_inference_adapter(run_one_sample: Callable) -> InferenceAdapter:
         gen_config = json.loads(gen_config_bytes)
         t0 = time.time()
         result = run_one_sample(
-            run_kind=run_kind,
+            mode=run_kind,
             prompt=prompt,
-            cond_image_path=cond_image_path,
+            cond_image=cond_image_path,
             gen_config=gen_config,
             out_dir=out_dir,
-            **ckpt_args,
+            seed=gen_config["seed"],
+            **{k: v for k, v in ckpt_args.items()
+               if k in ("baseline_ckpt", "trained_lora", "low_noise_ckpt", "upstream", "recipe_yaml")},
         )
         wall = time.time() - t0
         return {
@@ -378,6 +466,8 @@ def python_api_inference_adapter(run_one_sample: Callable) -> InferenceAdapter:
             "out_dir": str(out_dir),
             "wall_seconds": round(wall, 2),
             "result": result,
+            "ckpt_shas": (result.get("ckpt_shas") if isinstance(result, dict) else None)
+                         or _extract_ckpt_shas(out_dir),
         }
 
     return adapter
@@ -484,7 +574,7 @@ def regen_one_prompt(
         "trained": trained_manifest,
         "complete": True,
     }
-    summary_path.write_text(json.dumps(out, indent=2, sort_keys=True), encoding="utf-8")
+    _mw_atomic_write_json(summary_path, out)
     return out
 
 
@@ -526,40 +616,68 @@ def main() -> int:
                    help="Path to the dpo_v0 recipes/ dir (defaults to alongside this file).")
     p.add_argument("--inference-smoke-py", type=pathlib.Path, default=HERE / "inference_smoke.py",
                    help="Path to rl5's inference_smoke.py (used by subprocess adapter).")
-    p.add_argument("--adapter", choices=["subprocess", "dry_run"], default="subprocess",
-                   help="Inference adapter to use. 'subprocess' shells out to inference_smoke.py; "
-                        "'dry_run' is a no-op for orchestration testing without GPU.")
+    p.add_argument("--adapter", choices=["subprocess", "python_api", "dry_run"], default="subprocess",
+                   help="Inference adapter to use. 'subprocess' shells out to inference_smoke.py "
+                        "(default; deploy escape valve via process boundary). 'python_api' imports "
+                        "inference_smoke.run_one_sample and calls it in-process (rl5 lock 5e8993eb / "
+                        "ac00949). 'dry_run' is a no-op for orchestration testing without GPU.")
     p.add_argument("--baseline-ckpt", type=str, default=None,
                    help="Path to original-init no-DPO baseline ckpt (high-noise sharded base).")
     p.add_argument("--trained-lora", type=str, default=None,
                    help="Path to LoRA adapter checkpoint from M3/M4 trained run.")
     p.add_argument("--low-noise-ckpt", type=str, default=None,
-                   help="Path to frozen low-noise expert (per AC-7.3 SHA stamping).")
+                   help="Path to frozen low-noise expert (REQUIRED with --adapter subprocess; "
+                        "per AC-7.3 SHA stamping + rl5 inference_smoke.py CLI lock).")
+    p.add_argument("--upstream", type=str, default=None,
+                   help="VAE/T5/tokenizer source root (passed through to inference_smoke.py).")
+    p.add_argument("--recipe-yaml", type=str, default=None,
+                   help="Recipe YAML path for inference_smoke.py recipe_id pin assert "
+                        "(passed through; defaults to inference_smoke's own canonical path).")
     p.add_argument("--seed", type=int, default=42,
                    help="Generation seed (byte-identical between baseline and trained).")
-    p.add_argument("--sampler", type=str, default="unipc")
+    p.add_argument("--sampler", type=str, default="uni_pc",
+                   help="Sampler name; defaults to 'uni_pc' per rl5 inference_smoke.py CLI lock.")
     p.add_argument("--inference-steps", type=int, default=50)
     p.add_argument("--guidance-scale", type=float, default=5.0)
     p.add_argument("--negative-prompt", type=str, default="")
     p.add_argument("--resolution", type=str, default="832x480",
                    help="WxH; defaults to 832x480 per parent-plan training resolution.")
     p.add_argument("--num-frames", type=int, default=81)
-    p.add_argument("--dtype", type=str, default="bfloat16")
+    p.add_argument("--dtype", type=str, default="bf16",
+                   help="dtype tag stamped into gen_config; defaults to 'bf16' per rl5 schema.")
     p.add_argument("--selection-rule", choices=["first_alpha", "first_in_record_order"],
                    default="first_alpha")
+    p.add_argument("--cond-image-fallback-root", type=pathlib.Path, default=None,
+                   help="Basename-keyed fallback dir for cond images when canonical T2 paths "
+                        "are not mounted on this host (mirrors rl1 trainer flag from commit "
+                        "0030832 round-3 attempt 5). If primary path missing, look for "
+                        "<fallback_root>/<basename>; otherwise leave path as-is so loader "
+                        "fails with the real error.")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
     p.add_argument("--rank", type=int, default=int(os.environ.get("RANK", "0")))
     p.add_argument("--world-size", type=int, default=int(os.environ.get("WORLD_SIZE", "1")))
-    p.add_argument("--compute-envelope", choices=["single_gpu", "dpo_multi_gpu_zero2"],
+    p.add_argument("--compute-envelope",
+                   choices=["single_gpu", "dpo_multi_gpu_ddp", "dpo_multi_gpu_zero2",
+                            "multi_gpu_inference_seed_parallel"],
                    default="single_gpu",
-                   help="DEC-6 envelope tag stamped into the run manifest.")
+                   help="DEC-6 envelope tag stamped into the run manifest. "
+                        "Inference defaults to 'single_gpu'; M6 4-rank parallel-by-seed is "
+                        "'multi_gpu_inference_seed_parallel' (DEC-6 i2v.md L76).")
     args = p.parse_args()
 
     if args.adapter == "subprocess":
-        if args.baseline_ckpt is None or args.trained_lora is None:
+        missing = []
+        if args.baseline_ckpt is None:
+            missing.append("--baseline-ckpt")
+        if args.trained_lora is None:
+            missing.append("--trained-lora")
+        if args.low_noise_ckpt is None:
+            missing.append("--low-noise-ckpt")
+        if missing:
             print(
-                "[heldout_regen] --baseline-ckpt and --trained-lora are required with --adapter subprocess",
+                f"[heldout_regen] {', '.join(missing)} required with --adapter subprocess "
+                f"(per rl5 inference_smoke.py CLI lock).",
                 file=sys.stderr,
             )
             return 2
@@ -578,8 +696,19 @@ def main() -> int:
     )
 
     # 3. canonical selection
-    selections = select_canonical_groups(records, image_manifest, rule=args.selection_rule)
+    selections = select_canonical_groups(
+        records,
+        image_manifest,
+        rule=args.selection_rule,
+        cond_image_fallback_root=args.cond_image_fallback_root,
+    )
     print(f"[selection] {len(selections)} canonical (prompt, group, image) triples", flush=True)
+    if args.cond_image_fallback_root is not None:
+        n_fallback = sum(
+            1 for s in selections
+            if str(args.cond_image_fallback_root) in s.cond_image_path
+        )
+        print(f"[selection] {n_fallback}/{len(selections)} cond images resolved via fallback", flush=True)
 
     # 4. byte-identical generation_config
     res = args.resolution.lower().split("x")
@@ -609,6 +738,20 @@ def main() -> int:
             )
             return 2
         adapter = subprocess_inference_adapter(args.inference_smoke_py)
+    elif args.adapter == "python_api":
+        # Lazy-import so subprocess + dry_run paths don't require inference_smoke
+        # to be importable (it depends on heavy GPU libs that the orchestrator
+        # itself doesn't need).
+        try:
+            from inference_smoke import run_one_sample  # type: ignore
+        except ImportError as exc:
+            print(
+                f"[heldout_regen] --adapter python_api requires inference_smoke.run_one_sample "
+                f"importable from PYTHONPATH (rl5 task #7 commit ac00949). ImportError: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        adapter = python_api_inference_adapter(run_one_sample)
     else:
         adapter = dry_run_inference_adapter()
 
@@ -619,6 +762,10 @@ def main() -> int:
         ckpt_args["trained_lora"] = args.trained_lora
     if args.low_noise_ckpt is not None:
         ckpt_args["low_noise_ckpt"] = args.low_noise_ckpt
+    if args.upstream is not None:
+        ckpt_args["upstream"] = args.upstream
+    if args.recipe_yaml is not None:
+        ckpt_args["recipe_yaml"] = args.recipe_yaml
 
     # 6. run-level dir + manifest
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -636,10 +783,9 @@ def main() -> int:
         "ckpt_args": ckpt_args,
         "rank": args.rank,
         "world_size": args.world_size,
+        "manifest_writer_schema_version": _MANIFEST_WRITER_SCHEMA_VERSION,
     }
-    (run_dir / "run_manifest.pre.json").write_text(
-        json.dumps(run_manifest_pre, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _mw_atomic_write_json(run_dir / "run_manifest.pre.json", run_manifest_pre)
 
     # 7. orchestration loop
     results = regen_all(
@@ -657,9 +803,7 @@ def main() -> int:
     run_manifest_post["results_count"] = len(results)
     run_manifest_post["complete"] = all(r.get("complete") for r in results)
     run_manifest_post["results"] = results
-    (run_dir / "run_manifest.json").write_text(
-        json.dumps(run_manifest_post, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _mw_atomic_write_json(run_dir / "run_manifest.json", run_manifest_post)
     print(
         f"[done] regenerated {len(results)} prompts (rank {args.rank}/{args.world_size}); "
         f"manifest at {run_dir / 'run_manifest.json'}",

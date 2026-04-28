@@ -283,6 +283,311 @@ def test_regen_all_world_size_sharding(tmp_path: pathlib.Path):
             seen.add(r["prompt_id"])
 
 
+# ---------- subprocess adapter CLI shape (rl5 lock 5e8993eb) ----------
+
+
+def test_subprocess_adapter_emits_locked_cli(tmp_path: pathlib.Path, monkeypatch):
+    """Verify the subprocess command shape matches rl5's locked inference_smoke.py CLI."""
+    captured: dict = {}
+
+    class _StubResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, timeout):
+        captured["cmd"] = list(cmd)
+        return _StubResult()
+
+    monkeypatch.setattr(heldout_regen.subprocess, "run", fake_run)
+
+    fake_inference = tmp_path / "inference_smoke.py"
+    fake_inference.write_text("# stub")
+    adapter = heldout_regen.subprocess_inference_adapter(fake_inference)
+
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=7)
+    )
+    adapter(
+        run_kind="baseline",
+        prompt="a thing happens",
+        cond_image_path="/fake/img.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out_baseline",
+        ckpt_args={
+            "baseline_ckpt": "/ckpt/base.safetensors",
+            "trained_lora": "/ckpt/lora.safetensors",
+            "low_noise_ckpt": "/ckpt/low.safetensors",
+            "upstream": "/data/Wan2.2-I2V-A14B",
+            "recipe_yaml": "/recipes/r.yaml",
+        },
+    )
+    cmd = captured["cmd"]
+    assert "--mode" in cmd and cmd[cmd.index("--mode") + 1] == "baseline"
+    assert "--baseline_ckpt" in cmd and cmd[cmd.index("--baseline_ckpt") + 1] == "/ckpt/base.safetensors"
+    assert "--low_noise_ckpt" in cmd and cmd[cmd.index("--low_noise_ckpt") + 1] == "/ckpt/low.safetensors"
+    assert "--upstream" in cmd and cmd[cmd.index("--upstream") + 1] == "/data/Wan2.2-I2V-A14B"
+    assert "--recipe_yaml" in cmd and cmd[cmd.index("--recipe_yaml") + 1] == "/recipes/r.yaml"
+    assert "--prompt" in cmd
+    assert "--cond_image" in cmd
+    assert "--out_dir" in cmd
+    assert "--gen_config_json" in cmd
+    assert "--seed" in cmd
+    # baseline mode does NOT pass --trained_lora
+    assert "--trained_lora" not in cmd
+
+
+def test_subprocess_adapter_trained_mode(tmp_path: pathlib.Path, monkeypatch):
+    captured: dict = {}
+
+    class _StubResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        heldout_regen.subprocess, "run",
+        lambda cmd, capture_output, text, timeout: (captured.update({"cmd": list(cmd)}) or _StubResult()),
+    )
+
+    fake_inference = tmp_path / "inference_smoke.py"
+    fake_inference.write_text("# stub")
+    adapter = heldout_regen.subprocess_inference_adapter(fake_inference)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=7)
+    )
+    adapter(
+        run_kind="trained",
+        prompt="x",
+        cond_image_path="/fake.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out_trained",
+        ckpt_args={
+            "trained_lora": "/ckpt/lora.safetensors",
+            "low_noise_ckpt": "/ckpt/low.safetensors",
+        },
+    )
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--mode") + 1] == "trained"
+    assert "--trained_lora" in cmd
+    assert "--baseline_ckpt" not in cmd  # trained mode doesn't need baseline
+
+
+def test_python_api_adapter_signature_matches_rl5_lock(tmp_path: pathlib.Path):
+    """The python_api adapter must call run_one_sample with the keyword arg
+    set rl5 locked at msg `5e8993eb` / `ac00949`:
+
+        mode, prompt, cond_image, gen_config, out_dir, seed,
+        baseline_ckpt, trained_lora, low_noise_ckpt, upstream, recipe_yaml
+
+    Any drift in this signature would break the wire-in. This test mocks
+    run_one_sample as a kwargs-only callable to assert the contract.
+    """
+    captured: dict = {}
+
+    def fake_run_one_sample(*, mode, prompt, cond_image, gen_config, out_dir, seed,
+                            baseline_ckpt=None, trained_lora=None, low_noise_ckpt=None,
+                            upstream=None, recipe_yaml=None):
+        captured.update(
+            mode=mode, prompt=prompt, cond_image=cond_image, gen_config=gen_config,
+            out_dir=out_dir, seed=seed,
+            baseline_ckpt=baseline_ckpt, trained_lora=trained_lora,
+            low_noise_ckpt=low_noise_ckpt, upstream=upstream, recipe_yaml=recipe_yaml,
+        )
+        return {
+            "mode": mode,
+            "ckpt_shas": {
+                "high_noise_base_sha256": "h0",
+                "low_noise_frozen_sha256": "l0",
+                **({"lora_adapter_sha256": "la"} if mode == "trained" else {}),
+            },
+        }
+
+    adapter = heldout_regen.python_api_inference_adapter(fake_run_one_sample)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    out = adapter(
+        run_kind="trained",
+        prompt="a thing",
+        cond_image_path="/fake/img.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out",
+        ckpt_args={
+            "baseline_ckpt": "/ckpt/base.safetensors",
+            "trained_lora": "/ckpt/lora.safetensors",
+            "low_noise_ckpt": "/ckpt/low.safetensors",
+            "upstream": "/data/Wan2.2-I2V-A14B",
+            "recipe_yaml": "/recipes/r.yaml",
+        },
+    )
+    # Signature contract assertions
+    assert captured["mode"] == "trained"
+    assert captured["prompt"] == "a thing"
+    assert captured["cond_image"] == "/fake/img.png"
+    assert captured["seed"] == 11
+    assert captured["baseline_ckpt"] == "/ckpt/base.safetensors"
+    assert captured["trained_lora"] == "/ckpt/lora.safetensors"
+    assert captured["low_noise_ckpt"] == "/ckpt/low.safetensors"
+    assert captured["upstream"] == "/data/Wan2.2-I2V-A14B"
+    assert captured["recipe_yaml"] == "/recipes/r.yaml"
+    # ckpt_shas propagated from inner result
+    assert out["ckpt_shas"] == {
+        "high_noise_base_sha256": "h0",
+        "low_noise_frozen_sha256": "l0",
+        "lora_adapter_sha256": "la",
+    }
+
+
+def test_subprocess_adapter_requires_low_noise(tmp_path: pathlib.Path):
+    fake_inference = tmp_path / "inference_smoke.py"
+    fake_inference.write_text("# stub")
+    adapter = heldout_regen.subprocess_inference_adapter(fake_inference)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=7)
+    )
+    with pytest.raises(KeyError, match="low_noise_ckpt"):
+        adapter(
+            run_kind="baseline",
+            prompt="x",
+            cond_image_path="/fake.png",
+            gen_config_bytes=cfg_bytes,
+            out_dir=tmp_path / "out",
+            ckpt_args={"baseline_ckpt": "/ckpt/base.safetensors"},
+        )
+
+
+# ---------- ckpt_shas propagation (rl5 schema a76f4c8e) ----------
+
+
+def test_extract_ckpt_shas_reads_manifest(tmp_path: pathlib.Path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "manifest.json").write_text(json.dumps({
+        "ckpt_shas": {
+            "high_noise_base_sha256": "deadbeef",
+            "low_noise_frozen_sha256": "cafef00d",
+            "lora_adapter_sha256": "12345678",
+        },
+    }))
+    shas = heldout_regen._extract_ckpt_shas(out_dir)
+    assert shas == {
+        "high_noise_base_sha256": "deadbeef",
+        "low_noise_frozen_sha256": "cafef00d",
+        "lora_adapter_sha256": "12345678",
+    }
+
+
+def test_extract_ckpt_shas_missing_manifest(tmp_path: pathlib.Path):
+    assert heldout_regen._extract_ckpt_shas(tmp_path) is None
+
+
+def test_extract_ckpt_shas_run_manifest_alias(tmp_path: pathlib.Path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "run_manifest.json").write_text(json.dumps({
+        "ckpt_shas": {"high_noise_base_sha256": "abc"},
+    }))
+    shas = heldout_regen._extract_ckpt_shas(out_dir)
+    assert shas == {"high_noise_base_sha256": "abc"}
+
+
+def test_subprocess_adapter_propagates_ckpt_shas(tmp_path: pathlib.Path, monkeypatch):
+    """When inference_smoke writes manifest.json with ckpt_shas, adapter surfaces it."""
+    captured: dict = {}
+
+    class _StubResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, timeout):
+        captured["cmd"] = list(cmd)
+        # Simulate inference_smoke dropping a manifest with ckpt_shas in out_dir.
+        out_idx = cmd.index("--out_dir") + 1
+        out_dir = pathlib.Path(cmd[out_idx])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "manifest.json").write_text(json.dumps({
+            "ckpt_shas": {
+                "high_noise_base_sha256": "aaaaa",
+                "low_noise_frozen_sha256": "bbbbb",
+            },
+        }))
+        return _StubResult()
+
+    monkeypatch.setattr(heldout_regen.subprocess, "run", fake_run)
+
+    fake_inference = tmp_path / "inference_smoke.py"
+    fake_inference.write_text("# stub")
+    adapter = heldout_regen.subprocess_inference_adapter(fake_inference)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=7)
+    )
+    out = adapter(
+        run_kind="baseline",
+        prompt="x",
+        cond_image_path="/fake.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out",
+        ckpt_args={
+            "baseline_ckpt": "/ckpt/base.safetensors",
+            "low_noise_ckpt": "/ckpt/low.safetensors",
+        },
+    )
+    assert out["ckpt_shas"] == {
+        "high_noise_base_sha256": "aaaaa",
+        "low_noise_frozen_sha256": "bbbbb",
+    }
+
+
+# ---------- cond-image fallback root (rl1 0030832 mirror) ----------
+
+
+def test_resolve_cond_image_fallback_root(tmp_path: pathlib.Path):
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    (fallback / "img.png").write_bytes(b"\x89PNG")
+    primary_missing = "/this/path/does/not/exist/img.png"
+    out = heldout_regen._resolve_cond_image_path(primary_missing, fallback)
+    assert out == str(fallback / "img.png")
+
+
+def test_resolve_cond_image_passthrough_when_primary_exists(tmp_path: pathlib.Path):
+    primary_real = tmp_path / "real.png"
+    primary_real.write_bytes(b"x")
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    out = heldout_regen._resolve_cond_image_path(str(primary_real), fallback)
+    assert out == str(primary_real)
+
+
+def test_resolve_cond_image_returns_primary_when_fallback_misses(tmp_path: pathlib.Path):
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    primary_missing = "/no/such/img.png"
+    out = heldout_regen._resolve_cond_image_path(primary_missing, fallback)
+    assert out == primary_missing  # unchanged so downstream loader fails loudly
+
+
+def test_select_canonical_with_fallback(tmp_path: pathlib.Path):
+    root = _build_heldout_fixture(tmp_path)
+    records = heldout_regen.load_heldout_records(root)
+    image_manifest = heldout_regen.load_t2_image_manifest(root)
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    # Materialize one fallback for the first canonical group.
+    first_group_id = sorted(image_manifest.keys())[0]
+    (fallback / f"{first_group_id}.png").write_bytes(b"\x89PNG")
+    selections = heldout_regen.select_canonical_groups(
+        records, image_manifest, rule="first_alpha",
+        cond_image_fallback_root=fallback,
+    )
+    # The selection that maps to first_group_id should resolve via fallback.
+    matches = [s for s in selections if s.group_id == first_group_id]
+    assert len(matches) == 1
+    assert str(fallback) in matches[0].cond_image_path
+
+
 # ---------- recipe-pin assertion ----------
 
 
@@ -291,7 +596,9 @@ def test_recipe_pin_drift_halts(tmp_path: pathlib.Path):
     rd.mkdir()
     (rd / "wan22_i2v_a14b__round2_v0.yaml").write_text("anything: 1")
     (rd / "recipe_id").write_text("0000000000000000")
-    with pytest.raises(RuntimeError, match="recipe pin drift"):
+    # Underlying impl is manifest_writer.assert_recipe_pins which raises
+    # AssertionError (3-way assert with all three values inline).
+    with pytest.raises(AssertionError, match="recipe pin drift"):
         heldout_regen.assert_recipe_pin(rd, expected="6bef6e104cdd3442")
 
 
