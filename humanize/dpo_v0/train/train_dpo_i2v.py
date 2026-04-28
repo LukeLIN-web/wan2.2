@@ -55,6 +55,45 @@ def _mem(stage, device="cuda:0"):
     except Exception:
         pass
 
+
+def _wandb_init(args, ts, recipe_id, world_size, run_dir):
+    # Rank-0-only. Returns the wandb module on success, None on disable / failure.
+    if not args.wandb_project or args.wandb_mode == "disabled":
+        return None
+    try:
+        import wandb
+    except Exception as e:
+        print(f"[wandb] import failed ({e}); skipping.", flush=True)
+        return None
+    name = args.wandb_run_name or f"{args.tier}-{recipe_id[:8]}-{ts}"
+    cfg = {
+        "tier": args.tier,
+        "lr": args.lr,
+        "beta": args.beta,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "max_steps": args.max_steps,
+        "seed_namespace": args.seed_namespace,
+        "world_size": world_size,
+        "dit_fsdp": args.dit_fsdp,
+        "enable_grad_ckpt": args.enable_grad_ckpt,
+        "halt_on_low_noise": args.halt_on_low_noise,
+        "recipe_id": recipe_id,
+        "training_config_sha256_pin": args.training_config_sha256_pin,
+        "pair_ids_sha256_hex16": args.pair_ids_sha256_pin,
+        "ts_utc": ts,
+        "run_dir": str(run_dir),
+    }
+    try:
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                   name=name, mode=args.wandb_mode, config=cfg, dir=str(run_dir))
+        print(f"[wandb] init ok: project={args.wandb_project} entity={args.wandb_entity} "
+              f"name={name} mode={args.wandb_mode}", flush=True)
+        return wandb
+    except Exception as e:
+        print(f"[wandb] init failed ({e}); continuing without wandb.", flush=True)
+        return None
+
 import safetensors.torch
 import torch
 import torch.distributed as dist
@@ -617,6 +656,16 @@ def main():
         help="Expected sha256[:16] of the canonical newline-joined pair_ids. "
              "Required when --subset-pair-ids-json is set.",
     )
+    # Wandb (rank-0 only; failures are non-fatal so training never depends on wandb).
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="Wandb project name. If unset (or --wandb-mode disabled), wandb is skipped.")
+    p.add_argument("--wandb-entity", type=str, default=None,
+                   help="Wandb entity (user or team).")
+    p.add_argument("--wandb-mode", type=str, default="online",
+                   choices=["online", "offline", "disabled"],
+                   help="Wandb mode. 'disabled' is a no-op even if --wandb-project is set.")
+    p.add_argument("--wandb-run-name", type=str, default=None,
+                   help="Wandb run name. Default: <tier>-<recipe[:8]>-<ts>.")
     args = p.parse_args()
 
     recipe_id = assert_recipe_pin(RECIPES_DIR, EXPECTED_RECIPE_ID)
@@ -694,9 +743,11 @@ def main():
 
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     run_dir = args.out_dir / ts
+    wandb_mod = None
     if is_main:
         run_dir.mkdir(parents=True, exist_ok=True)
         print(f"[init] world_size={world_size} rank={rank} device={device} run_dir={run_dir}", flush=True)
+        wandb_mod = _wandb_init(args, ts, recipe_id, world_size, run_dir)
 
     # Records
     records_all = load_pair_records(
@@ -1076,6 +1127,24 @@ def main():
                     f"elapsed={elapsed:.1f}s vram_peak={vram_alloc_gb:.2f}GB reserved={vram_reserved_gb:.2f}GB",
                     flush=True,
                 )
+                if wandb_mod is not None:
+                    try:
+                        wandb_mod.log({
+                            "loss": loss_val,
+                            "t_raw": t_raw,
+                            "logit": logit,
+                            "delta": float(delta_val.item()),
+                            "mse_pi_w": float(mse_pi_w_scalar.item()),
+                            "mse_pi_l": float(mse_pi_l_scalar.item()),
+                            "mse_ref_w": float(mse_ref_w.item()),
+                            "mse_ref_l": float(mse_ref_l.item()),
+                            "c_w": c_w,
+                            "elapsed_s": elapsed,
+                            "vram_peak_alloc_gb": vram_alloc_gb,
+                            "vram_peak_reserved_gb": vram_reserved_gb,
+                        }, step=step)
+                    except Exception as e:
+                        print(f"[wandb] log failed at step {step}: {e}", flush=True)
 
             # FSDP collective requires all ranks to enter summon_full_params together,
             # so the gating drops `is_main` here; _save_lora handles rank-0-only IO internally.
@@ -1151,6 +1220,15 @@ def main():
         print(f"[done] saved {ckpt_path}", flush=True)
         print(f"[done] manifest at {run_dir / 'run_manifest.json'}", flush=True)
         print(f"[done] routing counter: {routing_counter.summary()}", flush=True)
+
+        if wandb_mod is not None:
+            try:
+                for k, v in manifest.items():
+                    # wandb summary accepts JSON-ish scalars/lists/dicts.
+                    wandb_mod.summary[k] = v
+                wandb_mod.finish()
+            except Exception as e:
+                print(f"[wandb] finish failed: {e}", flush=True)
 
     if is_distributed:
         dist.destroy_process_group()

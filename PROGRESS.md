@@ -4,6 +4,17 @@
 
 ---
 
+## 2026-04-28 — DPO trainer 接 wandb
+
+**Commit**: `PENDING`
+
+- `train_dpo_i2v.py`: 新增 `--wandb-{project,entity,mode,run-name}` 四个 CLI；`_wandb_init` 仅在 rank0 调用，import / init / log / finish 全 try-except，wandb 任何失败都不影响训练。
+- 每 `--log-every` 步 `wandb.log({loss, t_raw, logit, delta, mse_pi/ref_{w,l}, c_w, vram_peak})`；收尾把 `manifest` 全写到 `wandb.summary` 再 `finish()`。
+- launcher 默认 `WANDB_PROJECT=wanrl WANDB_ENTITY=lukelin`；没 `WANDB_API_KEY` 也没 `~/.netrc` 就自动降级 `offline`。
+- 不要把 wandb log 放在所有 rank：FSDP 下非 rank0 调用会触发 wandb 多进程冲突；`if is_main:` 守好。
+
+---
+
 ## 2026-04-28 — DPO 14B step-0 OOM / cold boot
 
 **Commit**: `e05a9a5`
