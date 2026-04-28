@@ -206,11 +206,8 @@ def main(argv=None):
             s1 = video_score[v1]["score"]
             s2 = video_score[v2]["score"]
 
-            # invariant: same group ⇒ same prompt (already asserted in loader);
-            # any violation here is a bug, not a drop.
-            # We still keep the bucket label for manifest completeness; the value
-            # must remain 0 by construction.
-
+            # cross_prompt / cross_group are invariants (always 0 by construction);
+            # the histogram keys are kept for manifest completeness.
             if s1 == s2:
                 drop_hist["tie"] += 1
                 continue
@@ -293,9 +290,9 @@ def main(argv=None):
     assert train_p.isdisjoint(hold_p), "train ∩ heldout prompts non-empty"
     assert val_p.isdisjoint(hold_p), "val ∩ heldout prompts non-empty"
 
-    # Overall Wan-pair counts
-    wan_overall_loser = sum(1 for p in pairs if p["loser"]["dataset"] == args.target_model)
-    wan_overall_winner = sum(1 for p in pairs if p["winner"]["dataset"] == args.target_model)
+    # Overall Wan-pair counts (sum across splits — already computed per-split above).
+    wan_overall_loser = sum(splits_out[s]["wan_pair_counts"]["as_loser"] for s in ("train", "val", "heldout"))
+    wan_overall_winner = sum(splits_out[s]["wan_pair_counts"]["as_winner"] for s in ("train", "val", "heldout"))
 
     # Distinct datasets seen
     datasets = sorted({p["winner"]["dataset"] for p in pairs} | {p["loser"]["dataset"] for p in pairs})

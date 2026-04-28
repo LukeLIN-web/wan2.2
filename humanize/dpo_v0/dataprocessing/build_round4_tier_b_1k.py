@@ -135,7 +135,6 @@ def main(argv=None):
     rng.shuffle(shuffled)
     selected = shuffled[: args.target_n]
 
-    selected_set = set(selected)
     selected_records = [pair_by_id[pid] for pid in selected]
     selected_groups = {r["group_id"] for r in selected_records}
     selected_scenes = {r["filename"] for r in selected_records}

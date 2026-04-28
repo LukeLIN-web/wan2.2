@@ -48,13 +48,10 @@ def select_tier_a(train_pairs, n: int, seed: str):
     rng.shuffle(wan_winner)
 
     def diverse_take(pool, k, opp_key):
-        seen_opp = {}
-        # Sort by opponent dataset visit count to balance opponents.
+        # Greedy round-robin: at each step pick the pair whose opponent dataset
+        # has the lowest cumulative pick count, breaking ties by pair_id.
+        seen_opp = {p[opp_key]["dataset"]: 0 for p in pool}
         out = []
-        for p in pool:
-            opp = p[opp_key]["dataset"]
-            seen_opp.setdefault(opp, 0)
-        # Greedy: pick the pair whose opponent has the lowest current count.
         remaining = list(pool)
         while len(out) < k and remaining:
             remaining.sort(key=lambda p: (seen_opp[p[opp_key]["dataset"]], p["pair_id"]))
@@ -71,10 +68,10 @@ def select_tier_a(train_pairs, n: int, seed: str):
 def main(argv=None):
     args = parse_args(argv)
 
-    train_pairs = json.load(open(args.train_json))
-    val_pairs = json.load(open(args.val_json))
-    heldout_pairs = json.load(open(args.heldout_json))
-    post_t2 = json.load(open(args.post_t2_pair_json))
+    train_pairs = json.loads(Path(args.train_json).read_bytes())
+    val_pairs = json.loads(Path(args.val_json).read_bytes())
+    heldout_pairs = json.loads(Path(args.heldout_json).read_bytes())
+    post_t2 = json.loads(Path(args.post_t2_pair_json).read_bytes())
 
     # Tier A: 16 stratified pair_ids from train.
     tier_a = select_tier_a(train_pairs, n=args.tier_a_size, seed=args.tier_a_seed)

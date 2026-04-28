@@ -89,9 +89,8 @@ def _read_recipe_pin() -> str:
     return on_disk
 
 
-def _load_heldout_blocklist() -> set[str]:
-    """Load the heldout filename set from T3_subset.json (AC-4 guard)."""
-    subset = json.loads(T3_SUBSET_JSON.read_bytes())
+def _heldout_blocklist(subset: dict) -> set[str]:
+    """Extract the heldout filename set from a loaded T3_subset.json (AC-4 guard)."""
     return set(subset["heldout_excluded"]["scene_filenames"])
 
 
@@ -251,10 +250,10 @@ def main(argv: list[str]) -> int:
 
     recipe_id = _read_recipe_pin()
     print(f"recipe_id pin OK: {recipe_id}")
-    blocklist = _load_heldout_blocklist()
-    print(f"heldout blocklist size: {len(blocklist)}")
 
     subset = json.loads(T3_SUBSET_JSON.read_bytes())
+    blocklist = _heldout_blocklist(subset)
+    print(f"heldout blocklist size: {len(blocklist)}")
     post_t2 = {r["pair_id"]: r for r in json.loads(POST_T2_PAIR_JSON.read_bytes())}
     if args.tier == "tier_a":
         pair_ids = list(subset["tier_a"]["pair_ids"])
