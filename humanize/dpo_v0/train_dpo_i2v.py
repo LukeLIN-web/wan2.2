@@ -212,6 +212,7 @@ class PairRecord:
     group_id: str
     prompt: str
     cond_image_path: str
+    cond_image_md5: str  # rl2 round-2 review: cache cond latents by image_md5 not path
     winner_latent_path: str
     loser_latent_path: str
 
@@ -238,13 +239,16 @@ def load_pair_records(
     for pid, roles in pairs_by_id.items():
         meta = pair_meta[pid]
         gid = meta["group_id"]
-        cond_image_path = image_manifest[gid]["image_path"]
+        manifest_entry = image_manifest[gid]
+        cond_image_path = manifest_entry["image_path"]
+        cond_image_md5 = manifest_entry["image_md5"]
         records.append(
             PairRecord(
                 pair_id=pid,
                 group_id=gid,
                 prompt=meta["prompt"],
                 cond_image_path=cond_image_path,
+                cond_image_md5=cond_image_md5,
                 winner_latent_path=roles["winner"]["latent_path"],
                 loser_latent_path=roles["loser"]["latent_path"],
             )
@@ -269,6 +273,7 @@ class TierLatentDataset(Dataset):
             "group_id": r.group_id,
             "prompt": r.prompt,
             "cond_image_path": r.cond_image_path,
+            "cond_image_md5": r.cond_image_md5,
             "winner_latent": winner_latent,
             "loser_latent": loser_latent,
         }
@@ -369,11 +374,16 @@ class RoutingCounter:
                 )
 
     def summary(self) -> dict:
+        # Each log() entry corresponds to one sampled (step, t_raw) pair; the 4 model
+        # forward passes per pair (policy/ref × winner/loser) all share the same route
+        # so the counter is keyed at the sample level, not the forward level.
         return {
             "high_count": self.high_count,
             "low_count": self.low_count,
             "fraction_high_noise": self.high_count / max(1, len(self.entries)),
-            "total_forwards": len(self.entries),
+            "total_samples": len(self.entries),
+            "forwards_per_sample": 4,
+            "total_forwards": len(self.entries) * 4,
         }
 
 
@@ -448,15 +458,20 @@ def main():
 
     vae = Wan2_1_VAE(z_dim=16, vae_pth=str(args.upstream / "Wan2.1_VAE.pth"), dtype=dtype, device=str(device))
 
-    unique_image_paths = sorted({r.cond_image_path for r in records})
+    # Cache cond latents by image_md5 (rl2 round-2 review): same md5 = same image bytes,
+    # so different paths pointing at the same content share one encode.
+    md5_to_path: dict[str, str] = {}
+    for r in records:
+        if r.cond_image_md5 not in md5_to_path:
+            md5_to_path[r.cond_image_md5] = r.cond_image_path
     if is_main:
-        print(f"[cond-encode] encoding {len(unique_image_paths)} unique cond images ...", flush=True)
+        print(f"[cond-encode] encoding {len(md5_to_path)} unique cond images (by image_md5) ...", flush=True)
     cond_latent_cache: dict[str, torch.Tensor] = {}
-    for ip in unique_image_paths:
+    for md5, ip in md5_to_path.items():
         z_cond_cpu = encode_conditioning_image(
             vae, pathlib.Path(ip), args.target_w, args.target_h, args.frame_num, device, dtype,
         )
-        cond_latent_cache[ip] = z_cond_cpu
+        cond_latent_cache[md5] = z_cond_cpu
     # Free VAE GPU memory after init
     del vae
     torch.cuda.empty_cache()
@@ -480,8 +495,9 @@ def main():
     with torch.no_grad():
         for prompt in unique_prompts:
             ctx_list = text_encoder([prompt], device)
-            prompt_cache[prompt] = ctx_list[0].detach()
-    # Free T5 (keep encoded tensors)
+            # Codex round 2 P1: cache to CPU so del text_encoder actually reclaims T5 GPU memory.
+            prompt_cache[prompt] = ctx_list[0].detach().cpu()
+    # Free T5 (keep encoded tensors on CPU)
     del text_encoder
     torch.cuda.empty_cache()
 
@@ -507,7 +523,9 @@ def main():
     reference.eval()
 
     if is_distributed:
-        policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=True, broadcast_buffers=False)
+        # Codex round 2 hint: find_unused_parameters=True is unnecessary overhead since
+        # all LoRA params receive grad; flip to False for cleaner DDP behavior.
+        policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, betas=(0.9, 0.999))
     routing_counter = RoutingCounter(halt_on_low_noise=args.halt_on_low_noise)
@@ -540,12 +558,12 @@ def main():
             z_w_t, v_w = linear_flow_matching_noise(wlat, eps, t_raw)
             z_l_t, v_l = linear_flow_matching_noise(llat, eps, t_raw)
 
-            # Build y conditioning
-            cond_z = cond_latent_cache[data["cond_image_path"]]  # [16, T, H, W] CPU bf16
+            # Build y conditioning (cache keyed by image_md5)
+            cond_z = cond_latent_cache[data["cond_image_md5"]]  # [16, T, H, W] CPU bf16
             y = build_y_conditioning(cond_z, wlat.shape[1], wlat.shape[2], wlat.shape[3], device, dtype)
 
-            # Context (T5 cached)
-            context = [prompt_cache[data["prompt"]].to(device=device, dtype=dtype)]
+            # Context (T5 cached on CPU; bring to device per step to avoid persistent T5 GPU footprint)
+            context = [prompt_cache[data["prompt"]].to(device=device, dtype=dtype, non_blocking=True)]
 
             seq_len = wlat.shape[1] * wlat.shape[2] * wlat.shape[3] // 4
             t_tensor = torch.tensor([t_raw], device=device, dtype=torch.float32)
@@ -629,7 +647,12 @@ def main():
             "lora_alpha": args.lora_alpha,
             "ref_on_cpu": args.ref_on_cpu,
             "world_size": world_size,
-            "compute_envelope": "dpo_multi_gpu_zero2" if is_distributed else "single_gpu",
+            # Honest enum (rl2 df979b3d): plan AC-6 names dpo_multi_gpu_zero2 but round-2
+            # actually runs plain DDP + ref_offload + DistributedSampler. dpo_multi_gpu_zero2
+            # (real DS Zero-2 wrap) is round-3+ aspiration.
+            "compute_envelope": "dpo_multi_gpu_ddp" if is_distributed else "single_gpu",
+            "parallelism": "ddp" if is_distributed else "none",
+            "ref_offload": args.ref_on_cpu,
             "machine_internal_ip_tail": socket_tail(),
             "recipe_id": recipe_id,
             "lora_target_modules_count": len(matched_names),
