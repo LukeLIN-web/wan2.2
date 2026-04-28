@@ -29,6 +29,7 @@ DS Zero-2 wrap deferred to M4 (P2 #6 partial fix tonight).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -312,12 +313,37 @@ class LoRALinear(nn.Module):
         # B initialized at zero so adapter contributes 0 at init.
         for p in self.base.parameters():
             p.requires_grad_(False)
+        # `enabled=False` makes the adapter a pass-through (= base linear). Used by the
+        # ref-via-toggled-LoRA trick to compute reference outputs without holding a
+        # second 27 GB WanModel on GPU. Math equivalence: LoRA.B is frozen-equal to
+        # what a separate frozen reference would store; setting enabled=False bypasses
+        # the delta path entirely so output is byte-identical to the original base linear.
+        self.enabled = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
+        if not self.enabled:
+            return base_out
         x_a = x.to(self.A.dtype)
         delta = (x_a @ self.A) @ self.B
         return base_out + (self.scale * delta).to(base_out.dtype)
+
+
+@contextlib.contextmanager
+def lora_disabled(model: nn.Module):
+    """Temporarily disable all LoRALinear adapters in `model` so it behaves like the
+    frozen base. try/finally guarantees adapters are re-enabled even on exception
+    (rl2 sign-off requirement: a leaked disabled state would silently null out training).
+    """
+    layers = [m for m in model.modules() if isinstance(m, LoRALinear)]
+    prev = [m.enabled for m in layers]
+    try:
+        for m in layers:
+            m.enabled = False
+        yield
+    finally:
+        for m, e in zip(layers, prev):
+            m.enabled = e
 
 
 def inject_lora(model: nn.Module, target_re: re.Pattern, rank: int, alpha: float, dtype: torch.dtype, device: torch.device) -> tuple[list[nn.Parameter], list[str]]:
@@ -586,15 +612,18 @@ def main():
     if is_main:
         print(f"[lora] injected on {len(matched_names)} modules; sample: {matched_names[:6]}", flush=True)
 
-    if is_main:
-        print(f"[load] reference WanModel (frozen, {'CPU' if args.ref_on_cpu else 'GPU'}) ...", flush=True)
-    reference = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(
-        dtype=dtype, device="cpu" if args.ref_on_cpu else device,
+    # rl9 precondition for ref-via-disabled-LoRA: no dropout in policy. WanModel uses
+    # RMSNorm (no running stats) and flash attention without attention_dropout, so this
+    # should be empty — but assert defensively in case a future commit adds dropout.
+    has_dropout = any(
+        isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d, nn.AlphaDropout))
+        for m in policy.modules()
     )
-    reference.requires_grad_(False)
-    reference.eval()
+    assert not has_dropout, (
+        "ref-via-disabled-LoRA assumes no dropout in policy; revisit if WanModel adds dropout"
+    )
     if is_main:
-        _mem("after reference load")
+        print("[ref-via-toggled-LoRA] precondition OK: policy has no dropout module", flush=True)
 
     if is_distributed:
         # Codex round 2 hint: find_unused_parameters=True is unnecessary overhead since
@@ -642,60 +671,96 @@ def main():
             seq_len = wlat.shape[1] * wlat.shape[2] * wlat.shape[3] // 4
             t_tensor = torch.tensor([t_raw], device=device, dtype=torch.float32)
 
-            # Reference forwards (no_grad, optionally on CPU)
+            # ----- Sequential DPO with ref-via-disabled-LoRA (v8 architecture) -----
+            #
+            # Original 4-forward DPO had two issues on 80GB cards:
+            #   1. Separate reference WanModel = 27 GB redundant weight on GPU
+            #   2. v_pi_w + v_pi_l autograd graphs alive simultaneously = 2x activations
+            #
+            # v8 fix:
+            #   Pass A — 4 no-grad forwards on POLICY (with LoRA toggled off for ref pair)
+            #            collect scalar MSEs only (no activations retained)
+            #   Pass B — single forward+backward on policy(z_w_t) with grad-coef c_w
+            #   Pass C — single forward+backward on policy(z_l_t) with grad-coef c_l
+            #            grads accumulate into LoRA params via .grad += chain rule
+            #
+            # Math (sigmoid loss decomposition):
+            #   delta = (mse_pi_l - mse_pi_w) - (mse_ref_l - mse_ref_w)
+            #   L     = -log_sigmoid(beta * delta)
+            #   c_w   = +beta * sigmoid(-beta*delta)        (= -dL/d(mse_pi_w))
+            #   c_l   = -beta * sigmoid(-beta*delta)
+            #   So scalar grad coefs precomputed -> two independent backward passes
+            #   accumulate into the same .grad with no double-activation residency.
+
+            mse_target_w = v_w  # [16, T, H, W]
+            mse_target_l = v_l
+
             try:
                 if is_main and step == 0:
-                    _mem("step0 pre-ref-forward")
+                    _mem("step0 pre-passA")
+                # Pass A: 4 no-grad forwards on POLICY for scalar MSEs.
                 with torch.no_grad():
-                    if args.ref_on_cpu:
-                        # Move to GPU just for the two ref forwards
-                        reference.to(device)
-                        if is_main and step == 0:
-                            _mem("step0 ref-on-GPU")
                     with torch.amp.autocast("cuda", dtype=dtype):
-                        v_ref_w = reference([z_w_t], t_tensor, context, seq_len, y=[y])[0]
-                        v_ref_l = reference([z_l_t], t_tensor, context, seq_len, y=[y])[0]
-                    if args.ref_on_cpu:
-                        reference.cpu()
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                        # ref via disabled LoRA (mathematically equivalent to frozen base)
+                        with lora_disabled(policy.module if is_distributed else policy):
+                            v_ref_w_ng = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
+                            mse_ref_w = (v_ref_w_ng.float() - mse_target_w.float()).pow(2).mean()
+                            del v_ref_w_ng
+                            v_ref_l_ng = policy([z_l_t], t_tensor, context, seq_len, y=[y])[0]
+                            mse_ref_l = (v_ref_l_ng.float() - mse_target_l.float()).pow(2).mean()
+                            del v_ref_l_ng
+                        # policy with LoRA enabled
+                        v_pi_w_ng = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
+                        mse_pi_w_scalar = (v_pi_w_ng.float() - mse_target_w.float()).pow(2).mean()
+                        del v_pi_w_ng
+                        v_pi_l_ng = policy([z_l_t], t_tensor, context, seq_len, y=[y])[0]
+                        mse_pi_l_scalar = (v_pi_l_ng.float() - mse_target_l.float()).pow(2).mean()
+                        del v_pi_l_ng
                 if is_main and step == 0:
-                    _mem("step0 post-ref-back-to-CPU")
-            except Exception as e:
-                if is_main:
-                    print(f"[step {step}] REF FORWARD FAILURE: {e}", flush=True)
-                raise
+                    _mem("step0 post-passA")
 
-            # Policy forwards (with autograd)
-            try:
+                # Compute scalar grad coefficients
+                delta_val = (mse_pi_l_scalar - mse_pi_w_scalar) - (mse_ref_l - mse_ref_w)
+                # logit = beta * delta
+                logit = float(args.beta) * float(delta_val.item())
+                # loss = -log(sigmoid(logit)) = -F.logsigmoid(logit_t).item()  (scalar)
+                logit_t = torch.tensor([logit], dtype=torch.float32, device=device)
+                loss_val = float((-F.logsigmoid(logit_t)).item())
+                # dL/dlogit = -sigmoid(-logit)  (so d/d(mse_pi_l) = -sigmoid(-logit)*beta,
+                #                                d/d(mse_pi_w) = +sigmoid(-logit)*beta)
+                sig_neg = float(torch.sigmoid(-logit_t).item())
+                c_w = +sig_neg * float(args.beta)
+                c_l = -sig_neg * float(args.beta)
+
+                # Pass B + Pass C: forward + backward separately for winner / loser, summing grads.
+                optimizer.zero_grad()
+
                 with torch.amp.autocast("cuda", dtype=dtype):
-                    v_pi_w = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
+                    v_pi_w_grad = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
                     if is_main and step == 0:
-                        _mem("step0 post-v_pi_w")
-                    v_pi_l = policy([z_l_t], t_tensor, context, seq_len, y=[y])[0]
+                        _mem("step0 post-passB-fwd")
+                mse_pi_w_grad = (v_pi_w_grad.float() - mse_target_w.float()).pow(2).mean()
+                (c_w * mse_pi_w_grad).backward()
+                del v_pi_w_grad, mse_pi_w_grad
+                if is_main and step == 0:
+                    _mem("step0 post-passB-bwd")
+
+                with torch.amp.autocast("cuda", dtype=dtype):
+                    v_pi_l_grad = policy([z_l_t], t_tensor, context, seq_len, y=[y])[0]
                     if is_main and step == 0:
-                        _mem("step0 post-v_pi_l")
+                        _mem("step0 post-passC-fwd")
+                mse_pi_l_grad = (v_pi_l_grad.float() - mse_target_l.float()).pow(2).mean()
+                (c_l * mse_pi_l_grad).backward()
+                del v_pi_l_grad, mse_pi_l_grad
+                if is_main and step == 0:
+                    _mem("step0 post-passC-bwd")
             except Exception as e:
                 if is_main:
-                    print(f"[step {step}] POLICY FORWARD FAILURE: {e}", flush=True)
+                    print(f"[step {step}] DPO FAILURE: {e}", flush=True)
                 raise
-
-            # DPO loss
-            loss = flow_matching_dpo_loss(
-                v_policy_winner=v_pi_w.unsqueeze(0).float(),
-                v_policy_loser=v_pi_l.unsqueeze(0).float(),
-                v_reference_winner=v_ref_w.unsqueeze(0).float(),
-                v_reference_loser=v_ref_l.unsqueeze(0).float(),
-                v_target_winner=v_w.unsqueeze(0).float(),
-                v_target_loser=v_l.unsqueeze(0).float(),
-                beta=args.beta,
-            )
-
-            optimizer.zero_grad()
-            loss.backward()
             optimizer.step()
 
-            loss_val = float(loss.detach().cpu())
+            # loss_val computed scalar-style above (no autograd through loss)
             losses.append(loss_val)
 
             if is_main and step % args.log_every == 0:
@@ -730,14 +795,18 @@ def main():
             "beta": args.beta,
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
-            "ref_on_cpu": args.ref_on_cpu,
             "world_size": world_size,
             # Honest enum (rl2 df979b3d): plan AC-6 names dpo_multi_gpu_zero2 but round-2
-            # actually runs plain DDP + ref_offload + DistributedSampler. dpo_multi_gpu_zero2
-            # (real DS Zero-2 wrap) is round-3+ aspiration.
+            # actually runs plain DDP + sequential-DPO + ref-via-disabled-LoRA. The
+            # dpo_multi_gpu_zero2 envelope (DS Zero-2 wrap) remains a round-3+ aspiration.
             "compute_envelope": "dpo_multi_gpu_ddp" if is_distributed else "single_gpu",
             "parallelism": "ddp" if is_distributed else "none",
-            "ref_offload": args.ref_on_cpu,
+            # v8 architecture: no separate reference WanModel. Ref forwards run on policy
+            # with LoRA disabled (= byte-identical to frozen base because base is never
+            # touched). Saves 27 GB of redundant ref weight on GPU.
+            "ref_strategy": "lora-toggle-on-policy",
+            "dpo_execution": "sequential-grad-coef",
+            "ref_offload": False,  # legacy field; no separate ref to offload
             "machine_internal_ip_tail": socket_tail(),
             "recipe_id": recipe_id,
             "lora_target_modules_count": len(matched_names),
