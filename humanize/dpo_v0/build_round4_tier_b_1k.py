@@ -101,6 +101,17 @@ def compute_seed(namespace: str, recipe_id: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:8]
 
 
+def canonical_pair_ids_sha256(pair_ids: list[str]) -> str:
+    """Canonical hash for the trainer pin (rl2 review #19 follow-up).
+
+    Newline-joined + trailing newline form, NOT json.dumps default form, so it
+    is independent of CPython json.dumps default separators which may vary
+    across implementations / future versions.
+    """
+    payload = ("\n".join(pair_ids) + "\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -134,6 +145,9 @@ def main(argv=None):
         sys.stderr.write(f"ERROR: scene leakage with heldout: {leak}\n")
         sys.exit(3)
 
+    pair_ids_sha256_full = canonical_pair_ids_sha256(selected)
+    pair_ids_sha256_hex16 = pair_ids_sha256_full[:16]
+
     utc = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     out_dir = pathlib.Path(args.out_dir) / utc
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -160,6 +174,12 @@ def main(argv=None):
                 "seed_int": seed_int,
                 "method": "sha256(namespace||recipe_id)[:8] -> Random.shuffle -> take first N",
             },
+            "pair_ids_sha256_canonical": {
+                "form": "newline-joined-with-trailing-newline",
+                "code": "hashlib.sha256(('\\n'.join(pair_ids) + '\\n').encode('utf-8')).hexdigest()",
+                "sha256_full": pair_ids_sha256_full,
+                "sha256_hex16": pair_ids_sha256_hex16,
+            },
             "stats": {
                 "n_unique_groups": len(selected_groups),
                 "n_unique_scenes": len(selected_scenes),
@@ -184,6 +204,9 @@ def main(argv=None):
 
     pin_path = out_dir / "recipe_id_pin"
     pin_path.write_text(args.recipe_id + "\n", encoding="utf-8")
+
+    pids_pin_path = out_dir / "pair_ids_sha256_hex16_pin"
+    pids_pin_path.write_text(pair_ids_sha256_hex16 + "\n", encoding="utf-8")
 
     drops_path = out_dir / "drop_log.json"
     drops_path.write_bytes(
