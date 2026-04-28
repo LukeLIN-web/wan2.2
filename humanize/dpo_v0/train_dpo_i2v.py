@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import gc
 import hashlib
 import json
 import math
@@ -40,6 +41,17 @@ import re
 import sys
 import time
 from contextlib import nullcontext
+
+
+def _mem(stage, device="cuda:0"):
+    import torch as _t
+    try:
+        a = _t.cuda.memory_allocated(device) / 1024**3
+        r = _t.cuda.memory_reserved(device) / 1024**3
+        m = _t.cuda.max_memory_allocated(device) / 1024**3
+        print(f"[mem] {stage}: alloc={a:.2f}GB reserved={r:.2f}GB max_alloc={m:.2f}GB", flush=True)
+    except Exception:
+        pass
 
 import safetensors.torch
 import torch
@@ -513,7 +525,10 @@ def main():
         cond_latent_cache[md5] = z_cond_cpu
     # Free VAE GPU memory after init
     del vae
+    gc.collect()
     torch.cuda.empty_cache()
+    if is_main:
+        _mem("after VAE del+gc")
 
     # ---- T5 (encode all unique prompts at init, then free) ----
     if is_main:
@@ -538,7 +553,10 @@ def main():
             prompt_cache[prompt] = ctx_list[0].detach().cpu()
     # Free T5 (keep encoded tensors on CPU)
     del text_encoder
+    gc.collect()
     torch.cuda.empty_cache()
+    if is_main:
+        _mem("after T5 del+gc")
 
     # ---- Policy + reference WanModel ----
     if is_main:
@@ -547,6 +565,8 @@ def main():
 
     policy = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(dtype=dtype, device=device)
     policy.requires_grad_(False)
+    if is_main:
+        _mem("after policy load")
 
     # Optional gradient checkpointing on transformer blocks (round-4 fix for 80GB OOM).
     # Wraps each block.forward with torch.utils.checkpoint.checkpoint so activations are
@@ -573,6 +593,8 @@ def main():
     )
     reference.requires_grad_(False)
     reference.eval()
+    if is_main:
+        _mem("after reference load")
 
     if is_distributed:
         # Codex round 2 hint: find_unused_parameters=True is unnecessary overhead since
@@ -622,16 +644,23 @@ def main():
 
             # Reference forwards (no_grad, optionally on CPU)
             try:
+                if is_main and step == 0:
+                    _mem("step0 pre-ref-forward")
                 with torch.no_grad():
                     if args.ref_on_cpu:
                         # Move to GPU just for the two ref forwards
                         reference.to(device)
+                        if is_main and step == 0:
+                            _mem("step0 ref-on-GPU")
                     with torch.amp.autocast("cuda", dtype=dtype):
                         v_ref_w = reference([z_w_t], t_tensor, context, seq_len, y=[y])[0]
                         v_ref_l = reference([z_l_t], t_tensor, context, seq_len, y=[y])[0]
                     if args.ref_on_cpu:
                         reference.cpu()
+                        gc.collect()
                         torch.cuda.empty_cache()
+                if is_main and step == 0:
+                    _mem("step0 post-ref-back-to-CPU")
             except Exception as e:
                 if is_main:
                     print(f"[step {step}] REF FORWARD FAILURE: {e}", flush=True)
@@ -641,7 +670,11 @@ def main():
             try:
                 with torch.amp.autocast("cuda", dtype=dtype):
                     v_pi_w = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
+                    if is_main and step == 0:
+                        _mem("step0 post-v_pi_w")
                     v_pi_l = policy([z_l_t], t_tensor, context, seq_len, y=[y])[0]
+                    if is_main and step == 0:
+                        _mem("step0 post-v_pi_l")
             except Exception as e:
                 if is_main:
                     print(f"[step {step}] POLICY FORWARD FAILURE: {e}", flush=True)
