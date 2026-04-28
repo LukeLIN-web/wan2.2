@@ -26,3 +26,5 @@ wandb/
 *.sh
 *.tex
 *.jsonl
+humanize/dpo_v0/out/
+humanize/dpo_v0/latents/
