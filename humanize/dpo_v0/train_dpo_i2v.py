@@ -422,7 +422,13 @@ def main():
         "--cond-image-fallback-root",
         type=pathlib.Path,
         default=None,
-        help="If set, look up cond images by basename under this dir when the manifest path is missing. Useful for cross-machine deploys where the original /shared/... paths are not mounted.",
+        help="If set, look up cond images by basename under this dir when the manifest path is missing.",
+    )
+    p.add_argument(
+        "--enable-grad-ckpt",
+        type=lambda s: s.lower() == "true",
+        default=False,
+        help="Wrap each WanModel block.forward with torch.utils.checkpoint.checkpoint to trade compute for activation memory. Required on 80GB cards for 14B+y conditioning.",
     )
     args = p.parse_args()
 
@@ -541,6 +547,19 @@ def main():
 
     policy = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(dtype=dtype, device=device)
     policy.requires_grad_(False)
+
+    # Optional gradient checkpointing on transformer blocks (round-4 fix for 80GB OOM).
+    # Wraps each block.forward with torch.utils.checkpoint.checkpoint so activations are
+    # recomputed during backward instead of cached. Trades ~2x compute for ~2x activation memory.
+    if args.enable_grad_ckpt and hasattr(policy, "blocks"):
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        for blk in policy.blocks:
+            _orig_block_fwd = blk.forward
+            def _ckpt_block(*a, _orig=_orig_block_fwd, **kw):
+                return _ckpt(_orig, *a, use_reentrant=False, **kw)
+            blk.forward = _ckpt_block
+        if is_main:
+            print(f"[grad-ckpt] wrapped {len(list(policy.blocks))} blocks with torch.utils.checkpoint", flush=True)
 
     # P1 #4: target Wan's q/k/v/o + ffn.0/ffn.2
     lora_params, matched_names = inject_lora(policy, LORA_TARGET_RE, args.lora_rank, args.lora_alpha, dtype, device)
