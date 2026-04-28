@@ -334,6 +334,9 @@ def run_one_sample(
     recipe_id: str,
     high_noise_sha: Optional[str] = None,
     low_noise_sha: Optional[str] = None,
+    pipe: Any = None,
+    lora_already_attached: bool = False,
+    lora_sha: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run one inference sample and write video + manifest.
 
@@ -351,6 +354,26 @@ def run_one_sample(
     ``sharded_ckpt_sha(...)``; passing them avoids recomputing the same
     digest twice when the caller runs both modes back-to-back. If omitted,
     they are computed inline.
+
+    ``pipe`` lets a multi-call caller (M6 heldout regen orchestrator with
+    ``world_size << len(prompts)``) build the ~95 GB Wan2.2-I2V-A14B
+    pipeline once and reuse it across many ``run_one_sample`` calls. When
+    ``None``, a fresh pipeline is built (single-call CLI default). When a
+    pipe is provided, the caller is responsible for: (1) building it from
+    the SAME ``upstream`` and ``torch_dtype`` / ``device`` that this call
+    will record into the manifest, (2) tracking LoRA attachment state via
+    ``lora_already_attached``.
+
+    ``lora_already_attached`` is True when the caller has already called
+    ``attach_lora(pipe, lora_adapter_path)`` for the same path. When True,
+    this function skips the attach call but still records ``lora_sha``
+    into the manifest. When False (default) and ``mode == "trained"``,
+    this function calls ``attach_lora`` itself. DiffSynth does not expose
+    a clean detach path, so the caller must rebuild ``pipe`` between
+    different LoRA paths or between trained → baseline transitions.
+
+    ``lora_sha`` lets the caller skip the per-call ``file_sha256`` of the
+    LoRA file when batching many trained runs against the same adapter.
     """
     if mode not in ("baseline", "trained"):
         raise ValueError(f"mode must be 'baseline' or 'trained'; got {mode!r}")
@@ -361,6 +384,14 @@ def run_one_sample(
             "mode='baseline' must not be passed a lora_adapter_path "
             f"(got {lora_adapter_path}); pass mode='trained' instead"
         )
+    if lora_already_attached and lora_adapter_path is None:
+        raise ValueError(
+            "lora_already_attached=True requires lora_adapter_path; got None"
+        )
+    if pipe is None and lora_already_attached:
+        raise ValueError(
+            "lora_already_attached=True is meaningless without a cached pipe"
+        )
 
     run_dir = out_dir / mode / timestamp()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -370,15 +401,25 @@ def run_one_sample(
     if low_noise_sha is None:
         low_noise_sha = sharded_ckpt_sha(upstream.low_noise_shards)
 
-    print(f"[{mode}] building pipeline ...", flush=True)
-    pipe = build_pipeline(upstream, torch_dtype=torch_dtype, device=device)
+    if pipe is None:
+        print(f"[{mode}] building pipeline ...", flush=True)
+        pipe = build_pipeline(upstream, torch_dtype=torch_dtype, device=device)
+    else:
+        print(f"[{mode}] reusing cached pipeline (skip build)", flush=True)
 
-    lora_sha = None
     if lora_adapter_path is not None:
-        lora_sha = file_sha256(lora_adapter_path)
-        print(f"[{mode}] attaching LoRA {lora_adapter_path} sha={lora_sha[:12]}...",
-              flush=True)
-        attach_lora(pipe, lora_adapter_path)
+        if lora_sha is None:
+            lora_sha = file_sha256(lora_adapter_path)
+        if lora_already_attached:
+            print(
+                f"[{mode}] LoRA {lora_adapter_path} sha={lora_sha[:12]}... "
+                f"already attached by caller; skip attach",
+                flush=True,
+            )
+        else:
+            print(f"[{mode}] attaching LoRA {lora_adapter_path} sha={lora_sha[:12]}...",
+                  flush=True)
+            attach_lora(pipe, lora_adapter_path)
 
     print(f"[{mode}] loading conditioning image {cond_image_path}", flush=True)
     cond_image = Image.open(str(cond_image_path)).convert("RGB")

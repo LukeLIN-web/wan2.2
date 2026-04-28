@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -434,6 +434,8 @@ def python_api_inference_adapter(
     run_one_sample: Callable,
     UpstreamPaths: Optional[Callable] = None,
     assert_recipe_pin: Optional[Callable] = None,
+    cache_pipe: bool = False,
+    build_pipeline: Optional[Callable] = None,
 ) -> InferenceAdapter:
     """Adapter that calls into rl5's ``inference_smoke.run_one_sample`` directly.
 
@@ -456,6 +458,9 @@ def python_api_inference_adapter(
             recipe_id: str,                      # the 16-char pin, NOT the yaml path
             high_noise_sha: Optional[str] = None,
             low_noise_sha: Optional[str] = None,
+            pipe: Any = None,                    # cache_pipe path
+            lora_already_attached: bool = False, # cache_pipe path
+            lora_sha: Optional[str] = None,      # cache_pipe path
         ) -> dict[str, Any]            # returns manifest dict incl. ckpt_shas
 
     Pass the matching ``UpstreamPaths`` dataclass as the second arg
@@ -468,6 +473,23 @@ def python_api_inference_adapter(
     is opt-in. The process boundary is an escape valve for deploy
     issues (env divergence, partial OOM recovery, GPU-context leak)
     where the in-process adapter would take down the orchestrator.
+
+    ``cache_pipe`` (False by default — backward compat): when True, the
+    adapter holds a single ``WanVideoPipeline`` across all calls,
+    skipping the ~95 GB ``build_pipeline`` reload that dominates wall
+    time when one process serves N>>1 prompts. Required for full
+    42-prompt heldout regen at modest world_size (e.g. world_size=8 →
+    10-11 calls/rank → 10-11×95 GB rebuilds without this flag).
+
+    With ``cache_pipe=True`` the caller MUST iterate mode-batched per
+    rank (all baselines first, then all trained) — DiffSynth does not
+    expose a clean LoRA detach path, so a baseline call after a trained
+    call requires a pipe rebuild. The orchestrator's ``--mode-batched``
+    flag enforces this.
+
+    ``build_pipeline`` overrides the default (lazy-imported from
+    ``inference_smoke``); pass an explicit callable in tests so the
+    cache path is exercisable without GPU / DiffSynth.
     """
     if assert_recipe_pin is None:
         # Late-bound to module-level wrapper to avoid forward-reference at
@@ -476,6 +498,21 @@ def python_api_inference_adapter(
         _assert_recipe_pin = globals()["assert_recipe_pin"]
     else:
         _assert_recipe_pin = assert_recipe_pin
+
+    # Process-local cache of the built pipeline + LoRA attachment + sharded
+    # SHA hashes. Mutated in-place across calls when cache_pipe=True; ignored
+    # otherwise. Keyed by (upstream_root, torch_dtype_name, device) — any
+    # mismatch across calls is a caller error and raises.
+    _state: dict[str, Any] = {
+        "pipe": None,
+        "lora_attached_path": None,
+        "upstream_root": None,
+        "torch_dtype_name": None,
+        "device": None,
+        "lora_sha": None,
+        "high_noise_sha": None,
+        "low_noise_sha": None,
+    }
 
     def adapter(
         run_kind: str,
@@ -548,6 +585,88 @@ def python_api_inference_adapter(
 
         compute_envelope = ckpt_args.get("compute_envelope", "single_gpu")
 
+        # Cache path: pre-build the pipe on first call, validate state
+        # consistency on subsequent calls, and decide whether to skip the
+        # LoRA attach inside run_one_sample.
+        pipe_kwargs: dict[str, Any] = {}
+        if cache_pipe:
+            # Validate (upstream_root, torch_dtype, device) stable across
+            # calls; mismatch signals an orchestrator error.
+            if _state["pipe"] is not None:
+                if _state["upstream_root"] != upstream_root:
+                    raise RuntimeError(
+                        "cached pipe was built for upstream_root "
+                        f"{_state['upstream_root']}; got {upstream_root} "
+                        "on later call. Rebuild required."
+                    )
+                if _state["torch_dtype_name"] != dtype_name:
+                    raise RuntimeError(
+                        f"cached pipe torch_dtype was {_state['torch_dtype_name']}; "
+                        f"got {dtype_name} on later call. Rebuild required."
+                    )
+                if _state["device"] != device:
+                    raise RuntimeError(
+                        f"cached pipe device was {_state['device']}; "
+                        f"got {device} on later call. Rebuild required."
+                    )
+            else:
+                # First call: build pipe up-front so the adapter (not
+                # run_one_sample) owns the cached reference.
+                if build_pipeline is None:
+                    try:
+                        from inference_smoke import build_pipeline as _build_pipeline  # type: ignore
+                    except ImportError as exc:
+                        raise ImportError(
+                            "cache_pipe=True requires inference_smoke.build_pipeline "
+                            "importable from PYTHONPATH; got: " f"{exc!r}"
+                        ) from exc
+                else:
+                    _build_pipeline = build_pipeline
+                print(
+                    f"[python_api_adapter] cache_pipe=True: building shared pipeline "
+                    f"once (upstream={upstream_root}, dtype={dtype_name}, device={device})",
+                    flush=True,
+                )
+                _state["pipe"] = _build_pipeline(
+                    upstream, torch_dtype=torch_dtype, device=device
+                )
+                _state["upstream_root"] = upstream_root
+                _state["torch_dtype_name"] = dtype_name
+                _state["device"] = device
+
+            # LoRA state management (no detach path in DiffSynth → caller
+            # MUST iterate mode-batched: all baselines, then all trained).
+            if run_kind == "baseline":
+                if _state["lora_attached_path"] is not None:
+                    raise RuntimeError(
+                        "cached pipe has LoRA "
+                        f"{_state['lora_attached_path']} attached; baseline "
+                        "run after trained run requires pipe rebuild because "
+                        "DiffSynth does not expose a clean detach. Iterate "
+                        "mode-batched (all baselines first, then all trained) "
+                        "via the orchestrator's --mode-batched flag."
+                    )
+                lora_already_attached = False
+            else:  # trained
+                attached = _state["lora_attached_path"]
+                if attached is not None and attached != lora_adapter_path:
+                    raise RuntimeError(
+                        f"cached pipe has LoRA {attached} attached; trained "
+                        f"run requested {lora_adapter_path}. Different LoRA "
+                        "paths within the same cached session require pipe "
+                        "rebuild (no detach support)."
+                    )
+                lora_already_attached = (attached == lora_adapter_path)
+
+            pipe_kwargs["pipe"] = _state["pipe"]
+            pipe_kwargs["lora_already_attached"] = lora_already_attached
+            if lora_already_attached and _state.get("lora_sha"):
+                pipe_kwargs["lora_sha"] = _state["lora_sha"]
+            if _state.get("high_noise_sha"):
+                pipe_kwargs["high_noise_sha"] = _state["high_noise_sha"]
+            if _state.get("low_noise_sha"):
+                pipe_kwargs["low_noise_sha"] = _state["low_noise_sha"]
+
         t0 = time.time()
         result = run_one_sample(
             mode=run_kind,
@@ -562,8 +681,23 @@ def python_api_inference_adapter(
             lora_adapter_path=lora_adapter_path,
             compute_envelope=compute_envelope,
             recipe_id=recipe_id,
+            **pipe_kwargs,
         )
         wall = time.time() - t0
+
+        # Update cached state from manifest shas + lora attach side-effects.
+        if cache_pipe:
+            shas = result.get("ckpt_shas") if isinstance(result, dict) else None
+            if isinstance(shas, dict):
+                if shas.get("high_noise_base_sha256"):
+                    _state["high_noise_sha"] = shas["high_noise_base_sha256"]
+                if shas.get("low_noise_frozen_sha256"):
+                    _state["low_noise_sha"] = shas["low_noise_frozen_sha256"]
+                if run_kind == "trained" and shas.get("lora_adapter_sha256"):
+                    _state["lora_sha"] = shas["lora_adapter_sha256"]
+            if run_kind == "trained":
+                _state["lora_attached_path"] = lora_adapter_path
+
         return {
             "run_kind": run_kind,
             "out_dir": str(out_dir),
@@ -690,19 +824,108 @@ def regen_all(
     resume: bool = True,
     rank: int = 0,
     world_size: int = 1,
+    mode_batched: bool = False,
 ) -> list[dict]:
     """Drive the full 42-prompt loop. Optional rank/world_size shards
     selections across N processes by index modulo world_size — caller
     invokes one ``regen_all`` per rank.
+
+    ``mode_batched`` (False by default): when True, iterate each rank's
+    assigned prompts in two passes — all baselines first, then all
+    trained — instead of interleaving baseline+trained per prompt. This
+    is required when the adapter caches a single pipeline across calls
+    (``python_api_inference_adapter(..., cache_pipe=True)``) because
+    DiffSynth does not expose a clean LoRA detach path: a trained call
+    leaves LoRA attached on ``pipe.dit``, so the next baseline call on
+    the same pipe would silently include the trained-mode weights.
+    Mode-batched ordering means LoRA gets attached exactly once per rank
+    (between the baseline pass and the trained pass) and stays attached
+    for the entire trained pass.
+
+    Resume semantics under ``mode_batched``: the per-prompt summary
+    (``prompt_manifest.json``) is written only when both modes complete,
+    matching the non-batched path; partial completion leaves
+    per-mode dirs in place and the next run's resume check rebuilds
+    state from those dirs (the inner ``regen_one_prompt`` skip-if-complete
+    short-circuit kicks in for any prompt whose summary already exists).
     """
     prompt_out_root = out_root / "heldout_regen"
     prompt_out_root.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
-    for idx, sel in enumerate(selections):
-        if idx % world_size != rank:
+
+    rank_selections = [
+        sel for idx, sel in enumerate(selections) if idx % world_size == rank
+    ]
+
+    if not mode_batched:
+        for sel in rank_selections:
+            rec = regen_one_prompt(
+                sel, gen_config_bytes, prompt_out_root, adapter, ckpt_args, resume=resume
+            )
+            results.append(rec)
+        return results
+
+    # Mode-batched path: pass 1 = all baselines, pass 2 = all trained,
+    # then write per-prompt summary by zipping baseline + trained results.
+    print(
+        f"[regen_all] mode_batched=True: rank={rank}/{world_size} "
+        f"baseline-pass over {len(rank_selections)} prompts",
+        flush=True,
+    )
+    baseline_manifests: dict[str, dict] = {}
+    for sel in rank_selections:
+        prompt_dir = prompt_out_root / sel.prompt_id
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = prompt_dir / "prompt_manifest.json"
+        if resume and summary_path.exists():
+            existing = json.loads(summary_path.read_bytes())
+            if existing.get("complete") is True:
+                existing["resumed"] = True
+                results.append(existing)
+                continue
+        baseline_dir = prompt_dir / "baseline"
+        baseline_manifests[sel.prompt_id] = adapter(
+            "baseline",
+            sel.prompt,
+            sel.cond_image_path,
+            gen_config_bytes,
+            baseline_dir,
+            ckpt_args,
+        )
+
+    print(
+        f"[regen_all] mode_batched=True: rank={rank}/{world_size} "
+        f"trained-pass over {len(baseline_manifests)} prompts (baseline pass done)",
+        flush=True,
+    )
+    for sel in rank_selections:
+        if sel.prompt_id not in baseline_manifests:
+            # Already resumed (full prompt summary existed); skip both passes.
             continue
-        rec = regen_one_prompt(sel, gen_config_bytes, prompt_out_root, adapter, ckpt_args, resume=resume)
-        results.append(rec)
+        prompt_dir = prompt_out_root / sel.prompt_id
+        baseline_dir = prompt_dir / "baseline"
+        trained_dir = prompt_dir / "trained"
+        trained_manifest = adapter(
+            "trained",
+            sel.prompt,
+            sel.cond_image_path,
+            gen_config_bytes,
+            trained_dir,
+            ckpt_args,
+        )
+        cfg_sha = assert_byte_identical_generation_configs(baseline_dir, trained_dir)
+        out = {
+            "prompt_id": sel.prompt_id,
+            "prompt": sel.prompt,
+            "group_id": sel.group_id,
+            "cond_image_path": sel.cond_image_path,
+            "gen_config_sha256": cfg_sha,
+            "baseline": baseline_manifests[sel.prompt_id],
+            "trained": trained_manifest,
+            "complete": True,
+        }
+        _mw_atomic_write_json(prompt_dir / "prompt_manifest.json", out)
+        results.append(out)
     return results
 
 
@@ -771,6 +994,21 @@ def main() -> int:
                         "sharding (sharding is index-mod-world_size on top).")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
+    p.add_argument("--cache-pipe", action="store_true",
+                   help="python_api adapter only: build the WanVideoPipeline (~95 GB) "
+                        "ONCE per rank-process and reuse it across all assigned prompts. "
+                        "Without this, each (prompt, mode) call rebuilds the pipeline — "
+                        "fine for round-2 M6 (16 ranks × 1 call/rank) but blows up for "
+                        "full 42-prompt × world_size=8 (10-11 calls/rank). Implies "
+                        "--mode-batched (DiffSynth has no LoRA detach path; trained run "
+                        "after baseline run requires LoRA attached, then it cannot be "
+                        "removed without rebuilding pipe).")
+    p.add_argument("--mode-batched", action="store_true",
+                   help="Per rank, run all baseline prompts first, then all trained "
+                        "prompts. Required when --cache-pipe is set; safe to enable "
+                        "without it (only changes call ordering, not byte-equality). "
+                        "Mode-batched ordering means LoRA attaches exactly once per rank "
+                        "(between baseline pass and trained pass).")
     p.add_argument("--rank", type=int, default=int(os.environ.get("RANK", "0")))
     p.add_argument("--world-size", type=int, default=int(os.environ.get("WORLD_SIZE", "1")))
     p.add_argument("--compute-envelope",
@@ -880,7 +1118,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        adapter = python_api_inference_adapter(run_one_sample)
+        adapter = python_api_inference_adapter(run_one_sample, cache_pipe=args.cache_pipe)
     else:
         adapter = dry_run_inference_adapter()
 
@@ -914,11 +1152,23 @@ def main() -> int:
         "ckpt_args": ckpt_args,
         "rank": args.rank,
         "world_size": args.world_size,
+        "cache_pipe": args.cache_pipe,
+        "mode_batched": args.mode_batched or args.cache_pipe,
         "manifest_writer_schema_version": _MANIFEST_WRITER_SCHEMA_VERSION,
     }
     _mw_atomic_write_json(run_dir / "run_manifest.pre.json", run_manifest_pre)
 
     # 7. orchestration loop
+    if args.cache_pipe and not args.mode_batched:
+        print(
+            "[heldout_regen] --cache-pipe implies --mode-batched (no DiffSynth LoRA "
+            "detach path); enabling mode-batched iteration.",
+            flush=True,
+        )
+        mode_batched = True
+    else:
+        mode_batched = args.mode_batched
+
     results = regen_all(
         selections=selections,
         gen_config_bytes=gen_config_bytes,
@@ -928,6 +1178,7 @@ def main() -> int:
         resume=not args.no_resume,
         rank=args.rank,
         world_size=args.world_size,
+        mode_batched=mode_batched,
     )
 
     run_manifest_post = dict(run_manifest_pre)

@@ -820,3 +820,387 @@ def test_recipe_pin_passes_when_consistent(tmp_path: pathlib.Path):
     (rd / "recipe_id").write_text(expected)
     got = heldout_regen.assert_recipe_pin(rd, expected=expected)
     assert got == expected
+
+
+# ---------- pipe-cache + mode-batched (round-4 N>>1 calls/rank) ----------
+
+
+import dataclasses
+
+
+def _build_pipe_cache_adapter(captured: list[dict]):
+    """Build a python_api adapter wired to fake build_pipeline + run_one_sample.
+
+    ``captured`` is appended one record per run_one_sample call so tests can
+    assert the (pipe-identity, lora_already_attached, lora_sha) wiring.
+    """
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    class FakePipe:
+        """Sentinel returned by build_pipeline; identity-tracked across calls."""
+
+        _next = 0
+
+        def __init__(self):
+            FakePipe._next += 1
+            self.id = FakePipe._next
+
+    build_count = {"n": 0}
+
+    def fake_build_pipeline(upstream, *, torch_dtype, device):
+        build_count["n"] += 1
+        return FakePipe()
+
+    def fake_run_one_sample(
+        *,
+        mode,
+        out_dir,
+        upstream,
+        torch_dtype,
+        device,
+        prompt,
+        cond_image_path,
+        generation_config,
+        generation_config_bytes,
+        lora_adapter_path,
+        compute_envelope,
+        recipe_id,
+        high_noise_sha=None,
+        low_noise_sha=None,
+        pipe=None,
+        lora_already_attached=False,
+        lora_sha=None,
+    ):
+        captured.append({
+            "mode": mode,
+            "prompt": prompt,
+            "pipe_id": pipe.id if pipe is not None else None,
+            "lora_already_attached": lora_already_attached,
+            "lora_sha_param": lora_sha,
+            "lora_adapter_path": lora_adapter_path,
+            "high_noise_sha": high_noise_sha,
+        })
+        return {
+            "mode": mode,
+            "ckpt_shas": {
+                "high_noise_base_sha256": "h0",
+                "low_noise_frozen_sha256": "l0",
+                **({"lora_adapter_sha256": "la"} if mode == "trained" else {}),
+            },
+        }
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=lambda rd: "6bef6e104cdd3442",
+        cache_pipe=True,
+        build_pipeline=fake_build_pipeline,
+    )
+    return adapter, build_count, FakePipe
+
+
+def _ckpt_args_for_pipe_cache():
+    return {
+        "trained_lora": "/ckpt/lora.safetensors",
+        "upstream": "/data/Wan2.2-I2V-A14B",
+        "recipe_yaml": "/recipes/r.yaml",
+        "compute_envelope": "multi_gpu_inference_seed_parallel",
+        "device": "cuda",
+    }
+
+
+def test_python_api_cache_pipe_builds_once_across_calls(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, build_count, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    # 5 baselines, then 5 trained — mode-batched order required by cache.
+    for i in range(5):
+        adapter("baseline", f"prompt {i}", "/img.png", cfg_bytes,
+                tmp_path / f"b{i}", ckpt_args)
+    for i in range(5):
+        adapter("trained", f"prompt {i}", "/img.png", cfg_bytes,
+                tmp_path / f"t{i}", ckpt_args)
+
+    # Single build_pipeline across all 10 calls (the whole point).
+    assert build_count["n"] == 1, f"expected 1 build, got {build_count['n']}"
+    # All 10 calls saw the same pipe identity.
+    pipe_ids = {c["pipe_id"] for c in captured}
+    assert pipe_ids == {1}
+    # Baseline calls: lora_already_attached=False
+    assert all(c["lora_already_attached"] is False for c in captured if c["mode"] == "baseline")
+    # First trained call: not yet attached → lora_already_attached=False
+    trained = [c for c in captured if c["mode"] == "trained"]
+    assert trained[0]["lora_already_attached"] is False
+    # Subsequent trained calls reuse: lora_already_attached=True + cached lora_sha
+    for t in trained[1:]:
+        assert t["lora_already_attached"] is True
+        assert t["lora_sha_param"] == "la"
+    # Sharded SHAs cached after first call (passed to run_one_sample on subsequent).
+    assert captured[0]["high_noise_sha"] is None
+    assert all(c["high_noise_sha"] == "h0" for c in captured[1:])
+
+
+def test_python_api_cache_pipe_rejects_baseline_after_trained(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, _, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    adapter("baseline", "p0", "/img.png", cfg_bytes, tmp_path / "b0", ckpt_args)
+    adapter("trained", "p0", "/img.png", cfg_bytes, tmp_path / "t0", ckpt_args)
+    with pytest.raises(RuntimeError, match="baseline run after trained"):
+        adapter("baseline", "p1", "/img.png", cfg_bytes, tmp_path / "b1", ckpt_args)
+
+
+def test_python_api_cache_pipe_rejects_different_lora_paths(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, _, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    adapter("trained", "p0", "/img.png", cfg_bytes, tmp_path / "t0", ckpt_args)
+    ckpt_args2 = dict(ckpt_args)
+    ckpt_args2["trained_lora"] = "/ckpt/other.safetensors"
+    with pytest.raises(RuntimeError, match="Different LoRA paths"):
+        adapter("trained", "p1", "/img.png", cfg_bytes, tmp_path / "t1", ckpt_args2)
+
+
+def test_python_api_cache_pipe_rejects_upstream_change(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, _, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    adapter("baseline", "p0", "/img.png", cfg_bytes, tmp_path / "b0", ckpt_args)
+    ckpt_args2 = dict(ckpt_args)
+    ckpt_args2["upstream"] = "/data/different/Wan2.2"
+    with pytest.raises(RuntimeError, match="upstream_root"):
+        adapter("baseline", "p1", "/img.png", cfg_bytes, tmp_path / "b1", ckpt_args2)
+
+
+def test_python_api_no_cache_pipe_omits_pipe_kwarg(tmp_path: pathlib.Path):
+    """Backward compat: when cache_pipe=False, run_one_sample receives no
+    pipe= kwarg (so it builds its own pipeline as before)."""
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    captured: dict = {}
+
+    def fake_run_one_sample(
+        *, mode, out_dir, upstream, torch_dtype, device, prompt, cond_image_path,
+        generation_config, generation_config_bytes, lora_adapter_path,
+        compute_envelope, recipe_id, high_noise_sha=None, low_noise_sha=None,
+        **extras,
+    ):
+        captured["extras"] = extras
+        return {"mode": mode, "ckpt_shas": {}}
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=lambda rd: "6bef6e104cdd3442",
+        # cache_pipe defaults to False
+    )
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    adapter("baseline", "p0", "/img.png", cfg_bytes, tmp_path / "b0",
+            _ckpt_args_for_pipe_cache())
+    # No pipe / lora_already_attached / lora_sha kwargs leaked through.
+    assert captured["extras"] == {}
+
+
+def test_regen_all_mode_batched_runs_baselines_first(tmp_path: pathlib.Path):
+    """With --mode-batched, per rank: all baselines first, then all trained.
+
+    Verifies the call order at the adapter boundary so cache_pipe + LoRA
+    state machine is fed the right sequence.
+    """
+    root = _build_heldout_fixture(tmp_path)
+    selections = heldout_regen.select_canonical_groups(
+        heldout_regen.load_heldout_records(root),
+        heldout_regen.load_t2_image_manifest(root),
+    )
+    selections = selections[:4]  # smoke scope
+
+    call_order: list[tuple[str, str]] = []
+
+    def adapter(run_kind, prompt, cond_image_path, gen_config_bytes, out_dir, ckpt_args):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        call_order.append((run_kind, prompt))
+        gen_cfg_path = out_dir / "gen_config.json"
+        gen_cfg_path.write_bytes(gen_config_bytes)
+        return {
+            "run_kind": run_kind,
+            "out_dir": str(out_dir),
+            "wall_seconds": 0.01,
+            "result": {"mode": run_kind, "ckpt_shas": {}},
+            "ckpt_shas": {},
+        }
+
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    out_root = tmp_path / "out"
+    out_root.mkdir()
+
+    results = heldout_regen.regen_all(
+        selections=selections,
+        gen_config_bytes=cfg_bytes,
+        out_root=out_root,
+        adapter=adapter,
+        ckpt_args={},
+        resume=False,
+        rank=0,
+        world_size=1,
+        mode_batched=True,
+    )
+    # All baselines first, then all trained.
+    kinds = [k for k, _ in call_order]
+    assert kinds == ["baseline"] * 4 + ["trained"] * 4
+    assert len(results) == 4
+    # Per-prompt summaries written.
+    for sel in selections:
+        summary = out_root / "heldout_regen" / sel.prompt_id / "prompt_manifest.json"
+        assert summary.exists()
+        rec = json.loads(summary.read_bytes())
+        assert rec["complete"] is True
+
+
+def test_regen_all_mode_batched_resumes_completed_prompts(tmp_path: pathlib.Path):
+    """A prompt with an existing complete=True summary skips both passes."""
+    root = _build_heldout_fixture(tmp_path)
+    selections = heldout_regen.select_canonical_groups(
+        heldout_regen.load_heldout_records(root),
+        heldout_regen.load_t2_image_manifest(root),
+    )
+    selections = selections[:3]
+
+    out_root = tmp_path / "out"
+    (out_root / "heldout_regen").mkdir(parents=True)
+    # Pre-populate prompt[0] as complete.
+    pre = out_root / "heldout_regen" / selections[0].prompt_id
+    pre.mkdir()
+    (pre / "prompt_manifest.json").write_text(json.dumps({
+        "prompt_id": selections[0].prompt_id,
+        "complete": True,
+    }))
+
+    call_order: list[str] = []
+
+    def adapter(run_kind, prompt, cond_image_path, gen_config_bytes, out_dir, ckpt_args):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "gen_config.json").write_bytes(gen_config_bytes)
+        call_order.append(run_kind)
+        return {"run_kind": run_kind, "ckpt_shas": {}}
+
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    results = heldout_regen.regen_all(
+        selections=selections,
+        gen_config_bytes=cfg_bytes,
+        out_root=out_root,
+        adapter=adapter,
+        ckpt_args={},
+        resume=True,
+        rank=0,
+        world_size=1,
+        mode_batched=True,
+    )
+    # Prompt 0 resumed → 0 calls; prompts 1, 2 → 2 baselines + 2 trained.
+    assert call_order == ["baseline", "baseline", "trained", "trained"]
+    assert len(results) == 3
+    assert any(r.get("resumed") is True for r in results)
+
+
+def test_run_one_sample_pipe_param_skips_build(tmp_path: pathlib.Path):
+    """When pipe=<sentinel> is passed, run_one_sample skips build_pipeline.
+
+    Inject fake ``diffsynth.utils.data`` into sys.modules before importing
+    inference_smoke so the test runs on hosts without DiffSynth installed
+    (the orchestrator dev box). The lazy ``from diffsynth.utils.data
+    import save_video`` inside run_one_sample picks up our fake.
+    """
+    import types
+    fake_du = types.ModuleType("diffsynth.utils.data")
+    fake_du.save_video = lambda video, path, fps=1, quality=5: pathlib.Path(path).write_bytes(b"\x00")
+    fake_u = types.ModuleType("diffsynth.utils")
+    fake_u.data = fake_du
+    fake_diffsynth = sys.modules.setdefault("diffsynth", types.ModuleType("diffsynth"))
+    sys.modules.setdefault("diffsynth.utils", fake_u)
+    sys.modules.setdefault("diffsynth.utils.data", fake_du)
+
+    inference_smoke = pytest.importorskip("inference_smoke")
+    torch = pytest.importorskip("torch")
+
+    class FakePipe:
+        def __call__(self, **kw):
+            class _V:
+                def cpu(self): return self
+            return _V()
+
+    build_called = {"n": 0}
+    attach_called = {"n": 0}
+
+    def fake_build_pipeline(upstream, *, torch_dtype, device):
+        build_called["n"] += 1
+        return FakePipe()
+
+    def fake_attach_lora(pipe, lora_path):
+        attach_called["n"] += 1
+
+    import unittest.mock as mock
+    with mock.patch.object(inference_smoke, "build_pipeline", fake_build_pipeline), \
+         mock.patch.object(inference_smoke, "attach_lora", fake_attach_lora), \
+         mock.patch.object(inference_smoke, "sharded_ckpt_sha", lambda paths: "z" * 64), \
+         mock.patch.object(inference_smoke, "file_sha256", lambda p: "f" * 64):
+        cfg = inference_smoke.build_generation_config(
+            type("A", (), dict(
+                seed=1, num_inference_steps=1, cfg_scale=1.0, negative_prompt="",
+                height=64, width=64, num_frames=1, fps=1,
+                torch_dtype="bf16", switch_DiT_boundary=875,
+            ))()
+        )
+        cfg_bytes = inference_smoke.serialize_generation_config(cfg)
+
+        cached_pipe = FakePipe()
+        upstream = inference_smoke.UpstreamPaths(upstream_root=tmp_path / "wan")
+        cond = tmp_path / "cond.png"
+        from PIL import Image
+        Image.new("RGB", (64, 64)).save(cond)
+
+        manifest = inference_smoke.run_one_sample(
+            mode="baseline",
+            out_dir=tmp_path / "out",
+            upstream=upstream,
+            torch_dtype=torch.bfloat16,
+            device="cpu",
+            prompt="a thing",
+            cond_image_path=cond,
+            generation_config=cfg,
+            generation_config_bytes=cfg_bytes,
+            lora_adapter_path=None,
+            compute_envelope="single_gpu",
+            recipe_id="6bef6e104cdd3442",
+            pipe=cached_pipe,
+        )
+
+    assert build_called["n"] == 0, "build_pipeline must be skipped when pipe= is passed"
+    assert attach_called["n"] == 0
+    assert manifest["mode"] == "baseline"
