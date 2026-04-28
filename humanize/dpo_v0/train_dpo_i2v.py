@@ -123,6 +123,46 @@ def _tokenizer_tree_sha256(tokenizer_dir: pathlib.Path) -> str:
     return h.hexdigest()
 
 
+def assert_training_config_pin(
+    config_path: pathlib.Path,
+    expected_sha256_hex16: str,
+) -> dict:
+    """Round-4 training_config double-pin (rl2 spec b98b72b1).
+
+    Reads the canonical training_config_round4.yaml, fresh-hashes it under
+    the same canonical rules as recipe.yaml, and asserts equality with the
+    expected pin. Returns the parsed config dict for hyperparameter override.
+    """
+    import yaml as _yaml
+
+    config_bytes = config_path.read_bytes()
+    fresh = hashlib.sha256(config_bytes).hexdigest()[:16]
+    assert fresh == expected_sha256_hex16, (
+        f"training_config pin drift: fresh={fresh}, expected={expected_sha256_hex16}, "
+        f"path={config_path}"
+    )
+    return _yaml.safe_load(config_bytes)
+
+
+def assert_pair_ids_pin(
+    pair_ids: list[str],
+    expected_sha256_hex16: str,
+) -> str:
+    """Round-4 subset pin (rl2 spec b98b72b1).
+
+    Hashes the loaded subset's pair_ids under the canonical newline-joined
+    form (independent of json.dumps separators / Python implementation) and
+    asserts equality with the expected pin emitted by build_round4_tier_b_1k.py.
+    """
+    canonical = ("\n".join(pair_ids) + "\n").encode("utf-8")
+    fresh = hashlib.sha256(canonical).hexdigest()[:16]
+    assert fresh == expected_sha256_hex16, (
+        f"pair_ids pin drift: fresh={fresh}, expected={expected_sha256_hex16}, "
+        f"n_pairs={len(pair_ids)}"
+    )
+    return fresh
+
+
 def assert_model_asset_pins(upstream: pathlib.Path) -> dict[str, str]:
     pins = {
         "vae_sha256": _file_sha256(upstream / "Wan2.1_VAE.pth"),
@@ -524,6 +564,39 @@ def main():
         default=False,
         help="Wrap each WanModel block.forward with torch.utils.checkpoint.checkpoint to trade compute for activation memory. Required on 80GB cards for 14B+y conditioning.",
     )
+    # Round-4 double-pin args (rl2 spec b98b72b1). All four mutually optional;
+    # round-4 launches must set all four together. Round-2 mode (no training_config)
+    # still works for smoke tests / single-GPU dev.
+    p.add_argument(
+        "--training-config-path",
+        type=pathlib.Path,
+        default=None,
+        help="Round-4 training_config_round4.yaml path. When set, hyperparameters "
+             "(lr/max_steps/beta/lora_rank/lora_alpha/seed_namespace) are read from "
+             "the YAML and override CLI defaults.",
+    )
+    p.add_argument(
+        "--training-config-sha256-pin",
+        type=str,
+        default=None,
+        help="Expected sha256[:16] of the canonical training_config YAML bytes. "
+             "Trainer fresh-hashes and asserts equality. Required when --training-config-path is set.",
+    )
+    p.add_argument(
+        "--subset-pair-ids-json",
+        type=pathlib.Path,
+        default=None,
+        help="Round-4 T3_round4_tier_b_1k.json path. When set, pair_records are filtered "
+             "to only those in tier_b_round4_1k.pair_ids; sha256 of the canonical "
+             "newline-joined form is asserted against --pair-ids-sha256-pin.",
+    )
+    p.add_argument(
+        "--pair-ids-sha256-pin",
+        type=str,
+        default=None,
+        help="Expected sha256[:16] of the canonical newline-joined pair_ids. "
+             "Required when --subset-pair-ids-json is set.",
+    )
     args = p.parse_args()
 
     recipe_id = assert_recipe_pin(RECIPES_DIR, EXPECTED_RECIPE_ID)
@@ -536,6 +609,51 @@ def main():
         f"tokenizer_tree={asset_pins['tokenizer_tree_sha256'][:16]}",
         flush=True,
     )
+
+    # Round-4 training_config double-pin (rl2 spec b98b72b1). When the operator
+    # passes --training-config-path, hyperparameters in the YAML override CLI
+    # defaults and the pin is asserted. Single-arg-set: requires --training-config-sha256-pin.
+    training_config_dict: dict | None = None
+    if args.training_config_path is not None:
+        if args.training_config_sha256_pin is None:
+            raise SystemExit(
+                "--training-config-path set without --training-config-sha256-pin; both required together."
+            )
+        training_config_dict = assert_training_config_pin(
+            args.training_config_path, args.training_config_sha256_pin
+        )
+        # Override CLI defaults with YAML values (YAML is the source of truth for round-4).
+        for cli_attr, yaml_key in (
+            ("lr", "lr"),
+            ("max_steps", "max_steps"),
+            ("beta", "beta"),
+            ("lora_rank", "lora_rank"),
+            ("lora_alpha", "lora_alpha"),
+            ("seed_namespace", "seed_namespace"),
+        ):
+            if yaml_key in training_config_dict:
+                setattr(args, cli_attr, training_config_dict[yaml_key])
+        print(
+            f"[training_config pin] OK: {args.training_config_sha256_pin} "
+            f"(lr={args.lr} max_steps={args.max_steps} beta={args.beta} "
+            f"lora_rank={args.lora_rank} lora_alpha={args.lora_alpha} "
+            f"seed_namespace={args.seed_namespace} "
+            f"max_pairs={training_config_dict.get('max_pairs')})",
+            flush=True,
+        )
+    elif args.training_config_sha256_pin is not None:
+        raise SystemExit(
+            "--training-config-sha256-pin set without --training-config-path; both required together."
+        )
+
+    if args.subset_pair_ids_json is not None and args.pair_ids_sha256_pin is None:
+        raise SystemExit(
+            "--subset-pair-ids-json set without --pair-ids-sha256-pin; both required together."
+        )
+    if args.pair_ids_sha256_pin is not None and args.subset_pair_ids_json is None:
+        raise SystemExit(
+            "--pair-ids-sha256-pin set without --subset-pair-ids-json; both required together."
+        )
 
     is_distributed = "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_distributed:
@@ -565,6 +683,30 @@ def main():
         args.latent_manifest, args.post_t2_pair, args.t2_image_manifest,
         latent_root=args.latent_root,
     )
+
+    # Round-4 subset filter (rl2 spec b98b72b1). When --subset-pair-ids-json is
+    # set, restrict records to the canonical 1k subset and assert pair_ids pin.
+    if args.subset_pair_ids_json is not None:
+        subset_data = json.loads(args.subset_pair_ids_json.read_bytes())
+        subset_pair_ids = subset_data["tier_b_round4_1k"]["pair_ids"]
+        assert_pair_ids_pin(subset_pair_ids, args.pair_ids_sha256_pin)
+        subset_set = set(subset_pair_ids)
+        before = len(records_all)
+        records_all = [r for r in records_all if r.pair_id in subset_set]
+        if is_main_pre := (int(os.environ.get("LOCAL_RANK", "0")) == 0):
+            print(
+                f"[pair_ids pin] OK: {args.pair_ids_sha256_pin} "
+                f"(subset={len(subset_pair_ids)}, manifest_intersect={len(records_all)}, "
+                f"manifest_total={before})",
+                flush=True,
+            )
+        if len(records_all) < len(subset_pair_ids):
+            missing = sorted(subset_set - {r.pair_id for r in records_all})
+            raise RuntimeError(
+                f"latent manifest is missing {len(missing)} of {len(subset_pair_ids)} subset pair_ids; "
+                f"sample missing: {missing[:5]}"
+            )
+
     # Resolve cond image paths with an optional fallback root: if the original
     # path is missing on this machine, look for the basename under
     # ``--cond-image-fallback-root``. Pairs that resolve nowhere are dropped.
@@ -876,6 +1018,11 @@ def main():
             "ref_offload": False,  # legacy field; no separate ref to offload
             "machine_internal_ip_tail": socket_tail(),
             "recipe_id": recipe_id,
+            "training_config_sha256_pin": args.training_config_sha256_pin,
+            "training_config_path": str(args.training_config_path) if args.training_config_path else None,
+            "subset_pair_ids_json": str(args.subset_pair_ids_json) if args.subset_pair_ids_json else None,
+            "pair_ids_sha256_hex16": args.pair_ids_sha256_pin,
+            "round_tag": (training_config_dict or {}).get("round_tag"),
             "vae_sha256": asset_pins["vae_sha256"],
             "t5_sha256": asset_pins["t5_sha256"],
             "tokenizer_tree_sha256": asset_pins["tokenizer_tree_sha256"],
