@@ -196,7 +196,7 @@ def per_frame_metrics(video_a: torch.Tensor, video_b: torch.Tensor) -> dict[str,
     ssim_vals = [p["ssim_bt709"] for p in per_frame]
     psnr_vals = [p["psnr_db"] for p in per_frame]
 
-    # mean_psnr_db semantics (per rl5 review note `f6333e32`):
+    # mean_psnr_db semantics:
     #   - all frames identical → +inf
     #   - mixed (some identical, some not) → mean of the FINITE frames only,
     #     so a single non-identical frame gives a meaningful mean rather than

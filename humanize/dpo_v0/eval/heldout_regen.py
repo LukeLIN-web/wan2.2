@@ -1,4 +1,4 @@
-"""M6 heldout regeneration orchestration scaffold.
+"""M6 heldout regeneration orchestrator.
 
 Reads ``<T0_T3_ROOT>/splits/heldout.json`` (579 pairs / 245 groups / 42
 unique prompts) and ``<T0_T3_ROOT>/t2/image_manifest.json`` (1440 group
@@ -7,13 +7,12 @@ deterministic rule, and runs ``inference_smoke.py`` twice per prompt
 (baseline ckpt + trained ckpt) under one byte-identical generation
 config.
 
-This is the M6 orchestration scaffold. The actual generation work is
-delegated to ``inference_smoke.py`` (rl5, task #7) — this module
-calls it via subprocess CLI (preferred for byte-identical config + a
-clean process boundary) or via Python API hook once rl5 exposes
+The actual generation work is delegated to ``inference_smoke.py`` —
+this module calls it via subprocess CLI (preferred for byte-identical
+config + a clean process boundary) or via the in-process Python API
 ``inference_smoke.run_one_sample(...)``.
 
-Plan: humanize/i2v.md AC-7.1, AC-7.2, AC-7.3, M6, task8.
+Plan: humanize/i2v.md AC-7.1, AC-7.2, AC-7.3, M6.
 
 Hard contracts honoured here:
   - Heldout is NEVER pre-encoded. We invoke inference, which encodes
@@ -753,12 +752,13 @@ def assert_byte_identical_generation_configs(
 ) -> str:
     a = (baseline_dir / "gen_config.json").read_bytes()
     b = (trained_dir / "gen_config.json").read_bytes()
+    a_sha = hashlib.sha256(a).hexdigest()
     if a != b:
         raise RuntimeError(
             f"generation_config drift between {baseline_dir} and {trained_dir}: "
-            f"sha256={hashlib.sha256(a).hexdigest()[:16]} vs {hashlib.sha256(b).hexdigest()[:16]}"
+            f"sha256={a_sha[:16]} vs {hashlib.sha256(b).hexdigest()[:16]}"
         )
-    return hashlib.sha256(a).hexdigest()
+    return a_sha
 
 
 # ---------- per-prompt orchestration ----------
@@ -984,8 +984,7 @@ def main() -> int:
                    default="first_alpha")
     p.add_argument("--cond-image-fallback-root", type=pathlib.Path, default=None,
                    help="Basename-keyed fallback dir for cond images when canonical T2 paths "
-                        "are not mounted on this host (mirrors rl1 trainer flag from commit "
-                        "0030832 round-3 attempt 5). If primary path missing, look for "
+                        "are not mounted on this host. If primary path missing, look for "
                         "<fallback_root>/<basename>; otherwise leave path as-is so loader "
                         "fails with the real error.")
     p.add_argument("--limit-prompts", type=int, default=None,
@@ -1102,7 +1101,7 @@ def main() -> int:
         if not args.inference_smoke_py.exists():
             print(
                 f"[heldout_regen] inference_smoke.py not found at {args.inference_smoke_py}; "
-                f"either pass --inference-smoke-py <path> or wait for rl5 task #7 to land.",
+                f"pass --inference-smoke-py <path>.",
                 file=sys.stderr,
             )
             return 2
@@ -1116,7 +1115,7 @@ def main() -> int:
         except ImportError as exc:
             print(
                 f"[heldout_regen] --adapter python_api requires inference_smoke.run_one_sample "
-                f"importable from PYTHONPATH (rl5 task #7 commit ac00949). ImportError: {exc}",
+                f"importable from PYTHONPATH. ImportError: {exc}",
                 file=sys.stderr,
             )
             return 2
