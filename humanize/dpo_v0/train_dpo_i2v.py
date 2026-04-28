@@ -1,23 +1,29 @@
-"""Wan2.2-I2V-A14B Direct I2V DPO trainer (v0, tier_a tiny-overfit + tier_b short DPO).
+"""Wan2.2-I2V-A14B Direct I2V DPO trainer (v0, round 2 — codex review fixes applied).
 
 Single-file trainer. Loads the original sharded high-noise expert as both
-policy (with LoRA) and frozen reference (no_grad, optionally CPU-offloaded).
-Reads pre-encoded tier_a / tier_b winner+loser latents from the encoder's
-output dir (recipe_id pinned at 6bef6e104cdd3442), reads the canonical
-T2-resolved conditioning image for each pair, encodes prompts via the
-pinned T5, samples per-pair shared (t, eps) deterministically, runs the
-flow-matching DPO loss across 4 forward passes per step (policy/ref ×
-winner/loser), and applies the AC-5 routing-counter contract on every
-forward.
+policy (with LoRA on attention q/k/v/o + ffn.0/ffn.2) and frozen reference
+(no_grad, optionally CPU-offloaded). Reads pre-encoded tier_a/tier_b
+winner+loser latents from the encoder's output dir (recipe_id pinned at
+6bef6e104cdd3442), pre-encodes T2 conditioning images via the I2V VAE
+once at startup (cached by image_path), encodes prompts via T5 once
+(cached by prompt), samples per-pair shared (t, eps) deterministically,
+runs the flow-matching DPO loss across 4 forward passes per step under
+``torch.amp.autocast("cuda", dtype=bfloat16)`` and applies the AC-5
+routing-counter contract on every forward.
 
-Multi-GPU launch via accelerate (DeepSpeed Zero-2 config in
-``deepspeed_zero2.json``). Single-card launch via ``python train_dpo_i2v.py``.
+Round 2 fixes (Codex review msg 70939ec1, all P0+P1+P3 applied):
+  P0 #1 — y conditioning built from cond image VAE latent + 4-channel mask;
+          y.shape == [20, F_latent, H_latent, W_latent] passed to all forwards.
+  P0 #2 — bf16 autocast wraps every forward; LoRA dtype-safe via
+          ``x.to(A.dtype)`` inside the patched forward.
+  P0 #3 — Reference defaults to CPU + offload; T5 freed after encoding.
+  P1 #4 — LoRA targets matched against Wan's q/k/v/o naming + ffn.{0,2}.
+  P1 #5 — LoRA save with module-aligned keys (`<module>.lora_A` / `.lora_B`)
+          + metadata (`rank`, `alpha`, `target_modules`).
+  P3 #7 — Sampling band restricted to [901, 999] (Wan's grid max is 999).
 
-Hard contracts (carried from plan + rl2 reviews):
-  - recipe_id pin asserted at startup (sha256 of canonical_yaml.bytes[:16] = 6bef6e104cdd3442)
-  - heldout never pre-encoded (encoder enforces; trainer also asserts via blocklist)
-  - tier_a routing counter 100% high-noise (any low-noise increment halts hard)
-  - low-noise expert byte-equality post-run (held in disk; loader manifest pre/post compare)
+Multi-GPU launch via torchrun (DistributedSampler over the pair list);
+DS Zero-2 wrap deferred to M4 (P2 #6 partial fix tonight).
 """
 
 from __future__ import annotations
@@ -30,35 +36,44 @@ import json
 import math
 import os
 import pathlib
-import random
+import re
 import sys
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 
 import safetensors.torch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-# Local modules
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent.parent))  # videodpoWan
-from dpo_loss import flow_matching_dpo_loss
+from dpo_loss import flow_matching_dpo_loss  # noqa: E402
 
 # Recipe pin (must match recipes/recipe_id)
 EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
 RECIPES_DIR = HERE / "recipes"
-LOADER_OUT_ROOT = HERE / "loader" / "out"
 
 # AC-5.U2 raw boundary (switch_DiT_boundary * 1000)
 SWITCH_DIT_BOUNDARY_RAW = 900
 NUM_TRAIN_TIMESTEPS = 1000
-# AC-5.U1 sampling band (boundary fractions)
-MIN_TIMESTEP_FRACTION = 0.0
-MAX_TIMESTEP_FRACTION = 0.358
+SAMPLING_T_LOW = 901
+SAMPLING_T_HIGH = 999  # P3 #7: Wan's grid max is 999, not 1000
+
+# Wan I2V conditioning shapes for tier_a / tier_b at 832x480:
+# z latent: [16, 21, 60, 104]; mask: [4, 21, 60, 104]; y = cat(mask, z_cond) → [20, ...]
+LATENT_C = 16
+MASK_C = 4
+Y_C = LATENT_C + MASK_C  # 20
+
+LORA_TARGET_RE = re.compile(r"\.(self_attn|cross_attn)\.(q|k|v|o)$|\.ffn\.(0|2)$")
+
+
+# ---------- pin / determinism helpers ----------
 
 
 def _file_sha256(path: pathlib.Path, buf: int = 4 * 1024 * 1024) -> str:
@@ -73,16 +88,13 @@ def assert_recipe_pin(recipes_dir: pathlib.Path, expected: str = EXPECTED_RECIPE
     yaml_bytes = (recipes_dir / "wan22_i2v_a14b__round2_v0.yaml").read_bytes()
     fresh = hashlib.sha256(yaml_bytes).hexdigest()[:16]
     on_disk = (recipes_dir / "recipe_id").read_text(encoding="ascii").strip()
-    assert fresh == on_disk == expected, f"recipe pin drift: fresh={fresh}, on_disk={on_disk}, expected={expected}"
+    assert fresh == on_disk == expected, (
+        f"recipe pin drift: fresh={fresh}, on_disk={on_disk}, expected={expected}"
+    )
     return on_disk
 
 
 def per_pair_seed(pair_id: str, namespace: str = "dpo-tier_a") -> int:
-    """Deterministic per-pair seed for (t, eps) sampling.
-
-    Identical between winner/loser AND between policy/reference within
-    one pair, independent across pairs (AC-5 contract).
-    """
     h = hashlib.sha256(f"{namespace}:{pair_id}".encode("utf-8")).digest()
     return int.from_bytes(h[:8], "big")
 
@@ -93,26 +105,18 @@ def sample_per_pair_t_eps(
     device: torch.device,
     dtype: torch.dtype,
     namespace: str = "dpo-tier_a",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample shared (t, eps) for a pair under AC-5.U1 sampling band.
+) -> tuple[int, torch.Tensor]:
+    """Sample (t_raw, eps) shared per pair (AC-5.U1/U3).
 
-    Returns (t_raw, eps) where t_raw is in [SWITCH_DIT_BOUNDARY_RAW + 1,
-    NUM_TRAIN_TIMESTEPS] (i.e. always inside the high-noise expert band
-    after AC-5.U2 routing detection) and eps has shape ``latent_shape``.
-
-    Sampling band fractions [0, 0.358] map to raw timesteps in
-    [641, 1000] (i.e. 1000 - 0.358*1000 = 641 to 1000 - 0*1000 = 1000).
-    Per AC-5.U2, raw_timestep > 900 routes to high-noise. Within the
-    band [641, 1000], values > 900 are 100/360 ≈ 28% of samples by
-    default. To honor AC-5.U3 (100% high-noise on tier_a), we restrict
-    sampling to the high-noise sub-band [901, 1000].
+    t_raw is in [SAMPLING_T_LOW, SAMPLING_T_HIGH] (high-noise sub-band so
+    AC-5.U3 routing counter stays at 100% high-noise). eps has shape
+    ``latent_shape`` and is generated from a per-pair-deterministic
+    CPU generator, then cast to ``dtype`` and moved to ``device``.
     """
     g = torch.Generator(device="cpu").manual_seed(per_pair_seed(pair_id, namespace))
-    # Restrict to high-noise sub-band so routing counter stays at 100% high-noise.
-    t_raw = torch.randint(
-        low=SWITCH_DIT_BOUNDARY_RAW + 1, high=NUM_TRAIN_TIMESTEPS + 1, size=(1,), generator=g
-    ).to(device=device).long()
-    eps = torch.randn(latent_shape, generator=g, dtype=torch.float32).to(device=device, dtype=dtype)
+    t_raw = int(torch.randint(low=SAMPLING_T_LOW, high=SAMPLING_T_HIGH + 1, size=(1,), generator=g).item())
+    eps_cpu = torch.randn(latent_shape, generator=g, dtype=torch.float32)
+    eps = eps_cpu.to(device=device, dtype=dtype)
     return t_raw, eps
 
 
@@ -121,106 +125,220 @@ def detected_expert_from_raw(raw_timestep: int) -> str:
 
 
 def linear_flow_matching_noise(z0: torch.Tensor, eps: torch.Tensor, t_raw: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Add flow-matching noise: z_t = (1 - frac) * z_0 + frac * eps.
-
-    ``t_raw`` is in [0, NUM_TRAIN_TIMESTEPS]; fraction = t_raw /
-    NUM_TRAIN_TIMESTEPS. Target velocity v_target = eps - z_0 (constant
-    along the linear interpolant). Returns (z_t, v_target).
-    """
+    """z_t = (1 - frac) * z_0 + frac * eps, target v = eps - z_0 (Wan flow matching, P3 #7 verified)."""
     frac = float(t_raw) / NUM_TRAIN_TIMESTEPS
     z_t = (1.0 - frac) * z0 + frac * eps
     v_target = eps - z0
     return z_t, v_target
 
 
+# ---------- Conditioning y construction (P0 #1) ----------
+
+
+def build_y_conditioning(
+    cond_image_latent: torch.Tensor,
+    latent_T: int,
+    latent_H: int,
+    latent_W: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build the I2V conditioning y = cat(mask, z_cond) with shape [20, T, H, W].
+
+    Mirrors ``wan/image2video.py`` lines 290-326:
+      msk[:, 0] = 1, rest = 0
+      y_video = VAE.encode(cat([interp(image), zeros(F-1)])); shape [16, T, H, W]
+      y = cat(msk_4channel, y_video) along channel dim -> [20, T, H, W]
+    """
+    # Mask: 4 channels because the upstream construction reshapes a 1-channel
+    # mask of length 4*T into a 4-channel tensor of length T (see image2video.py:298-299).
+    # In our pre-encoded latent space, T is the *latent* T (e.g., 21). The mask is
+    # 1.0 at the conditioning frame slot (frame 0) and 0.0 elsewhere.
+    msk = torch.zeros(MASK_C, latent_T, latent_H, latent_W, device=device, dtype=dtype)
+    msk[:, 0] = 1.0
+    # Concat conditioning latent in front (broadcast first frame across temporal repeat)
+    z_cond = cond_image_latent.to(device=device, dtype=dtype)
+    if z_cond.shape != (LATENT_C, latent_T, latent_H, latent_W):
+        raise ValueError(
+            f"cond_image_latent shape mismatch: got {tuple(z_cond.shape)}, expected ({LATENT_C}, {latent_T}, {latent_H}, {latent_W})"
+        )
+    y = torch.cat([msk, z_cond], dim=0)
+    assert y.shape == (Y_C, latent_T, latent_H, latent_W), y.shape
+    return y
+
+
+# ---------- Conditioning image encoder (init-time cache) ----------
+
+
+def encode_conditioning_image(
+    vae,
+    image_path: pathlib.Path,
+    target_w: int,
+    target_h: int,
+    frame_num: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Mirror image2video.py:317-326: load image, interp to (h, w), pad zeros for F-1 frames, VAE encode.
+
+    Returns z_cond of shape [16, T_latent, H_latent, W_latent].
+    """
+    import cv2
+
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise FileNotFoundError(f"could not read conditioning image: {image_path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # Bicubic resize to (target_h, target_w)
+    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+    img_t = torch.from_numpy(img).float() / 127.5 - 1.0  # [H, W, 3] in [-1, 1]
+    img_t = img_t.permute(2, 0, 1).contiguous()  # [3, H, W]
+    img_t = img_t.unsqueeze(1)  # [3, 1, H, W]
+    # Pad zeros for F-1 frames (per image2video.py L322)
+    zeros = torch.zeros(3, frame_num - 1, target_h, target_w, dtype=img_t.dtype)
+    video = torch.cat([img_t, zeros], dim=1)  # [3, F, H, W]
+    video_dev = video.to(device=device, dtype=dtype)
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        z_cond = vae.encode([video_dev])[0]  # [16, F_latent, H_latent, W_latent]
+    return z_cond.detach().cpu()
+
+
+# ---------- Dataset ----------
+
+
 @dataclasses.dataclass
-class PairLatent:
+class PairRecord:
     pair_id: str
+    group_id: str
     prompt: str
-    image_path: str  # canonical T2-resolved conditioning image path
+    cond_image_path: str
     winner_latent_path: str
     loser_latent_path: str
 
 
-def load_pair_latents_manifest(manifest_path: pathlib.Path) -> dict[str, dict]:
-    """Index encoder's manifest.jsonl by pair_id, with winner / loser paths."""
-    pairs: dict[str, dict] = {}
-    with manifest_path.open("rb") as f:
+def load_pair_records(
+    latent_manifest_path: pathlib.Path,
+    post_t2_pair_path: pathlib.Path,
+    t2_image_manifest_path: pathlib.Path,
+) -> list[PairRecord]:
+    pairs_by_id: dict[str, dict] = {}
+    with latent_manifest_path.open("rb") as f:
         for line in f:
             if not line.strip():
                 continue
             entry = json.loads(line)
             pid = entry["pair_id"]
-            pairs.setdefault(pid, {})[entry["role"]] = entry
-    # only keep pairs with both roles present
-    return {pid: roles for pid, roles in pairs.items() if "winner" in roles and "loser" in roles}
+            pairs_by_id.setdefault(pid, {})[entry["role"]] = entry
+    pairs_by_id = {pid: roles for pid, roles in pairs_by_id.items() if "winner" in roles and "loser" in roles}
 
+    pair_meta = {r["pair_id"]: r for r in json.loads(post_t2_pair_path.read_bytes())}
+    image_manifest = json.loads(t2_image_manifest_path.read_bytes())
 
-def load_t2_image_manifest(t2_image_manifest_path: pathlib.Path) -> dict[str, str]:
-    """Map (pair_id or group_id) -> conditioning image path from T2 manifest."""
-    raw = json.loads(t2_image_manifest_path.read_bytes())
-    # The T2 image manifest is keyed by group_id; we'll need to resolve
-    # via post_t2_pair.json (group_id from pair_id).
-    if isinstance(raw, dict):
-        return {gid: entry.get("image_path", entry.get("path", "")) for gid, entry in raw.items()}
-    return {}
-
-
-def load_post_t2_pair(post_t2_pair_path: pathlib.Path) -> dict[str, dict]:
-    """Index post_t2_pair.json by pair_id."""
-    records = json.loads(post_t2_pair_path.read_bytes())
-    return {r["pair_id"]: r for r in records}
+    records: list[PairRecord] = []
+    for pid, roles in pairs_by_id.items():
+        meta = pair_meta[pid]
+        gid = meta["group_id"]
+        cond_image_path = image_manifest[gid]["image_path"]
+        records.append(
+            PairRecord(
+                pair_id=pid,
+                group_id=gid,
+                prompt=meta["prompt"],
+                cond_image_path=cond_image_path,
+                winner_latent_path=roles["winner"]["latent_path"],
+                loser_latent_path=roles["loser"]["latent_path"],
+            )
+        )
+    records.sort(key=lambda r: r.pair_id)  # deterministic order
+    return records
 
 
 class TierLatentDataset(Dataset):
-    """Yields (pair_id, prompt, conditioning_image_path, winner_latent, loser_latent)."""
-
-    def __init__(
-        self,
-        latent_manifest_path: pathlib.Path,
-        post_t2_pair_path: pathlib.Path,
-        t2_image_manifest_path: pathlib.Path,
-        wmbench_data_root: pathlib.Path,
-    ):
-        self.pairs = load_pair_latents_manifest(latent_manifest_path)
-        self.pair_meta = load_post_t2_pair(post_t2_pair_path)
-        self.image_manifest = load_t2_image_manifest(t2_image_manifest_path)
-        self.wmbench_data_root = wmbench_data_root
-        self.pair_ids = sorted(self.pairs.keys())
-        for pid in self.pair_ids:
-            assert pid in self.pair_meta, f"pair {pid} in latent manifest but not post_t2_pair.json"
+    def __init__(self, records: list[PairRecord]):
+        self.records = records
 
     def __len__(self) -> int:
-        return len(self.pair_ids)
+        return len(self.records)
 
     def __getitem__(self, idx: int):
-        pid = self.pair_ids[idx]
-        roles = self.pairs[pid]
-        meta = self.pair_meta[pid]
-        winner_latent = safetensors.torch.load_file(roles["winner"]["latent_path"])["latent"]
-        loser_latent = safetensors.torch.load_file(roles["loser"]["latent_path"])["latent"]
-        # Prompt comes from post_t2_pair.json
-        prompt = meta["prompt"]
-        # Conditioning image is per-group (resolved at T2). Use group_id mapping.
-        gid = meta["group_id"]
-        cond_image_path = self.image_manifest.get(gid, "")
+        r = self.records[idx]
+        winner_latent = safetensors.torch.load_file(r.winner_latent_path)["latent"]
+        loser_latent = safetensors.torch.load_file(r.loser_latent_path)["latent"]
         return {
-            "pair_id": pid,
-            "prompt": prompt,
-            "winner_latent": winner_latent,  # bf16 [16, 21, H, W]
+            "pair_id": r.pair_id,
+            "group_id": r.group_id,
+            "prompt": r.prompt,
+            "cond_image_path": r.cond_image_path,
+            "winner_latent": winner_latent,
             "loser_latent": loser_latent,
-            "cond_image_path": cond_image_path,
-            "group_id": gid,
         }
 
 
-def collate_pair(batch):
-    """Collate a list of pair dicts; for DPO we typically use micro_batch=1."""
-    assert len(batch) == 1, f"expected micro_batch=1 (DPO ×2 already), got {len(batch)}"
+def collate_single(batch):
+    assert len(batch) == 1, "DPO uses micro_batch=1 (winner+loser already ×2)"
     return batch[0]
 
 
-# ---------- Routing counter (AC-5.U2/U3/U4) ----------
+# ---------- LoRA injection (P0 #2 dtype-safe + P1 #4 correct names) ----------
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int, alpha: float, dtype: torch.dtype, device: torch.device):
+        super().__init__()
+        self.base = base
+        self.rank = rank
+        self.alpha = alpha
+        self.scale = float(alpha) / float(rank)
+        self.A = nn.Parameter(torch.zeros(base.in_features, rank, dtype=dtype, device=device))
+        self.B = nn.Parameter(torch.zeros(rank, base.out_features, dtype=dtype, device=device))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        # B initialized at zero so adapter contributes 0 at init.
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        x_a = x.to(self.A.dtype)
+        delta = (x_a @ self.A) @ self.B
+        return base_out + (self.scale * delta).to(base_out.dtype)
+
+
+def inject_lora(model: nn.Module, target_re: re.Pattern, rank: int, alpha: float, dtype: torch.dtype, device: torch.device) -> tuple[list[nn.Parameter], list[str]]:
+    """Replace matching nn.Linear modules with LoRALinear; return trainable param list + matched names."""
+    matched_names: list[str] = []
+    lora_params: list[nn.Parameter] = []
+
+    def _walk(parent: nn.Module, prefix: str = ""):
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, nn.Linear) and target_re.search(full_name):
+                lora_module = LoRALinear(child, rank=rank, alpha=alpha, dtype=dtype, device=device)
+                setattr(parent, child_name, lora_module)
+                matched_names.append(full_name)
+                lora_params.append(lora_module.A)
+                lora_params.append(lora_module.B)
+            else:
+                _walk(child, full_name)
+
+    _walk(model)
+    return lora_params, matched_names
+
+
+def collect_lora_state(model: nn.Module) -> tuple[dict[str, torch.Tensor], dict]:
+    """Walk model, collect ``<module>.lora_A`` / ``<module>.lora_B`` entries (P1 #5)."""
+    state: dict[str, torch.Tensor] = {}
+    metadata = {"target_modules": []}
+    for name, mod in model.named_modules():
+        if isinstance(mod, LoRALinear):
+            state[f"{name}.lora_A"] = mod.A.detach().cpu().contiguous()
+            state[f"{name}.lora_B"] = mod.B.detach().cpu().contiguous()
+            metadata["target_modules"].append(name)
+            metadata["rank"] = mod.rank
+            metadata["alpha"] = mod.alpha
+    return state, metadata
+
+
+# ---------- Routing counter ----------
 
 
 @dataclasses.dataclass
@@ -231,8 +349,6 @@ class RoutingCounterEntry:
 
 
 class RoutingCounter:
-    """AC-5 routing counter; raises on any low-noise hit on tier_a."""
-
     def __init__(self, halt_on_low_noise: bool = True):
         self.entries: list[RoutingCounterEntry] = []
         self.halt_on_low_noise = halt_on_low_noise
@@ -261,16 +377,21 @@ class RoutingCounter:
         }
 
 
-# ---------- Main training entry ----------
+def socket_tail() -> str:
+    import socket as _socket
+
+    try:
+        return _socket.gethostbyname(_socket.gethostname()).rsplit(".", 1)[-1]
+    except OSError:
+        return "unknown"
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", type=pathlib.Path, default=pathlib.Path("/shared/user63/workspace/data/Wan/Wan2.2-I2V-A14B"))
-    p.add_argument("--latent-manifest", type=pathlib.Path, required=True, help="manifest.jsonl from encode_videos.py")
-    p.add_argument("--post-t2-pair", type=pathlib.Path, required=True, help="post_t2_pair.json from T2 step")
-    p.add_argument("--t2-image-manifest", type=pathlib.Path, required=True, help="t2/image_manifest.json")
-    p.add_argument("--wmbench-data-root", type=pathlib.Path, default=pathlib.Path("/shared/user60/worldmodel/wmbench/data"))
+    p.add_argument("--latent-manifest", type=pathlib.Path, required=True)
+    p.add_argument("--post-t2-pair", type=pathlib.Path, required=True)
+    p.add_argument("--t2-image-manifest", type=pathlib.Path, required=True)
     p.add_argument("--out-dir", type=pathlib.Path, default=HERE / "ckpts")
     p.add_argument("--tier", choices=["tier_a", "tier_b"], default="tier_a")
     p.add_argument("--max-steps", type=int, default=200)
@@ -278,21 +399,20 @@ def main():
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=16)
-    p.add_argument("--ref-offload", action="store_true")
-    p.add_argument("--micro-batch", type=int, default=1)
+    p.add_argument("--ref-on-cpu", type=lambda s: s.lower() == "true", default=True)
     p.add_argument("--seed-namespace", type=str, default="dpo-tier_a")
-    p.add_argument("--dtype", choices=["bfloat16"], default="bfloat16")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--target-w", type=int, default=832)
+    p.add_argument("--target-h", type=int, default=480)
+    p.add_argument("--frame-num", type=int, default=81)
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--halt-on-low-noise", type=lambda s: s.lower() == "true", default=True)
     args = p.parse_args()
 
-    # Recipe pin assert (before any heavy I/O)
     recipe_id = assert_recipe_pin(RECIPES_DIR, EXPECTED_RECIPE_ID)
     print(f"[recipe pin] OK: {recipe_id}", flush=True)
 
-    # DDP setup if launched with torchrun / accelerate
     is_distributed = "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_distributed:
         dist.init_process_group(backend="nccl")
@@ -310,78 +430,42 @@ def main():
     is_main = rank == 0
     dtype = torch.bfloat16
 
-    # Set up output dir
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     run_dir = args.out_dir / ts
     if is_main:
         run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[init] world_size={world_size} rank={rank} device={device} run_dir={run_dir}", flush=True)
 
-    # Load policy + reference WanModel (high_noise expert only for v0)
+    # Records
+    records = load_pair_records(args.latent_manifest, args.post_t2_pair, args.t2_image_manifest)
     if is_main:
-        print(f"[load] importing WanModel ...", flush=True)
-    from wan.modules.model import WanModel  # videodpoWan
+        print(f"[dataset] {len(records)} pairs", flush=True)
 
+    # ---- VAE for cond image encoding (init-time only) ----
     if is_main:
-        print(f"[load] policy from {args.upstream}/high_noise_model ...", flush=True)
-    policy = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(dtype=dtype, device=device)
-    policy.requires_grad_(False)  # base frozen, only LoRA trains
+        print(f"[load] VAE for cond image encoding ...", flush=True)
+    from wan.modules.vae2_1 import Wan2_1_VAE  # noqa: E402
 
-    # LoRA injection on attention + FFN modules
-    target_keys = []
-    for name, mod in policy.named_modules():
-        if isinstance(mod, nn.Linear):
-            # heuristic: target attention q/k/v/o and FFN linears
-            lower = name.lower()
-            if any(t in lower for t in ["q_proj", "k_proj", "v_proj", "o_proj", "to_q", "to_k", "to_v", "to_out", "ffn", "mlp", "fc1", "fc2"]):
-                target_keys.append(name)
+    vae = Wan2_1_VAE(z_dim=16, vae_pth=str(args.upstream / "Wan2.1_VAE.pth"), dtype=dtype, device=str(device))
+
+    unique_image_paths = sorted({r.cond_image_path for r in records})
     if is_main:
-        print(f"[lora] target_keys ({len(target_keys)}):", target_keys[:6], "..." if len(target_keys) > 6 else "", flush=True)
+        print(f"[cond-encode] encoding {len(unique_image_paths)} unique cond images ...", flush=True)
+    cond_latent_cache: dict[str, torch.Tensor] = {}
+    for ip in unique_image_paths:
+        z_cond_cpu = encode_conditioning_image(
+            vae, pathlib.Path(ip), args.target_w, args.target_h, args.frame_num, device, dtype,
+        )
+        cond_latent_cache[ip] = z_cond_cpu
+    # Free VAE GPU memory after init
+    del vae
+    torch.cuda.empty_cache()
 
-    # Insert LoRA adapters
-    lora_params: list[nn.Parameter] = []
-    for tname in target_keys:
-        # Resolve module
-        mod = policy
-        for part in tname.split("."):
-            mod = getattr(mod, part)
-        in_f, out_f = mod.in_features, mod.out_features
-        A = nn.Parameter(torch.zeros(in_f, args.lora_rank, dtype=dtype, device=device))
-        B = nn.Parameter(torch.zeros(args.lora_rank, out_f, dtype=dtype, device=device))
-        # init A normal, B zero -> LoRA effective is zero at init
-        nn.init.kaiming_uniform_(A, a=math.sqrt(5))
-        # B left at zero
-        scale = float(args.lora_alpha) / float(args.lora_rank)
-        # Wrap forward: out = mod(x) + scale * (x @ A) @ B
-        original_forward = mod.forward
-        def _make_lora_forward(orig_fwd, A_p, B_p, s):
-            def _fwd(x):
-                base = orig_fwd(x)
-                lora_out = (x @ A_p) @ B_p
-                return base + s * lora_out
-            return _fwd
-        mod.forward = _make_lora_forward(original_forward, A, B, scale)
-        # Register A/B on the module so DDP picks them up
-        mod.register_parameter(f"lora_A", A)
-        mod.register_parameter(f"lora_B", B)
-        lora_params.append(A)
-        lora_params.append(B)
-    for pp in lora_params:
-        pp.requires_grad_(True)
-
-    if is_main:
-        print(f"[load] reference from {args.upstream}/high_noise_model (frozen, no LoRA) ...", flush=True)
-    reference = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(dtype=dtype, device=device if not args.ref_offload else "cpu")
-    reference.requires_grad_(False)
-    reference.eval()
-
-    # DDP wrap policy
-    if is_distributed:
-        policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=True)
-
-    # T5 + tokenizer (for prompt encoding)
+    # ---- T5 (encode all unique prompts at init, then free) ----
     if is_main:
         print(f"[load] T5 encoder ...", flush=True)
-    from wan.modules.t5 import T5EncoderModel
+    from wan.modules.t5 import T5EncoderModel  # noqa: E402
+
     text_encoder = T5EncoderModel(
         text_len=512,
         dtype=dtype,
@@ -389,82 +473,118 @@ def main():
         checkpoint_path=str(args.upstream / "models_t5_umt5-xxl-enc-bf16.pth"),
         tokenizer_path=str(args.upstream / "google" / "umt5-xxl"),
     )
-
-    # Dataset
-    dataset = TierLatentDataset(
-        latent_manifest_path=args.latent_manifest,
-        post_t2_pair_path=args.post_t2_pair,
-        t2_image_manifest_path=args.t2_image_manifest,
-        wmbench_data_root=args.wmbench_data_root,
-    )
+    unique_prompts = sorted({r.prompt for r in records})
     if is_main:
-        print(f"[dataset] {len(dataset)} pairs", flush=True)
+        print(f"[prompt-encode] encoding {len(unique_prompts)} unique prompts ...", flush=True)
+    prompt_cache: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for prompt in unique_prompts:
+            ctx_list = text_encoder([prompt], device)
+            prompt_cache[prompt] = ctx_list[0].detach()
+    # Free T5 (keep encoded tensors)
+    del text_encoder
+    torch.cuda.empty_cache()
 
-    # Optimizer (LoRA params only)
+    # ---- Policy + reference WanModel ----
+    if is_main:
+        print(f"[load] policy WanModel from {args.upstream}/high_noise_model ...", flush=True)
+    from wan.modules.model import WanModel  # noqa: E402
+
+    policy = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(dtype=dtype, device=device)
+    policy.requires_grad_(False)
+
+    # P1 #4: target Wan's q/k/v/o + ffn.0/ffn.2
+    lora_params, matched_names = inject_lora(policy, LORA_TARGET_RE, args.lora_rank, args.lora_alpha, dtype, device)
+    if is_main:
+        print(f"[lora] injected on {len(matched_names)} modules; sample: {matched_names[:6]}", flush=True)
+
+    if is_main:
+        print(f"[load] reference WanModel (frozen, {'CPU' if args.ref_on_cpu else 'GPU'}) ...", flush=True)
+    reference = WanModel.from_pretrained(args.upstream, subfolder="high_noise_model").to(
+        dtype=dtype, device="cpu" if args.ref_on_cpu else device,
+    )
+    reference.requires_grad_(False)
+    reference.eval()
+
+    if is_distributed:
+        policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=True, broadcast_buffers=False)
+
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, betas=(0.9, 0.999))
-
     routing_counter = RoutingCounter(halt_on_low_noise=args.halt_on_low_noise)
 
-    # Training loop
+    dataset = TierLatentDataset(records)
+    if is_distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        loader = DataLoader(dataset, batch_size=1, sampler=sampler, collate_fn=collate_single, num_workers=0)
+    else:
+        sampler = None
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_single, num_workers=0)
+
+    losses: list[float] = []
     step = 0
-    losses = []
+    wall_start = time.time()
+
     while step < args.max_steps:
-        # Iterate dataset; cycle if needed
-        for idx in range(len(dataset)):
+        if sampler is not None:
+            sampler.set_epoch(step // max(1, len(dataset)))
+        for data in loader:
             if step >= args.max_steps:
                 break
-            data = dataset[idx]
             pid = data["pair_id"]
-            prompt = data["prompt"]
-            wlat = data["winner_latent"].to(device=device, dtype=dtype)  # [16, T, H, W]
+            wlat = data["winner_latent"].to(device=device, dtype=dtype)
             llat = data["loser_latent"].to(device=device, dtype=dtype)
 
-            # Sample shared (t, eps) per pair
-            latent_shape = tuple(wlat.shape)
-            t_raw, eps = sample_per_pair_t_eps(
-                pid, latent_shape, device, dtype, namespace=args.seed_namespace
-            )
-            t_raw_int = int(t_raw.item())
-            routing_counter.log(sampled_timestep_id=step, raw_timestep=t_raw_int)
+            # Sample shared (t, eps)
+            t_raw, eps = sample_per_pair_t_eps(pid, tuple(wlat.shape), device, dtype, namespace=args.seed_namespace)
+            routing_counter.log(sampled_timestep_id=step, raw_timestep=t_raw)
+            z_w_t, v_w = linear_flow_matching_noise(wlat, eps, t_raw)
+            z_l_t, v_l = linear_flow_matching_noise(llat, eps, t_raw)
 
-            # Add noise
-            z_w_t, v_w = linear_flow_matching_noise(wlat, eps, t_raw_int)
-            z_l_t, v_l = linear_flow_matching_noise(llat, eps, t_raw_int)
+            # Build y conditioning
+            cond_z = cond_latent_cache[data["cond_image_path"]]  # [16, T, H, W] CPU bf16
+            y = build_y_conditioning(cond_z, wlat.shape[1], wlat.shape[2], wlat.shape[3], device, dtype)
 
-            # Encode prompt via T5 (cached per prompt would be better; for tier_a 16 pairs OK)
-            with torch.no_grad():
-                context = text_encoder([prompt], device)  # list of [L, C]
+            # Context (T5 cached)
+            context = [prompt_cache[data["prompt"]].to(device=device, dtype=dtype)]
 
-            # TODO: integrate y (conditioning image latent + mask) per WanI2V conditioning contract.
-            # For tier_a tiny-overfit smoke, we forward without conditioning and let LoRA learn delta;
-            # this is a known simplification flagged in DESIGN open question #2.
-            seq_len = wlat.shape[1] * wlat.shape[2] * wlat.shape[3] // 4  # rough; WanModel will assert
-            t_tensor = t_raw.float().to(device=device)
+            seq_len = wlat.shape[1] * wlat.shape[2] * wlat.shape[3] // 4
+            t_tensor = torch.tensor([t_raw], device=device, dtype=torch.float32)
 
-            # Forward through policy and reference
+            # Reference forwards (no_grad, optionally on CPU)
             try:
-                v_pi_w_pred = policy([z_w_t], t_tensor, context, seq_len, y=None)[0]
-                v_pi_l_pred = policy([z_l_t], t_tensor, context, seq_len, y=None)[0]
                 with torch.no_grad():
-                    if args.ref_offload:
+                    if args.ref_on_cpu:
+                        # Move to GPU just for the two ref forwards
                         reference.to(device)
-                    v_ref_w_pred = reference([z_w_t], t_tensor, context, seq_len, y=None)[0]
-                    v_ref_l_pred = reference([z_l_t], t_tensor, context, seq_len, y=None)[0]
-                    if args.ref_offload:
+                    with torch.amp.autocast("cuda", dtype=dtype):
+                        v_ref_w = reference([z_w_t], t_tensor, context, seq_len, y=[y])[0]
+                        v_ref_l = reference([z_l_t], t_tensor, context, seq_len, y=[y])[0]
+                    if args.ref_on_cpu:
                         reference.cpu()
+                        torch.cuda.empty_cache()
             except Exception as e:
                 if is_main:
-                    print(f"[step {step}] FORWARD FAILURE: {e}", flush=True)
+                    print(f"[step {step}] REF FORWARD FAILURE: {e}", flush=True)
+                raise
+
+            # Policy forwards (with autograd)
+            try:
+                with torch.amp.autocast("cuda", dtype=dtype):
+                    v_pi_w = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
+                    v_pi_l = policy([z_l_t], t_tensor, context, seq_len, y=[y])[0]
+            except Exception as e:
+                if is_main:
+                    print(f"[step {step}] POLICY FORWARD FAILURE: {e}", flush=True)
                 raise
 
             # DPO loss
             loss = flow_matching_dpo_loss(
-                v_policy_winner=v_pi_w_pred.unsqueeze(0),
-                v_policy_loser=v_pi_l_pred.unsqueeze(0),
-                v_reference_winner=v_ref_w_pred.unsqueeze(0),
-                v_reference_loser=v_ref_l_pred.unsqueeze(0),
-                v_target_winner=v_w.unsqueeze(0),
-                v_target_loser=v_l.unsqueeze(0),
+                v_policy_winner=v_pi_w.unsqueeze(0).float(),
+                v_policy_loser=v_pi_l.unsqueeze(0).float(),
+                v_reference_winner=v_ref_w.unsqueeze(0).float(),
+                v_reference_loser=v_ref_l.unsqueeze(0).float(),
+                v_target_winner=v_w.unsqueeze(0).float(),
+                v_target_loser=v_l.unsqueeze(0).float(),
                 beta=args.beta,
             )
 
@@ -476,59 +596,65 @@ def main():
             losses.append(loss_val)
 
             if is_main and step % args.log_every == 0:
-                print(f"[step {step}/{args.max_steps}] pair={pid[:8]} t_raw={t_raw_int} loss={loss_val:.4f}", flush=True)
+                elapsed = time.time() - wall_start
+                vram_alloc_gb = torch.cuda.max_memory_allocated(device) / 1024**3
+                vram_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024**3
+                print(
+                    f"[step {step}/{args.max_steps}] pair={pid[:8]} t_raw={t_raw} loss={loss_val:.4f} "
+                    f"elapsed={elapsed:.1f}s vram_peak={vram_alloc_gb:.2f}GB reserved={vram_reserved_gb:.2f}GB",
+                    flush=True,
+                )
 
             if is_main and step > 0 and step % args.save_every == 0:
                 ckpt_path = run_dir / f"lora_step{step}.safetensors"
-                lora_state = {f"lora_{i}_A": A for i, A in enumerate([p for p in lora_params if "A" in str(p)])}
-                # simplified save: just dump the lora_params list
-                state = {f"lora_param_{i}": p.detach().cpu() for i, p in enumerate(lora_params)}
-                safetensors.torch.save_file(state, str(ckpt_path))
+                state, meta = collect_lora_state(policy.module if is_distributed else policy)
+                safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
                 print(f"[step {step}] saved {ckpt_path}", flush=True)
 
             step += 1
 
-    # Final save + manifest
+    wall_seconds = time.time() - wall_start
+
     if is_main:
         ckpt_path = run_dir / "lora_final.safetensors"
-        state = {f"lora_param_{i}": p.detach().cpu() for i, p in enumerate(lora_params)}
-        safetensors.torch.save_file(state, str(ckpt_path))
+        state, meta = collect_lora_state(policy.module if is_distributed else policy)
+        safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
         manifest = {
             "tier": args.tier,
             "max_steps": args.max_steps,
+            "actual_steps": step,
             "lr": args.lr,
             "beta": args.beta,
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
-            "ref_offload": args.ref_offload,
+            "ref_on_cpu": args.ref_on_cpu,
             "world_size": world_size,
             "compute_envelope": "dpo_multi_gpu_zero2" if is_distributed else "single_gpu",
             "machine_internal_ip_tail": socket_tail(),
             "recipe_id": recipe_id,
+            "lora_target_modules_count": len(matched_names),
+            "lora_target_modules_sample": matched_names[:8],
             "final_loss": losses[-1] if losses else None,
             "loss_min": min(losses) if losses else None,
             "loss_max": max(losses) if losses else None,
             "loss_mean": sum(losses) / len(losses) if losses else None,
             "routing_counter": routing_counter.summary(),
             "ckpt_path": str(ckpt_path),
-            "wall_seconds": None,  # filled below
+            "wall_seconds": round(wall_seconds, 2),
+            "p3_sampling_band": [SAMPLING_T_LOW, SAMPLING_T_HIGH],
+            "ts_utc": ts,
+            "vram_peak_alloc_gb": round(torch.cuda.max_memory_allocated(device) / 1024**3, 2),
+            "vram_peak_reserved_gb": round(torch.cuda.max_memory_reserved(device) / 1024**3, 2),
         }
         run_dir.joinpath("run_manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )
         print(f"[done] saved {ckpt_path}", flush=True)
         print(f"[done] manifest at {run_dir / 'run_manifest.json'}", flush=True)
+        print(f"[done] routing counter: {routing_counter.summary()}", flush=True)
 
     if is_distributed:
         dist.destroy_process_group()
-
-
-def socket_tail() -> str:
-    import socket
-    try:
-        return socket.gethostbyname(socket.gethostname()).rsplit(".", 1)[-1]
-    except OSError:
-        return "unknown"
 
 
 if __name__ == "__main__":
