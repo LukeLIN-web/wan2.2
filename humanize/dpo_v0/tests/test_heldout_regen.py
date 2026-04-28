@@ -357,26 +357,30 @@ def test_subprocess_adapter_emits_locked_cli(tmp_path: pathlib.Path, monkeypatch
         gen_config_bytes=cfg_bytes,
         out_dir=tmp_path / "out_baseline",
         ckpt_args={
-            "baseline_ckpt": "/ckpt/base.safetensors",
             "trained_lora": "/ckpt/lora.safetensors",
             "low_noise_ckpt": "/ckpt/low.safetensors",
             "upstream": "/data/Wan2.2-I2V-A14B",
             "recipe_yaml": "/recipes/r.yaml",
+            "compute_envelope": "single_gpu",
         },
     )
     cmd = captured["cmd"]
     assert "--mode" in cmd and cmd[cmd.index("--mode") + 1] == "baseline"
-    assert "--baseline_ckpt" in cmd and cmd[cmd.index("--baseline_ckpt") + 1] == "/ckpt/base.safetensors"
-    assert "--low_noise_ckpt" in cmd and cmd[cmd.index("--low_noise_ckpt") + 1] == "/ckpt/low.safetensors"
     assert "--upstream" in cmd and cmd[cmd.index("--upstream") + 1] == "/data/Wan2.2-I2V-A14B"
-    assert "--recipe_yaml" in cmd and cmd[cmd.index("--recipe_yaml") + 1] == "/recipes/r.yaml"
+    assert "--low-noise-ckpt" in cmd and cmd[cmd.index("--low-noise-ckpt") + 1] == "/ckpt/low.safetensors"
+    assert "--recipe-yaml" in cmd and cmd[cmd.index("--recipe-yaml") + 1] == "/recipes/r.yaml"
+    assert "--compute-envelope" in cmd and cmd[cmd.index("--compute-envelope") + 1] == "single_gpu"
     assert "--prompt" in cmd
-    assert "--cond_image" in cmd
-    assert "--out_dir" in cmd
-    assert "--gen_config_json" in cmd
+    assert "--cond-image" in cmd
+    assert "--out-dir" in cmd
+    assert "--gen-config-json" in cmd
     assert "--seed" in cmd
-    # baseline mode does NOT pass --trained_lora
+    # baseline mode takes NO --lora-adapter (inference_smoke rejects it)
+    assert "--lora-adapter" not in cmd
+    # legacy spec-flagged forms must NOT appear
+    assert "--baseline_ckpt" not in cmd
     assert "--trained_lora" not in cmd
+    assert "--cond_image" not in cmd
 
 
 def test_subprocess_adapter_trained_mode(tmp_path: pathlib.Path, monkeypatch):
@@ -407,34 +411,51 @@ def test_subprocess_adapter_trained_mode(tmp_path: pathlib.Path, monkeypatch):
         ckpt_args={
             "trained_lora": "/ckpt/lora.safetensors",
             "low_noise_ckpt": "/ckpt/low.safetensors",
+            "upstream": "/data/Wan2.2-I2V-A14B",
         },
     )
     cmd = captured["cmd"]
     assert cmd[cmd.index("--mode") + 1] == "trained"
-    assert "--trained_lora" in cmd
-    assert "--baseline_ckpt" not in cmd  # trained mode doesn't need baseline
+    assert "--lora-adapter" in cmd and cmd[cmd.index("--lora-adapter") + 1] == "/ckpt/lora.safetensors"
+    assert "--baseline_ckpt" not in cmd
+    assert "--trained_lora" not in cmd
 
 
-def test_python_api_adapter_signature_matches_rl5_lock(tmp_path: pathlib.Path):
-    """The python_api adapter must call run_one_sample with the keyword arg
-    set rl5 locked at msg `5e8993eb` / `ac00949`:
+def test_python_api_adapter_signature_matches_rl5_actual(tmp_path: pathlib.Path):
+    """The python_api adapter must call run_one_sample with the ACTUAL
+    signature in rl5's inference_smoke.py on rlcr/task-6 (rl1 caught the
+    spec/impl drift in #dpo:dac89b67 msg `04170e0b`):
 
-        mode, prompt, cond_image, gen_config, out_dir, seed,
-        baseline_ckpt, trained_lora, low_noise_ckpt, upstream, recipe_yaml
+        mode, out_dir, upstream, torch_dtype, device, prompt, cond_image_path,
+        generation_config, generation_config_bytes, lora_adapter_path,
+        compute_envelope, recipe_id
 
-    Any drift in this signature would break the wire-in. This test mocks
-    run_one_sample as a kwargs-only callable to assert the contract.
+    The adapter constructs UpstreamPaths(upstream_root=...) from
+    ckpt_args["upstream"], resolves recipe_id via assert_recipe_pin, and
+    forwards torch.bfloat16 / "cuda" defaults.
     """
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
     captured: dict = {}
 
-    def fake_run_one_sample(*, mode, prompt, cond_image, gen_config, out_dir, seed,
-                            baseline_ckpt=None, trained_lora=None, low_noise_ckpt=None,
-                            upstream=None, recipe_yaml=None):
+    def fake_run_one_sample(
+        *, mode, out_dir, upstream, torch_dtype, device, prompt, cond_image_path,
+        generation_config, generation_config_bytes, lora_adapter_path,
+        compute_envelope, recipe_id, high_noise_sha=None, low_noise_sha=None,
+    ):
         captured.update(
-            mode=mode, prompt=prompt, cond_image=cond_image, gen_config=gen_config,
-            out_dir=out_dir, seed=seed,
-            baseline_ckpt=baseline_ckpt, trained_lora=trained_lora,
-            low_noise_ckpt=low_noise_ckpt, upstream=upstream, recipe_yaml=recipe_yaml,
+            mode=mode, out_dir=out_dir, upstream=upstream,
+            torch_dtype=torch_dtype, device=device,
+            prompt=prompt, cond_image_path=cond_image_path,
+            generation_config=generation_config,
+            generation_config_bytes=generation_config_bytes,
+            lora_adapter_path=lora_adapter_path,
+            compute_envelope=compute_envelope,
+            recipe_id=recipe_id,
         )
         return {
             "mode": mode,
@@ -445,7 +466,15 @@ def test_python_api_adapter_signature_matches_rl5_lock(tmp_path: pathlib.Path):
             },
         }
 
-    adapter = heldout_regen.python_api_inference_adapter(fake_run_one_sample)
+    # Stub assert_recipe_pin so test doesn't need a real recipe YAML on disk.
+    def fake_assert_recipe_pin(recipes_dir):
+        return "6bef6e104cdd3442"
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=fake_assert_recipe_pin,
+    )
     cfg_bytes = heldout_regen.serialize_generation_config(
         heldout_regen.canonical_generation_config(seed=11)
     )
@@ -456,23 +485,34 @@ def test_python_api_adapter_signature_matches_rl5_lock(tmp_path: pathlib.Path):
         gen_config_bytes=cfg_bytes,
         out_dir=tmp_path / "out",
         ckpt_args={
-            "baseline_ckpt": "/ckpt/base.safetensors",
             "trained_lora": "/ckpt/lora.safetensors",
             "low_noise_ckpt": "/ckpt/low.safetensors",
             "upstream": "/data/Wan2.2-I2V-A14B",
             "recipe_yaml": "/recipes/r.yaml",
+            "compute_envelope": "multi_gpu_inference_seed_parallel",
+            "device": "cuda",
         },
     )
     # Signature contract assertions
     assert captured["mode"] == "trained"
     assert captured["prompt"] == "a thing"
-    assert captured["cond_image"] == "/fake/img.png"
-    assert captured["seed"] == 11
-    assert captured["baseline_ckpt"] == "/ckpt/base.safetensors"
-    assert captured["trained_lora"] == "/ckpt/lora.safetensors"
-    assert captured["low_noise_ckpt"] == "/ckpt/low.safetensors"
-    assert captured["upstream"] == "/data/Wan2.2-I2V-A14B"
-    assert captured["recipe_yaml"] == "/recipes/r.yaml"
+    # Path conversion: cond_image_path str → pathlib.Path
+    assert isinstance(captured["cond_image_path"], pathlib.Path)
+    assert str(captured["cond_image_path"]) == "/fake/img.png"
+    # generation_config dict + generation_config_bytes paired
+    assert captured["generation_config"]["seed"] == 11
+    assert captured["generation_config_bytes"] == cfg_bytes
+    # UpstreamPaths constructed with Path
+    assert isinstance(captured["upstream"], FakeUpstreamPaths)
+    assert captured["upstream"].upstream_root == pathlib.Path("/data/Wan2.2-I2V-A14B")
+    # lora_adapter_path is Path for trained, None for baseline
+    assert captured["lora_adapter_path"] == pathlib.Path("/ckpt/lora.safetensors")
+    assert captured["compute_envelope"] == "multi_gpu_inference_seed_parallel"
+    assert captured["recipe_id"] == "6bef6e104cdd3442"
+    assert captured["device"] == "cuda"
+    # torch_dtype resolved from gen_config dtype string
+    import torch
+    assert captured["torch_dtype"] is torch.bfloat16
     # ckpt_shas propagated from inner result
     assert out["ckpt_shas"] == {
         "high_noise_base_sha256": "h0",
@@ -481,21 +521,81 @@ def test_python_api_adapter_signature_matches_rl5_lock(tmp_path: pathlib.Path):
     }
 
 
-def test_subprocess_adapter_requires_low_noise(tmp_path: pathlib.Path):
+def test_python_api_adapter_baseline_passes_none_lora(tmp_path: pathlib.Path):
+    """Baseline mode must pass lora_adapter_path=None to run_one_sample."""
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    captured: dict = {}
+
+    def fake_run_one_sample(*, mode, lora_adapter_path, **kw):
+        captured["mode"] = mode
+        captured["lora_adapter_path"] = lora_adapter_path
+        return {"mode": mode, "ckpt_shas": {"high_noise_base_sha256": "x"}}
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=lambda d: "6bef6e104cdd3442",
+    )
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    adapter(
+        run_kind="baseline",
+        prompt="x",
+        cond_image_path="/fake.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out_baseline",
+        ckpt_args={
+            "trained_lora": "/ckpt/lora.safetensors",  # ignored in baseline
+            "upstream": "/data/Wan2.2-I2V-A14B",
+        },
+    )
+    assert captured["mode"] == "baseline"
+    assert captured["lora_adapter_path"] is None
+
+
+def test_subprocess_adapter_requires_upstream(tmp_path: pathlib.Path):
+    """upstream is the only orchestrator-level required ckpt_arg for the
+    subprocess adapter; everything else is optional or mode-conditional.
+    Baseline does NOT need a baseline_ckpt — inference_smoke baseline runs
+    off the canonical sharded high_noise expert under <upstream>/."""
     fake_inference = tmp_path / "inference_smoke.py"
     fake_inference.write_text("# stub")
     adapter = heldout_regen.subprocess_inference_adapter(fake_inference)
     cfg_bytes = heldout_regen.serialize_generation_config(
         heldout_regen.canonical_generation_config(seed=7)
     )
-    with pytest.raises(KeyError, match="low_noise_ckpt"):
+    with pytest.raises(KeyError, match="upstream"):
         adapter(
             run_kind="baseline",
             prompt="x",
             cond_image_path="/fake.png",
             gen_config_bytes=cfg_bytes,
             out_dir=tmp_path / "out",
-            ckpt_args={"baseline_ckpt": "/ckpt/base.safetensors"},
+            ckpt_args={"trained_lora": "/ckpt/lora.safetensors"},  # missing upstream
+        )
+
+
+def test_subprocess_adapter_trained_requires_lora(tmp_path: pathlib.Path):
+    fake_inference = tmp_path / "inference_smoke.py"
+    fake_inference.write_text("# stub")
+    adapter = heldout_regen.subprocess_inference_adapter(fake_inference)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=7)
+    )
+    with pytest.raises(KeyError, match="trained_lora"):
+        adapter(
+            run_kind="trained",
+            prompt="x",
+            cond_image_path="/fake.png",
+            gen_config_bytes=cfg_bytes,
+            out_dir=tmp_path / "out",
+            ckpt_args={"upstream": "/data/Wan2.2-I2V-A14B"},  # missing trained_lora
         )
 
 
@@ -546,7 +646,7 @@ def test_subprocess_adapter_propagates_ckpt_shas(tmp_path: pathlib.Path, monkeyp
     def fake_run(cmd, capture_output, text, timeout):
         captured["cmd"] = list(cmd)
         # Simulate inference_smoke dropping a manifest with ckpt_shas in out_dir.
-        out_idx = cmd.index("--out_dir") + 1
+        out_idx = cmd.index("--out-dir") + 1
         out_dir = pathlib.Path(cmd[out_idx])
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "manifest.json").write_text(json.dumps({
@@ -572,7 +672,7 @@ def test_subprocess_adapter_propagates_ckpt_shas(tmp_path: pathlib.Path, monkeyp
         gen_config_bytes=cfg_bytes,
         out_dir=tmp_path / "out",
         ckpt_args={
-            "baseline_ckpt": "/ckpt/base.safetensors",
+            "upstream": "/data/Wan2.2-I2V-A14B",
             "low_noise_ckpt": "/ckpt/low.safetensors",
         },
     )
