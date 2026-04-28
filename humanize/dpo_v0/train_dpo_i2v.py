@@ -447,9 +447,26 @@ def main():
         print(f"[init] world_size={world_size} rank={rank} device={device} run_dir={run_dir}", flush=True)
 
     # Records
-    records = load_pair_records(args.latent_manifest, args.post_t2_pair, args.t2_image_manifest)
+    records_all = load_pair_records(args.latent_manifest, args.post_t2_pair, args.t2_image_manifest)
+    # Filter pairs whose conditioning image is missing on this machine.
+    records: list[PairRecord] = []
+    dropped: list[str] = []
+    for r in records_all:
+        if pathlib.Path(r.cond_image_path).exists():
+            records.append(r)
+        else:
+            dropped.append(f"{r.pair_id} ({r.cond_image_path})")
     if is_main:
-        print(f"[dataset] {len(records)} pairs", flush=True)
+        print(
+            f"[dataset] {len(records)} pairs (dropped {len(dropped)} with missing cond images)",
+            flush=True,
+        )
+        for d in dropped[:16]:
+            print(f"  dropped: {d}", flush=True)
+    if not records:
+        raise RuntimeError(
+            "no pairs left after cond-image existence filter; deploy is incomplete"
+        )
 
     # ---- VAE for cond image encoding (init-time only) ----
     if is_main:
