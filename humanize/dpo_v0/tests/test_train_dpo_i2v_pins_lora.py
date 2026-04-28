@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))  # humanize/dpo_v0/
 
-import train_dpo_i2v as trainer  # noqa: E402
+from train import train_dpo_i2v as trainer  # noqa: E402
 
 
 def test_collect_lora_state_emits_diffsynth_native_weight_keys():

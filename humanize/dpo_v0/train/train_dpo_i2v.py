@@ -64,8 +64,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 HERE = pathlib.Path(__file__).resolve().parent
+DPO_ROOT = HERE.parent  # humanize/dpo_v0/
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent.parent))  # videodpoWan
+sys.path.insert(0, str(DPO_ROOT))
+sys.path.insert(0, str(DPO_ROOT.parent.parent))  # videodpoWan
 from dpo_loss import flow_matching_dpo_loss  # noqa: E402
 
 # Recipe pin (must match recipes/recipe_id)
@@ -73,7 +75,7 @@ EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
 EXPECTED_VAE_SHA256 = "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981"
 EXPECTED_T5_SHA256 = "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d"
 EXPECTED_TOKENIZER_TREE_SHA256 = "d987d207c7b61d346ed38997af29752f8bdde8c7185169b89cbd552c8421c438"
-RECIPES_DIR = HERE / "recipes"
+RECIPES_DIR = DPO_ROOT / "recipes"
 
 # AC-5.U2 raw boundary (switch_DiT_boundary * 1000)
 SWITCH_DIT_BOUNDARY_RAW = 900
@@ -536,7 +538,7 @@ def main():
     )
     p.add_argument("--post-t2-pair", type=pathlib.Path, required=True)
     p.add_argument("--t2-image-manifest", type=pathlib.Path, required=True)
-    p.add_argument("--out-dir", type=pathlib.Path, default=HERE / "ckpts")
+    p.add_argument("--out-dir", type=pathlib.Path, default=DPO_ROOT / "ckpts")
     p.add_argument("--tier", choices=["tier_a", "tier_b"], default="tier_a")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-5)
@@ -563,6 +565,15 @@ def main():
         type=lambda s: s.lower() == "true",
         default=False,
         help="Wrap each WanModel block.forward with torch.utils.checkpoint.checkpoint to trade compute for activation memory. Required on 80GB cards for 14B+y conditioning.",
+    )
+    p.add_argument(
+        "--dit-fsdp",
+        type=lambda s: s.lower() == "true",
+        default=False,
+        help="Wrap policy WanModel with FSDP FULL_SHARD (use_orig_params=True for LoRA "
+             "compat). Shards 14B base weights across world_size: ~3.5GB/rank vs DDP's "
+             "~28GB/rank. Required on 8x80GB after grad-ckpt is already enabled to clear "
+             "step-0 OOM. Uses wan.distributed.fsdp.shard_model.",
     )
     # Round-4 double-pin args (rl2 spec b98b72b1). All four mutually optional;
     # round-4 launches must set all four together. Round-2 mode (no training_config)
@@ -835,9 +846,18 @@ def main():
         print("[ref-via-toggled-LoRA] precondition OK: policy has no dropout module", flush=True)
 
     if is_distributed:
-        # Codex round 2 hint: find_unused_parameters=True is unnecessary overhead since
-        # all LoRA params receive grad; flip to False for cleaner DDP behavior.
-        policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
+        if args.dit_fsdp:
+            # FSDP FULL_SHARD: ~28GB base / world_size per rank (vs DDP's full 28GB/rank).
+            # use_lora=True -> use_orig_params=True so LoRA Parameter objects stay live for
+            # AdamW + lora_disabled() context (frozen base + trainable LoRA mixed requires_grad).
+            from wan.distributed.fsdp import shard_model
+            policy = shard_model(policy, device_id=local_rank, use_lora=True)
+            if is_main:
+                print("[fsdp] policy wrapped: FULL_SHARD use_orig_params=True bf16/fp32-reduce", flush=True)
+        else:
+            # Codex round 2 hint: find_unused_parameters=True is unnecessary overhead since
+            # all LoRA params receive grad; flip to False for cleaner DDP behavior.
+            policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, betas=(0.9, 0.999))
     routing_counter = RoutingCounter(halt_on_low_noise=args.halt_on_low_noise)
@@ -853,6 +873,22 @@ def main():
     losses: list[float] = []
     step = 0
     wall_start = time.time()
+
+    def _save_lora(ckpt_path):
+        # Under FSDP FULL_SHARD, LoRA Parameters are sharded across ranks; collect_lora_state
+        # would silently grab local shards. summon_full_params is a collective so ALL ranks
+        # must enter; rank0_only=True materializes full params on rank 0 only (others see
+        # empty), and only rank 0 writes the safetensors file.
+        if args.dit_fsdp and is_distributed:
+            from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+            with _FSDP.summon_full_params(policy, writeback=False, rank0_only=True):
+                if is_main:
+                    state, meta = collect_lora_state(policy)
+                    safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
+        elif is_main:
+            inner = policy.module if is_distributed else policy
+            state, meta = collect_lora_state(inner)
+            safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
 
     while step < args.max_steps:
         if sampler is not None:
@@ -982,20 +1018,24 @@ def main():
                     flush=True,
                 )
 
-            if is_main and step > 0 and step % args.save_every == 0:
+            # FSDP collective requires all ranks to enter summon_full_params together,
+            # so the gating drops `is_main` here; _save_lora handles rank-0-only IO internally.
+            if step > 0 and step % args.save_every == 0:
                 ckpt_path = run_dir / f"lora_step{step}.safetensors"
-                state, meta = collect_lora_state(policy.module if is_distributed else policy)
-                safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
-                print(f"[step {step}] saved {ckpt_path}", flush=True)
+                _save_lora(ckpt_path)
+                if is_main:
+                    print(f"[step {step}] saved {ckpt_path}", flush=True)
 
             step += 1
 
     wall_seconds = time.time() - wall_start
 
+    # _save_lora is a FSDP collective when --dit-fsdp is set (all ranks enter); manifest
+    # write below stays rank-0-only.
+    ckpt_path = run_dir / "lora_final.safetensors"
+    _save_lora(ckpt_path)
+
     if is_main:
-        ckpt_path = run_dir / "lora_final.safetensors"
-        state, meta = collect_lora_state(policy.module if is_distributed else policy)
-        safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
         manifest = {
             "tier": args.tier,
             "max_steps": args.max_steps,
@@ -1008,8 +1048,14 @@ def main():
             # Honest enum (rl2 df979b3d): plan AC-6 names dpo_multi_gpu_zero2 but round-2
             # actually runs plain DDP + sequential-DPO + ref-via-disabled-LoRA. The
             # dpo_multi_gpu_zero2 envelope (DS Zero-2 wrap) remains a round-3+ aspiration.
-            "compute_envelope": "dpo_multi_gpu_ddp" if is_distributed else "single_gpu",
-            "parallelism": "ddp" if is_distributed else "none",
+            "compute_envelope": (
+                "dpo_multi_gpu_fsdp" if (is_distributed and args.dit_fsdp)
+                else ("dpo_multi_gpu_ddp" if is_distributed else "single_gpu")
+            ),
+            "parallelism": (
+                "fsdp" if (is_distributed and args.dit_fsdp)
+                else ("ddp" if is_distributed else "none")
+            ),
             # v8 architecture: no separate reference WanModel. Ref forwards run on policy
             # with LoRA disabled (= byte-identical to frozen base because base is never
             # touched). Saves 27 GB of redundant ref weight on GPU.

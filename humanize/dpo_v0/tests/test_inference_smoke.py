@@ -21,8 +21,8 @@ import tempfile
 import pytest
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
-from inference_smoke import (  # noqa: E402
+sys.path.insert(0, str(HERE.parent))  # humanize/dpo_v0/
+from eval.inference_smoke import (  # noqa: E402
     COMPUTE_ENVELOPES_CANONICAL,
     EXPECTED_RECIPE_ID,
     FPS,

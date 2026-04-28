@@ -20,7 +20,7 @@ import torch
 # Local import path so this test runs from a checked-out videodpoWan tree
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from identity_gate_metrics import (  # noqa: E402
+from eval.identity_gate_metrics import (  # noqa: E402
     gate_decision,
     per_frame_metrics,
 )

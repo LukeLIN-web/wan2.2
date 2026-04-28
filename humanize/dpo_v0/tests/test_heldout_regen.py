@@ -24,7 +24,7 @@ PKG_ROOT = HERE.parent          # humanize/dpo_v0/
 sys.path.insert(0, str(PKG_ROOT))
 sys.path.insert(0, str(PKG_ROOT.parent.parent))  # videodpoWan
 
-import heldout_regen  # noqa: E402
+from eval import heldout_regen  # noqa: E402
 
 
 # ---------- fixtures ----------
@@ -536,7 +536,7 @@ def test_python_api_adapter_against_inference_smoke_real_signature():
     """
     import inspect
     try:
-        from inference_smoke import run_one_sample  # type: ignore
+        from eval.inference_smoke import run_one_sample  # type: ignore
     except ImportError as exc:
         pytest.skip(f"inference_smoke not importable in this env: {exc}")
 

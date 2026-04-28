@@ -33,8 +33,9 @@ import safetensors.torch
 import torch
 
 # Keep the loader's recipe pin in lockstep with this script.
-HUMANIZE_DIR = pathlib.Path(__file__).resolve().parent
-RECIPES_DIR = HUMANIZE_DIR / "recipes"
+HERE = pathlib.Path(__file__).resolve().parent
+DPO_ROOT = HERE.parent  # humanize/dpo_v0/
+RECIPES_DIR = DPO_ROOT / "recipes"
 EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
 
 # All paths support env-var override so the encoder runs on boxes without
@@ -59,7 +60,7 @@ UPSTREAM = pathlib.Path(os.environ.get(
 VAE_PATH = UPSTREAM / "Wan2.1_VAE.pth"
 VIDEODPOWAN_ROOT = pathlib.Path(os.environ.get(
     "VIDEODPOWAN_ROOT",
-    str(HUMANIZE_DIR.parent.parent),  # default: ../../ from dpo_v0/
+    str(DPO_ROOT.parent.parent),  # default: ../../ from dpo_v0/
 ))
 
 # Recipe values (pinned via recipe_id; do not edit without bumping recipe_id).
@@ -243,7 +244,7 @@ def main(argv: list[str]) -> int:
         default=None,
         help="Required when --tier tier_b_round4_1k: expected sha256[:16] of newline-canonical pair_ids.",
     )
-    ap.add_argument("--out-root", type=pathlib.Path, default=HUMANIZE_DIR / "latents")
+    ap.add_argument("--out-root", type=pathlib.Path, default=DPO_ROOT / "latents")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = ap.parse_args(argv[1:])

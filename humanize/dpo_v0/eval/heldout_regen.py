@@ -49,12 +49,14 @@ from typing import Any, Callable, Optional
 
 
 HERE = pathlib.Path(__file__).resolve().parent
+DPO_ROOT = HERE.parent  # humanize/dpo_v0/
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(DPO_ROOT))
 
 # rl8 task #16 manifest_writer (commit e096edf, schema version 1).
 # Adopted: assert_recipe_pins (3-way pin assert returning full pins dict)
 # + atomic_write_json (deterministic key order, .tmp + rename).
-from manifest_writer import (  # noqa: E402
+from dataprocessing.manifest_writer import (  # noqa: E402
     MANIFEST_SCHEMA_VERSION as _MANIFEST_WRITER_SCHEMA_VERSION,
     assert_recipe_pins as _mw_assert_recipe_pins,
     atomic_write_json as _mw_atomic_write_json,
@@ -552,7 +554,7 @@ def python_api_inference_adapter(
         recipes_dir = (
             pathlib.Path(ckpt_args["recipe_yaml"]).parent
             if "recipe_yaml" in ckpt_args
-            else HERE / "recipes"
+            else DPO_ROOT / "recipes"
         )
         recipe_id = _assert_recipe_pin(recipes_dir)
 
@@ -938,7 +940,7 @@ def main() -> int:
                    help="<T0_T3_ROOT> as resolved by M0 audit (round-0 §1).")
     p.add_argument("--out-dir", type=pathlib.Path, required=True,
                    help="Run output root; per-prompt dirs land under <out_dir>/heldout_regen/<prompt_id>/.")
-    p.add_argument("--recipes-dir", type=pathlib.Path, default=HERE / "recipes",
+    p.add_argument("--recipes-dir", type=pathlib.Path, default=DPO_ROOT / "recipes",
                    help="Path to the dpo_v0 recipes/ dir (defaults to alongside this file).")
     p.add_argument("--inference-smoke-py", type=pathlib.Path, default=HERE / "inference_smoke.py",
                    help="Path to rl5's inference_smoke.py (used by subprocess adapter).")

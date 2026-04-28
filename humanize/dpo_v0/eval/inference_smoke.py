@@ -47,7 +47,8 @@ from PIL import Image
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-RECIPES_DIR = HERE / "recipes"
+DPO_ROOT = HERE.parent  # humanize/dpo_v0/
+RECIPES_DIR = DPO_ROOT / "recipes"
 # AC-3.1 (videodpo/humanize/i2v.md line 26): recipe_id is frozen at this
 # value across the parent plan and the i2v plan; any drift halts before
 # any forward pass.

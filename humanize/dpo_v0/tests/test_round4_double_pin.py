@@ -19,11 +19,12 @@ import pytest
 import yaml
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+DPO_ROOT = HERE.parent  # humanize/dpo_v0/
+sys.path.insert(0, str(DPO_ROOT))
 
-import train_dpo_i2v as trainer  # noqa: E402
+from train import train_dpo_i2v as trainer  # noqa: E402
 
-RECIPES_DIR = HERE / "recipes"
+RECIPES_DIR = DPO_ROOT / "recipes"
 
 
 def test_assert_recipe_pin_passes_round2_immutable():
@@ -124,7 +125,7 @@ def test_trainer_cli_rejects_partial_round4_args(tmp_path):
     fake_latent_manifest.touch()
 
     cmd = [
-        sys.executable, str(HERE / "train_dpo_i2v.py"),
+        sys.executable, str(DPO_ROOT / "train" / "train_dpo_i2v.py"),
         "--latent-manifest", str(fake_latent_manifest),
         "--post-t2-pair", str(fake_pair_json),
         "--t2-image-manifest", str(fake_image_manifest),
@@ -148,7 +149,7 @@ def test_trainer_cli_rejects_partial_subset_args(tmp_path):
     fake_latent_manifest.touch()
 
     cmd = [
-        sys.executable, str(HERE / "train_dpo_i2v.py"),
+        sys.executable, str(DPO_ROOT / "train" / "train_dpo_i2v.py"),
         "--latent-manifest", str(fake_latent_manifest),
         "--post-t2-pair", str(fake_pair_json),
         "--t2-image-manifest", str(fake_image_manifest),

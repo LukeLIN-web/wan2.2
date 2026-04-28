@@ -9,12 +9,16 @@ policy that prefers winner more than reference yields a smaller loss;
 from __future__ import annotations
 
 import math
+import pathlib
+import sys
 
 import pytest
 import torch
 import torch.nn as nn
 
-from dpo_loss import flow_matching_dpo_loss, per_sample_mse
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))  # humanize/dpo_v0/
+from train.dpo_loss import flow_matching_dpo_loss, per_sample_mse  # noqa: E402
 
 
 def _shape() -> tuple[int, int, int, int, int]:
