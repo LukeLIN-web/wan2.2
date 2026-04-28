@@ -521,6 +521,73 @@ def test_python_api_adapter_signature_matches_rl5_actual(tmp_path: pathlib.Path)
     }
 
 
+def test_python_api_adapter_against_inference_smoke_real_signature():
+    """Cross-module signature integration test (BL-20260428-mock-not-import-
+    catches-spec-drift): verify the adapter passes EXACTLY the kwargs
+    rl5's actual ``run_one_sample`` accepts.
+
+    Uses ``inspect.signature`` on the real import — no GPU exec, no
+    diffsynth dependency, no torch model load. If a future commit
+    renames a kwarg or drops a parameter on either side, this test
+    flags it at test-time instead of M6-launch-time. The mock-only
+    ``test_python_api_adapter_signature_matches_rl5_actual`` above
+    encodes the orchestrator's call kwargs; this test verifies they
+    match the callee's actual parameter set.
+    """
+    import inspect
+    try:
+        from inference_smoke import run_one_sample  # type: ignore
+    except ImportError as exc:
+        pytest.skip(f"inference_smoke not importable in this env: {exc}")
+
+    sig = inspect.signature(run_one_sample)
+    callee_param_names = set(sig.parameters.keys())
+
+    # Kwargs the orchestrator's python_api_inference_adapter passes
+    # (kept in sync with the adapter implementation manually — drift
+    # between this set and the adapter call site would make the
+    # adapter pass an undefined kwarg).
+    adapter_kwargs = {
+        "mode",
+        "out_dir",
+        "upstream",
+        "torch_dtype",
+        "device",
+        "prompt",
+        "cond_image_path",
+        "generation_config",
+        "generation_config_bytes",
+        "lora_adapter_path",
+        "compute_envelope",
+        "recipe_id",
+    }
+
+    missing_in_callee = adapter_kwargs - callee_param_names
+    assert not missing_in_callee, (
+        f"orchestrator passes kwargs that don't exist in run_one_sample: "
+        f"{sorted(missing_in_callee)}. signature drift between "
+        f"heldout_regen.python_api_inference_adapter and "
+        f"inference_smoke.run_one_sample. expected callee params: "
+        f"{sorted(callee_param_names)}"
+    )
+
+    # Optional params on callee (e.g. high_noise_sha / low_noise_sha cache)
+    # are fine — adapter just doesn't use them. Required params on callee
+    # that adapter DOESN'T pass would TypeError at call time:
+    callee_required = {
+        name for name, param in sig.parameters.items()
+        if param.default is inspect.Parameter.empty
+        and param.kind not in (inspect.Parameter.VAR_POSITIONAL,
+                               inspect.Parameter.VAR_KEYWORD)
+    }
+    missing_in_adapter = callee_required - adapter_kwargs
+    assert not missing_in_adapter, (
+        f"run_one_sample requires kwargs the adapter doesn't pass: "
+        f"{sorted(missing_in_adapter)}. signature drift in the other "
+        f"direction. orchestrator passes: {sorted(adapter_kwargs)}"
+    )
+
+
 def test_python_api_adapter_baseline_passes_none_lora(tmp_path: pathlib.Path):
     """Baseline mode must pass lora_adapter_path=None to run_one_sample."""
     import dataclasses
