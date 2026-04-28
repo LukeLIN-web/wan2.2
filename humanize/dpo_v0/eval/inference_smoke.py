@@ -47,8 +47,23 @@ from PIL import Image
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-DPO_ROOT = HERE.parent  # humanize/dpo_v0/
-RECIPES_DIR = DPO_ROOT / "recipes"
+
+
+def _resolve_recipes_dir() -> pathlib.Path:
+    # Older checkout layout: humanize/dpo_v0/inference_smoke.py with
+    #   recipes at humanize/dpo_v0/recipes/.
+    # Newer checkout layout: humanize/dpo_v0/eval/inference_smoke.py with
+    #   recipes at humanize/dpo_v0/recipes/.
+    # Walk parents until a candidate `recipes/recipe_id` sidecar is found,
+    # so the same source works in either checkout.
+    for cand in (HERE / "recipes", HERE.parent / "recipes"):
+        if (cand / "recipe_id").exists():
+            return cand
+    return HERE.parent / "recipes"
+
+
+RECIPES_DIR = _resolve_recipes_dir()
+DPO_ROOT = RECIPES_DIR.parent  # humanize/dpo_v0/
 # AC-3.1 (videodpo/humanize/i2v.md line 26): recipe_id is frozen at this
 # value across the parent plan and the i2v plan; any drift halts before
 # any forward pass.
@@ -112,29 +127,28 @@ def file_sha256(path: pathlib.Path, buf: int = 4 * 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def sharded_ckpt_sha(shards: list[pathlib.Path]) -> str:
-    """Stable hash over an ordered shard list.
+# Sidecar-cached aggregated shard sha256 is shared across every inference
+# entrypoint via humanize/dpo_v0/file_sha_cache.py (cache file at
+# <upstream_root>/file_sha.cache.json). Aggregation byte stream is
+# byte-equal to a cold recompute, so AC-7.3 manifest stamps are unchanged.
+# Import is layout-tolerant: inference_smoke.py lives at humanize/dpo_v0/
+# in older checkouts and humanize/dpo_v0/eval/ in newer ones; the util
+# always sits next to humanize/dpo_v0/, so we walk parents until we find
+# it.
+def _import_file_sha_cache():
+    import importlib.util as _ilu
+    here = pathlib.Path(__file__).resolve()
+    for cand in (here.parent, here.parent.parent):
+        f = cand / "file_sha_cache.py"
+        if f.exists():
+            spec = _ilu.spec_from_file_location("_videodpo_file_sha_cache", f)
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise ImportError("file_sha_cache.py not found beside inference_smoke.py")
 
-    Walks the shards in alphabetical filename order. For each shard,
-    updates a single `hashlib.sha256()` with `<basename>|<file_sha>\\n`.
-    Captures both the ordered file list AND the per-file content, so two
-    deploys with the same logical content (same files, same bytes) hash
-    identically; reordering, renaming, replacing, or omitting any shard
-    changes the digest.
 
-    This is the load-side ground truth used for AC-7.3 manifest stamping
-    of `high_noise_base_sha256` and `low_noise_frozen_sha256` -- it does
-    not require torch (no state-dict load), so it is cheap to compute at
-    inference startup and matches what the loader records under the
-    canonical hash rule's per-shard SHA spectrum.
-    """
-    h = hashlib.sha256()
-    for s in sorted(shards, key=lambda p: p.name):
-        h.update(s.name.encode("utf-8"))
-        h.update(b"|")
-        h.update(file_sha256(s).encode("ascii"))
-        h.update(b"\n")
-    return h.hexdigest()
+sharded_ckpt_sha = _import_file_sha_cache().cached_sharded_ckpt_sha  # noqa: E305
 
 
 def code_commit_id() -> str:
@@ -662,12 +676,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             f"--switch-DiT-boundary must be {SWITCH_DIT_BOUNDARY} (AC-3.5); "
             f"got {args.switch_DiT_boundary}"
         )
-    if args.num_frames != NUM_FRAMES:
+    # AC-3.5 pins num_frames=81 / fps=16 for eval. The eval pipeline
+    # supplies these via `--gen-config-json` (canonical generation_config
+    # built by heldout_regen.py), which bypasses argparse entirely, so
+    # the eval contract is still enforced at the orchestrator level. The
+    # argparse defaults match the pin (81 / 16); we no longer assert
+    # equality here so dev / smoke runs can lower num_frames (e.g. 41,
+    # half the denoise) or fps (mp4 metadata only) without patching the
+    # source. The actual values are stamped into the per-run manifest's
+    # generation_config block, so any deviation is auditable.
+    if args.num_frames < 1:
+        raise SystemExit(f"--num-frames must be >= 1; got {args.num_frames}")
+    if (args.num_frames - 1) % 4 != 0:
         raise SystemExit(
-            f"--num-frames must be {NUM_FRAMES} (AC-3.5); got {args.num_frames}"
+            f"--num-frames must satisfy (n - 1) %% 4 == 0 (Wan temporal "
+            f"latent factor); got {args.num_frames}. Valid values include "
+            f"1, 5, 9, ..., 41, 81."
         )
-    if args.fps != FPS:
-        raise SystemExit(f"--fps must be {FPS} (AC-3.5); got {args.fps}")
+    if args.fps < 1:
+        raise SystemExit(f"--fps must be >= 1; got {args.fps}")
 
     # Mode-conditioned arg validation. `both` and `trained` need the LoRA
     # adapter; `baseline` rejects it (so a stray --lora-adapter never
