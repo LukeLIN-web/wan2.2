@@ -40,7 +40,7 @@ import pathlib
 import socket
 import subprocess
 import sys
-from typing import Optional
+from typing import Any, Literal, Optional
 
 import torch
 from PIL import Image
@@ -57,6 +57,19 @@ EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
 SWITCH_DIT_BOUNDARY = 0.9
 NUM_FRAMES = 81
 FPS = 16
+
+# AC-6 / DEC-6 (i2v.md line 76, line 214): canonical envelope enum shared
+# across trainer (`dpo_multi_gpu_ddp` round-3 honest enum, `_zero2` round-4+
+# aspiration), inference smoke (`single_gpu` by contract), and M6 heldout
+# regen (`multi_gpu_inference_seed_parallel` 4-rank seed-parallel inference).
+COMPUTE_ENVELOPES_CANONICAL = (
+    "single_gpu",
+    "dpo_multi_gpu_ddp",
+    "dpo_multi_gpu_zero2",
+    "multi_gpu_inference_seed_parallel",
+)
+
+Mode = Literal["both", "baseline", "trained"]
 
 DEFAULT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，"
@@ -95,6 +108,31 @@ def file_sha256(path: pathlib.Path, buf: int = 4 * 1024 * 1024) -> str:
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(buf), b""):
             h.update(chunk)
+    return h.hexdigest()
+
+
+def sharded_ckpt_sha(shards: list[pathlib.Path]) -> str:
+    """Stable hash over an ordered shard list.
+
+    Walks the shards in alphabetical filename order. For each shard,
+    updates a single `hashlib.sha256()` with `<basename>|<file_sha>\\n`.
+    Captures both the ordered file list AND the per-file content, so two
+    deploys with the same logical content (same files, same bytes) hash
+    identically; reordering, renaming, replacing, or omitting any shard
+    changes the digest.
+
+    This is the load-side ground truth used for AC-7.3 manifest stamping
+    of `high_noise_base_sha256` and `low_noise_frozen_sha256` -- it does
+    not require torch (no state-dict load), so it is cheap to compute at
+    inference startup and matches what the loader records under the
+    canonical hash rule's per-shard SHA spectrum.
+    """
+    h = hashlib.sha256()
+    for s in sorted(shards, key=lambda p: p.name):
+        h.update(s.name.encode("utf-8"))
+        h.update(b"|")
+        h.update(file_sha256(s).encode("ascii"))
+        h.update(b"\n")
     return h.hexdigest()
 
 
@@ -282,7 +320,7 @@ def timestamp() -> str:
 
 def run_one_sample(
     *,
-    run_label: str,
+    mode: Mode,
     out_dir: pathlib.Path,
     upstream: UpstreamPaths,
     torch_dtype: torch.dtype,
@@ -294,28 +332,58 @@ def run_one_sample(
     lora_adapter_path: Optional[pathlib.Path],
     compute_envelope: str,
     recipe_id: str,
-) -> pathlib.Path:
+    high_noise_sha: Optional[str] = None,
+    low_noise_sha: Optional[str] = None,
+) -> dict[str, Any]:
     """Run one inference sample and write video + manifest.
 
-    Returns the run dir (timestamped).
+    Public Python API used by both the CLI entry point and by the M6 heldout
+    regen orchestrator (`heldout_regen.py`'s ``python_api_inference_adapter``).
+    Returns the in-memory manifest dict so the caller can read back the
+    stamped ``ckpt_shas`` block (AC-7.3 load-side ground truth) and route
+    them into a per-prompt manifest without re-reading the file.
+
+    ``mode`` is ``"baseline"`` (no LoRA) or ``"trained"`` (LoRA on pipe.dit
+    high-noise only). The ``run_label`` directory under ``out_dir`` is the
+    same value, so the on-disk layout is ``out_dir/<mode>/<ts>/...``.
+
+    ``high_noise_sha`` / ``low_noise_sha`` are optional cached hashes from
+    ``sharded_ckpt_sha(...)``; passing them avoids recomputing the same
+    digest twice when the caller runs both modes back-to-back. If omitted,
+    they are computed inline.
     """
-    run_dir = out_dir / run_label / timestamp()
+    if mode not in ("baseline", "trained"):
+        raise ValueError(f"mode must be 'baseline' or 'trained'; got {mode!r}")
+    if mode == "trained" and lora_adapter_path is None:
+        raise ValueError("mode='trained' requires lora_adapter_path")
+    if mode == "baseline" and lora_adapter_path is not None:
+        raise ValueError(
+            "mode='baseline' must not be passed a lora_adapter_path "
+            f"(got {lora_adapter_path}); pass mode='trained' instead"
+        )
+
+    run_dir = out_dir / mode / timestamp()
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{run_label}] building pipeline ...", flush=True)
+    if high_noise_sha is None:
+        high_noise_sha = sharded_ckpt_sha(upstream.high_noise_shards)
+    if low_noise_sha is None:
+        low_noise_sha = sharded_ckpt_sha(upstream.low_noise_shards)
+
+    print(f"[{mode}] building pipeline ...", flush=True)
     pipe = build_pipeline(upstream, torch_dtype=torch_dtype, device=device)
 
     lora_sha = None
     if lora_adapter_path is not None:
         lora_sha = file_sha256(lora_adapter_path)
-        print(f"[{run_label}] attaching LoRA {lora_adapter_path} sha={lora_sha[:12]}...",
+        print(f"[{mode}] attaching LoRA {lora_adapter_path} sha={lora_sha[:12]}...",
               flush=True)
         attach_lora(pipe, lora_adapter_path)
 
-    print(f"[{run_label}] loading conditioning image {cond_image_path}", flush=True)
+    print(f"[{mode}] loading conditioning image {cond_image_path}", flush=True)
     cond_image = Image.open(str(cond_image_path)).convert("RGB")
 
-    print(f"[{run_label}] generating ...", flush=True)
+    print(f"[{mode}] generating ...", flush=True)
     video = pipe(
         prompt=prompt,
         negative_prompt=generation_config["negative_prompt"],
@@ -342,9 +410,23 @@ def run_one_sample(
     # we record the upstream root here and let the cross-reference happen
     # via the loader manifest path stored alongside.
     cond_image_sha = file_sha256(cond_image_path)
+    # AC-7.3 (i2v.md line 59): baseline run stamps original_high_noise_sha +
+    # low_noise_frozen_sha; trained run additionally stamps lora_adapter_sha.
+    # All three values come from the load-side (this process actually opened
+    # the file bytes), so the consumer (M6 orchestrator's
+    # `_extract_ckpt_shas`) can trust the manifest as ground truth even when
+    # the on-disk path was rewritten by a sed/scp deploy step.
+    ckpt_shas: dict[str, Optional[str]] = {
+        "high_noise_base_sha256": high_noise_sha,
+        "low_noise_frozen_sha256": low_noise_sha,
+        "lora_adapter_sha256": lora_sha if mode == "trained" else None,
+    }
     manifest = {
         "schema_version": 1,
-        "run_label": run_label,
+        "mode": mode,
+        # `run_label` retained for backward compatibility with consumers that
+        # were on luke's round-1 dual-mode field name; same value as `mode`.
+        "run_label": mode,
         "run_dir": str(run_dir),
         "timestamp_utc": run_dir.name,
         "code_commit_id": code_commit_id(),
@@ -357,10 +439,17 @@ def run_one_sample(
         "low_noise_shards": [p.name for p in upstream.low_noise_shards],
         "lora_adapter_path": str(lora_adapter_path) if lora_adapter_path else None,
         "lora_adapter_sha256": lora_sha,
+        "ckpt_shas": ckpt_shas,
+        "ckpt_paths": {
+            "high_noise_base": str(upstream.upstream_root / "high_noise_model"),
+            "low_noise_frozen": str(upstream.upstream_root / "low_noise_model"),
+            "lora_adapter": str(lora_adapter_path) if lora_adapter_path else None,
+        },
+        "gen_config_sha256": hashlib.sha256(generation_config_bytes).hexdigest(),
         "prompt": prompt,
         "cond_image_path": str(cond_image_path),
         "cond_image_sha256": cond_image_sha,
-        "video_path": str(video_path),
+        "out_video_path": str(video_path),
         "torch_version": torch.__version__,
         "torch_dtype": str(torch_dtype),
         "device": device,
@@ -374,8 +463,8 @@ def run_one_sample(
     # post-run cross-comparison reads the exact bytes the script
     # emitted, not a re-serialization of the manifest dict.
     (run_dir / "generation_config.json").write_bytes(generation_config_bytes)
-    print(f"[{run_label}] done -> {run_dir}", flush=True)
-    return run_dir
+    print(f"[{mode}] done -> {run_dir}", flush=True)
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -398,13 +487,61 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Canonical upstream root (default: shared cluster path).",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["both", "baseline", "trained"],
+        default="both",
+        help=(
+            "Which sample(s) to run. Default 'both' runs baseline followed by "
+            "trained under one shared generation_config (M5 / AC-7.0 smoke "
+            "contract). 'baseline' / 'trained' run a single sample for "
+            "callers that want to drive baseline + trained as separate "
+            "subprocess invocations (M6 heldout regen orchestrator)."
+        ),
+    )
+    parser.add_argument(
         "--lora-adapter",
         type=pathlib.Path,
-        required=True,
+        default=None,
         help=(
             "Path to the trained LoRA safetensors. Produced by "
-            "train_dpo_i2v.py at the end of M3/M4. Used for the trained "
-            "run only; the baseline run never sees it."
+            "train_dpo_i2v.py at the end of M3/M4. Required for "
+            "--mode in {both, trained}; rejected with --mode=baseline."
+        ),
+    )
+    parser.add_argument(
+        "--low-noise-ckpt",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Optional explicit path to the frozen low-noise expert directory "
+            "or single-file ckpt. Defaults to <upstream>/low_noise_model/ "
+            "(canonical sharded layout). The path is recorded under "
+            "ckpt_paths.low_noise_frozen and its merged shard hash is "
+            "stamped under ckpt_shas.low_noise_frozen_sha256 (AC-7.3)."
+        ),
+    )
+    parser.add_argument(
+        "--gen-config-json",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Path to a pre-built generation_config.json (typically built once "
+            "by an upstream orchestrator like M6 heldout_regen.py and reused "
+            "across both baseline and trained runs). When given, the bytes "
+            "are loaded verbatim and used as the byte-identical config; the "
+            "argparse generation knobs are ignored to avoid drift."
+        ),
+    )
+    parser.add_argument(
+        "--recipe-yaml",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Path to the canonical recipe YAML. Defaults to "
+            "<this_dir>/recipes/wan22_i2v_a14b__round2_v0.yaml. The "
+            "recipe_id pin assert is recomputed from the YAML bytes "
+            "(AC-3.1) before any forward pass."
         ),
     )
     parser.add_argument("--prompt", type=str, required=True)
@@ -453,8 +590,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--compute-envelope",
         type=str,
         default="single_gpu",
-        choices=["single_gpu", "dpo_multi_gpu_zero2"],
-        help="Stamped per-run; DEC-6. Smoke is single_gpu by contract.",
+        choices=list(COMPUTE_ENVELOPES_CANONICAL),
+        help=(
+            "Stamped per-run; DEC-6 / i2v.md line 76 + line 214. "
+            "Smoke is single_gpu by contract. The full canonical enum "
+            "(`single_gpu`, `dpo_multi_gpu_ddp`, `dpo_multi_gpu_zero2`, "
+            "`multi_gpu_inference_seed_parallel`) is exposed so this "
+            "module's manifest can be cross-checked against trainer + "
+            "M6 orchestrator manifests under the same field domain."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -482,77 +626,164 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         )
     if args.fps != FPS:
         raise SystemExit(f"--fps must be {FPS} (AC-3.5); got {args.fps}")
+
+    # Mode-conditioned arg validation. `both` and `trained` need the LoRA
+    # adapter; `baseline` rejects it (so a stray --lora-adapter never
+    # accidentally taints a baseline run by being silently ignored).
+    if args.mode in ("both", "trained") and args.lora_adapter is None:
+        raise SystemExit(
+            f"--mode={args.mode} requires --lora-adapter <path>; got None"
+        )
+    if args.mode == "baseline" and args.lora_adapter is not None:
+        raise SystemExit(
+            "--mode=baseline must not be passed --lora-adapter "
+            f"(got {args.lora_adapter}); use --mode=trained for LoRA."
+        )
     return args
+
+
+def _resolve_recipe_pin(args: argparse.Namespace) -> str:
+    """Resolve recipe_id from --recipe-yaml (if given) or default location."""
+    if args.recipe_yaml is not None:
+        # Caller supplied an explicit YAML path; assert against its dir's
+        # `recipe_id` sidecar so the 3-way drift check still applies.
+        recipes_dir = args.recipe_yaml.parent
+    else:
+        recipes_dir = RECIPES_DIR
+    return assert_recipe_pin(recipes_dir=recipes_dir)
+
+
+def _load_generation_config(args: argparse.Namespace) -> tuple[dict, bytes]:
+    """Pick generation_config either from --gen-config-json or argparse knobs.
+
+    When --gen-config-json is given, the file bytes are loaded verbatim and
+    are the single source of truth for the byte-identical contract; the
+    JSON dict is parsed for the actual runtime params. When omitted, the
+    config is built from argparse knobs and serialized via
+    `serialize_generation_config(...)` (back-compat with luke's round-1
+    entry point and the smoke / `--mode=both` use case).
+    """
+    if args.gen_config_json is not None:
+        gen_config_bytes = args.gen_config_json.read_bytes()
+        gen_config = json.loads(gen_config_bytes)
+        return gen_config, gen_config_bytes
+    gen_config = build_generation_config(args)
+    return gen_config, serialize_generation_config(gen_config)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
-    recipe_id = assert_recipe_pin()
+    recipe_id = _resolve_recipe_pin(args)
     print(f"[smoke] recipe_id pin OK: {recipe_id}", flush=True)
 
     upstream = UpstreamPaths(upstream_root=args.upstream)
     upstream.assert_present()
     print(f"[smoke] upstream present: {args.upstream}", flush=True)
 
-    if not args.lora_adapter.exists():
+    if args.lora_adapter is not None and not args.lora_adapter.exists():
         raise SystemExit(f"--lora-adapter does not exist: {args.lora_adapter}")
     if not args.cond_image.exists():
         raise SystemExit(f"--cond-image does not exist: {args.cond_image}")
 
-    generation_config = build_generation_config(args)
-    generation_config_bytes = serialize_generation_config(generation_config)
+    generation_config, generation_config_bytes = _load_generation_config(args)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "generation_config.json").write_bytes(generation_config_bytes)
 
     if args.dry_run:
-        print("[smoke] --dry-run: pin / paths / config OK; exiting before pipeline", flush=True)
+        print(
+            "[smoke] --dry-run: pin / paths / config OK; exiting before pipeline",
+            flush=True,
+        )
         return 0
 
-    baseline_dir = run_one_sample(
-        run_label="baseline",
-        out_dir=args.out_dir,
-        upstream=upstream,
-        torch_dtype=args.torch_dtype,
-        device=args.device,
-        prompt=args.prompt,
-        cond_image_path=args.cond_image,
-        generation_config=generation_config,
-        generation_config_bytes=generation_config_bytes,
-        lora_adapter_path=None,
-        compute_envelope=args.compute_envelope,
-        recipe_id=recipe_id,
-    )
-    trained_dir = run_one_sample(
-        run_label="trained",
-        out_dir=args.out_dir,
-        upstream=upstream,
-        torch_dtype=args.torch_dtype,
-        device=args.device,
-        prompt=args.prompt,
-        cond_image_path=args.cond_image,
-        generation_config=generation_config,
-        generation_config_bytes=generation_config_bytes,
-        lora_adapter_path=args.lora_adapter,
-        compute_envelope=args.compute_envelope,
-        recipe_id=recipe_id,
-    )
+    # Cache the sharded base hashes once across both modes. Computing each
+    # ckpt SHA traverses ~28 GB of safetensors; doing it twice would burn
+    # ~6-10 minutes of disk IO for no value (the bytes are identical across
+    # baseline and trained -- LoRA applies in-RAM only).
+    high_sha = sharded_ckpt_sha(upstream.high_noise_shards)
+    low_sha = sharded_ckpt_sha(upstream.low_noise_shards)
 
-    baseline_cfg = (baseline_dir / "generation_config.json").read_bytes()
-    trained_cfg = (trained_dir / "generation_config.json").read_bytes()
-    if baseline_cfg != trained_cfg:
-        raise RuntimeError(
-            "generation_config bytes diverge between baseline and trained runs "
-            f"(baseline={len(baseline_cfg)}B, trained={len(trained_cfg)}B). "
-            "AC-7.2 byte-identical contract violated."
+    baseline_manifest: Optional[dict[str, Any]] = None
+    trained_manifest: Optional[dict[str, Any]] = None
+
+    if args.mode in ("both", "baseline"):
+        baseline_manifest = run_one_sample(
+            mode="baseline",
+            out_dir=args.out_dir,
+            upstream=upstream,
+            torch_dtype=args.torch_dtype,
+            device=args.device,
+            prompt=args.prompt,
+            cond_image_path=args.cond_image,
+            generation_config=generation_config,
+            generation_config_bytes=generation_config_bytes,
+            lora_adapter_path=None,
+            compute_envelope=args.compute_envelope,
+            recipe_id=recipe_id,
+            high_noise_sha=high_sha,
+            low_noise_sha=low_sha,
         )
-    print(
-        f"[smoke] generation_config byte-identical across runs "
-        f"({len(baseline_cfg)}B). AC-7.0 smoke complete.",
-        flush=True,
-    )
+    if args.mode in ("both", "trained"):
+        trained_manifest = run_one_sample(
+            mode="trained",
+            out_dir=args.out_dir,
+            upstream=upstream,
+            torch_dtype=args.torch_dtype,
+            device=args.device,
+            prompt=args.prompt,
+            cond_image_path=args.cond_image,
+            generation_config=generation_config,
+            generation_config_bytes=generation_config_bytes,
+            lora_adapter_path=args.lora_adapter,
+            compute_envelope=args.compute_envelope,
+            recipe_id=recipe_id,
+            high_noise_sha=high_sha,
+            low_noise_sha=low_sha,
+        )
+
+    if args.mode == "both":
+        # AC-7.2: dual-run smoke must verify byte-identical config across the
+        # two stamped run dirs (not the two manifest dicts; the comparison
+        # MUST be byte-level since the test failure mode is hand-copying or
+        # accidental dict re-serialization in different orders).
+        assert baseline_manifest is not None and trained_manifest is not None
+        baseline_dir = pathlib.Path(baseline_manifest["run_dir"])
+        trained_dir = pathlib.Path(trained_manifest["run_dir"])
+        baseline_cfg = (baseline_dir / "generation_config.json").read_bytes()
+        trained_cfg = (trained_dir / "generation_config.json").read_bytes()
+        if baseline_cfg != trained_cfg:
+            raise RuntimeError(
+                "generation_config bytes diverge between baseline and "
+                f"trained runs (baseline={len(baseline_cfg)}B, "
+                f"trained={len(trained_cfg)}B). AC-7.2 byte-identical "
+                "contract violated."
+            )
+        print(
+            f"[smoke] generation_config byte-identical across runs "
+            f"({len(baseline_cfg)}B). AC-7.0 smoke complete.",
+            flush=True,
+        )
     return 0
+
+
+__all__ = [
+    "EXPECTED_RECIPE_ID",
+    "SWITCH_DIT_BOUNDARY",
+    "NUM_FRAMES",
+    "FPS",
+    "COMPUTE_ENVELOPES_CANONICAL",
+    "Mode",
+    "UpstreamPaths",
+    "assert_recipe_pin",
+    "file_sha256",
+    "sharded_ckpt_sha",
+    "build_generation_config",
+    "serialize_generation_config",
+    "run_one_sample",
+    "main",
+]
 
 
 if __name__ == "__main__":
