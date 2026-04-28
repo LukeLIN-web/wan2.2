@@ -245,6 +245,85 @@ def test_pair_halts_on_asymmetric_secondary_axes():
         jpd.pair_records_by_video_id([b], [t])
 
 
+def test_video_paired_list_loads_flat_paths_and_prompt_source(tmp_path):
+    b = tmp_path / "b.mp4"
+    t = tmp_path / "t.mp4"
+    b.write_bytes(b"b")
+    t.write_bytes(b"t")
+    paired = tmp_path / "pairs.json"
+    paired.write_text(json.dumps({
+        "pairs": [{
+            "scene_id": "collision_1",
+            "baseline_video_path": str(b),
+            "trained_video_path": str(t),
+        }]
+    }))
+    prompt_source = _write_json(tmp_path, "prompts.json", {
+        "prompts": [{
+            "video": "collision_1",
+            "prompt": "A ball hits a wall.",
+            "physical_laws": ["collision"],
+        }]
+    })
+
+    pairs = jpd.load_video_paired_list(paired, prompt_source_json=prompt_source)
+    assert len(pairs) == 1
+    assert pairs[0].video_id == "collision_1"
+    assert pairs[0].prompt == "A ball hits a wall."
+    assert pairs[0].physical_laws == ["collision"]
+    assert pairs[0].baseline_video_path == b
+    assert pairs[0].trained_video_path == t
+
+
+def test_video_paired_list_loads_heldout_regen_nested_out_dirs(tmp_path):
+    base_dir = tmp_path / "baseline"
+    train_dir = tmp_path / "trained"
+    base_dir.mkdir()
+    train_dir.mkdir()
+    (base_dir / "video.mp4").write_bytes(b"b")
+    (train_dir / "video.mp4").write_bytes(b"t")
+    paired = tmp_path / "run_manifest.json"
+    paired.write_text(json.dumps({
+        "results": [{
+            "prompt_id": "abc123",
+            "prompt": "A toy car rolls downhill.",
+            "baseline": {"out_dir": str(base_dir)},
+            "trained": {"out_dir": str(train_dir)},
+            "physical_laws": "gravity,inertia",
+        }]
+    }))
+
+    pairs = jpd.load_video_paired_list(paired)
+    assert pairs[0].video_id == "abc123"
+    assert pairs[0].physical_laws == ["gravity", "inertia"]
+    assert pairs[0].baseline_video_path == base_dir / "video.mp4"
+    assert pairs[0].trained_video_path == train_dir / "video.mp4"
+
+
+def test_prepare_video_pair_eval_inputs_writes_prompts_and_video_dirs(tmp_path):
+    b = tmp_path / "baseline_src.mp4"
+    t = tmp_path / "trained_src.mp4"
+    b.write_bytes(b"b")
+    t.write_bytes(b"t")
+    pairs = [jpd.VideoPair(
+        video_id="scene_1",
+        prompt="A block falls.",
+        baseline_video_path=b,
+        trained_video_path=t,
+        physical_laws=["gravity"],
+        dataset="wmb",
+    )]
+
+    prompts_json, baseline_dir, trained_dir = jpd.prepare_video_pair_eval_inputs(
+        pairs, tmp_path / "work"
+    )
+    payload = json.loads(prompts_json.read_text())
+    assert payload["prompts"][0]["video"] == "scene_1"
+    assert payload["prompts"][0]["physical_laws"] == ["gravity"]
+    assert (baseline_dir / "scene_1.mp4").exists()
+    assert (trained_dir / "scene_1.mp4").exists()
+
+
 # --- bootstrap tests --------------------------------------------------------
 
 def test_bootstrap_zero_deltas_zero_mean():

@@ -18,8 +18,9 @@ Round 2 fixes (Codex review msg 70939ec1, all P0+P1+P3 applied):
           ``x.to(A.dtype)`` inside the patched forward.
   P0 #3 — Reference defaults to CPU + offload; T5 freed after encoding.
   P1 #4 — LoRA targets matched against Wan's q/k/v/o naming + ffn.{0,2}.
-  P1 #5 — LoRA save with module-aligned keys (`<module>.lora_A` / `.lora_B`)
-          + metadata (`rank`, `alpha`, `target_modules`).
+  P1 #5 — LoRA save with DiffSynth-native module-aligned keys
+          (`<module>.lora_A.weight` / `.lora_B.weight`) + metadata
+          (`rank`, `alpha`, `target_modules`).
   P3 #7 — Sampling band restricted to [901, 999] (Wan's grid max is 999).
 
 Multi-GPU launch via torchrun (DistributedSampler over the pair list);
@@ -69,6 +70,9 @@ from dpo_loss import flow_matching_dpo_loss  # noqa: E402
 
 # Recipe pin (must match recipes/recipe_id)
 EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
+EXPECTED_VAE_SHA256 = "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981"
+EXPECTED_T5_SHA256 = "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d"
+EXPECTED_TOKENIZER_TREE_SHA256 = "d987d207c7b61d346ed38997af29752f8bdde8c7185169b89cbd552c8421c438"
 RECIPES_DIR = HERE / "recipes"
 
 # AC-5.U2 raw boundary (switch_DiT_boundary * 1000)
@@ -105,6 +109,37 @@ def assert_recipe_pin(recipes_dir: pathlib.Path, expected: str = EXPECTED_RECIPE
         f"recipe pin drift: fresh={fresh}, on_disk={on_disk}, expected={expected}"
     )
     return on_disk
+
+
+def _tokenizer_tree_sha256(tokenizer_dir: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    rel_files = sorted(
+        p.relative_to(tokenizer_dir).as_posix()
+        for p in tokenizer_dir.rglob("*")
+        if p.is_file()
+    )
+    for rel in rel_files:
+        h.update(f"{rel}|{_file_sha256(tokenizer_dir / rel)}\n".encode("ascii"))
+    return h.hexdigest()
+
+
+def assert_model_asset_pins(upstream: pathlib.Path) -> dict[str, str]:
+    pins = {
+        "vae_sha256": _file_sha256(upstream / "Wan2.1_VAE.pth"),
+        "t5_sha256": _file_sha256(upstream / "models_t5_umt5-xxl-enc-bf16.pth"),
+        "tokenizer_tree_sha256": _tokenizer_tree_sha256(upstream / "google" / "umt5-xxl"),
+    }
+    assert pins["vae_sha256"] == EXPECTED_VAE_SHA256, (
+        f"VAE pin drift: actual={pins['vae_sha256']}, expected={EXPECTED_VAE_SHA256}"
+    )
+    assert pins["t5_sha256"] == EXPECTED_T5_SHA256, (
+        f"T5 pin drift: actual={pins['t5_sha256']}, expected={EXPECTED_T5_SHA256}"
+    )
+    assert pins["tokenizer_tree_sha256"] == EXPECTED_TOKENIZER_TREE_SHA256, (
+        "tokenizer tree pin drift: "
+        f"actual={pins['tokenizer_tree_sha256']}, expected={EXPECTED_TOKENIZER_TREE_SHA256}"
+    )
+    return pins
 
 
 def per_pair_seed(pair_id: str, namespace: str = "dpo-tier_a") -> int:
@@ -382,13 +417,13 @@ def inject_lora(model: nn.Module, target_re: re.Pattern, rank: int, alpha: float
 
 
 def collect_lora_state(model: nn.Module) -> tuple[dict[str, torch.Tensor], dict]:
-    """Walk model, collect ``<module>.lora_A`` / ``<module>.lora_B`` entries (P1 #5)."""
+    """Walk model, collect DiffSynth-native ``.weight`` LoRA entries."""
     state: dict[str, torch.Tensor] = {}
     metadata = {"target_modules": []}
     for name, mod in model.named_modules():
         if isinstance(mod, LoRALinear):
-            state[f"{name}.lora_A"] = mod.A.detach().cpu().contiguous()
-            state[f"{name}.lora_B"] = mod.B.detach().cpu().contiguous()
+            state[f"{name}.lora_A.weight"] = mod.A.detach().T.cpu().contiguous()
+            state[f"{name}.lora_B.weight"] = mod.B.detach().T.cpu().contiguous()
             metadata["target_modules"].append(name)
             metadata["rank"] = mod.rank
             metadata["alpha"] = mod.alpha
@@ -493,6 +528,14 @@ def main():
 
     recipe_id = assert_recipe_pin(RECIPES_DIR, EXPECTED_RECIPE_ID)
     print(f"[recipe pin] OK: {recipe_id}", flush=True)
+    asset_pins = assert_model_asset_pins(args.upstream)
+    print(
+        "[asset pins] OK: "
+        f"vae={asset_pins['vae_sha256'][:16]} "
+        f"t5={asset_pins['t5_sha256'][:16]} "
+        f"tokenizer_tree={asset_pins['tokenizer_tree_sha256'][:16]}",
+        flush=True,
+    )
 
     is_distributed = "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_distributed:
@@ -833,6 +876,9 @@ def main():
             "ref_offload": False,  # legacy field; no separate ref to offload
             "machine_internal_ip_tail": socket_tail(),
             "recipe_id": recipe_id,
+            "vae_sha256": asset_pins["vae_sha256"],
+            "t5_sha256": asset_pins["t5_sha256"],
+            "tokenizer_tree_sha256": asset_pins["tokenizer_tree_sha256"],
             "lora_target_modules_count": len(matched_names),
             "lora_target_modules_sample": matched_names[:8],
             "final_loss": losses[-1] if losses else None,

@@ -83,12 +83,15 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import datetime
 import hashlib
 import json
 import math
+import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
@@ -200,6 +203,18 @@ class PairedDelta:
     video_id: str
     composite_delta: float
     secondary_deltas: dict[str, float]
+
+
+@dataclasses.dataclass(frozen=True)
+class VideoPair:
+    """One baseline/trained video pair to send through PhyJudge."""
+
+    video_id: str
+    prompt: str
+    baseline_video_path: pathlib.Path
+    trained_video_path: pathlib.Path
+    physical_laws: list[str] | None = None
+    dataset: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,6 +462,183 @@ def pair_records_by_video_id(
     return deltas, baseline_only, trained_only
 
 
+# --- direct video-pair-list ingestion ---------------------------------------
+
+def _as_path(value: object, field_name: str) -> pathlib.Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"video-paired-list row missing {field_name!r}")
+    p = pathlib.Path(value)
+    if not p.exists():
+        raise FileNotFoundError(f"{field_name} does not exist: {p}")
+    return p
+
+
+def _dig(row: dict, *keys: str) -> object | None:
+    cur: object = row
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def _video_path_from_row(row: dict, leg: str) -> pathlib.Path:
+    candidates = [
+        row.get(f"{leg}_video_path"),
+        row.get(f"{leg}_path"),
+        _dig(row, leg, "video_path"),
+        _dig(row, leg, "out_video_path"),
+        _dig(row, leg, "result", "out_video_path"),
+    ]
+    out_dir = _dig(row, leg, "out_dir")
+    if isinstance(out_dir, str):
+        candidates.append(str(pathlib.Path(out_dir) / "video.mp4"))
+    for value in candidates:
+        if isinstance(value, str) and value:
+            return _as_path(value, f"{leg}_video_path")
+    raise ValueError(f"video-paired-list row missing {leg} video path: {row}")
+
+
+def _load_prompt_source(path: pathlib.Path | None) -> tuple[dict[str, dict], dict[str, dict]]:
+    if path is None or not path.exists():
+        return {}, {}
+    payload = json.loads(path.read_text())
+    prompts = payload.get("prompts") if isinstance(payload, dict) else None
+    if prompts is None:
+        return {}, {}
+    items = prompts.items() if isinstance(prompts, dict) else enumerate(prompts)
+    by_video: dict[str, dict] = {}
+    by_prompt: dict[str, dict] = {}
+    for key, raw in items:
+        if not isinstance(raw, dict):
+            continue
+        video = raw.get("video") or str(key)
+        prompt = raw.get("prompt") or raw.get("description")
+        if isinstance(video, str):
+            by_video[video] = raw
+        if isinstance(prompt, str):
+            by_prompt[prompt.strip().strip('"')] = raw
+    return by_video, by_prompt
+
+
+def _normalize_video_pair(row: dict, prompt_source: tuple[dict[str, dict], dict[str, dict]]) -> VideoPair:
+    by_video, by_prompt = prompt_source
+    video_id = (
+        row.get("video_id")
+        or row.get("scene_id")
+        or row.get("prompt_id")
+        or row.get("id")
+    )
+    if not isinstance(video_id, str) or not video_id:
+        raise ValueError(f"video-paired-list row missing video_id/scene_id/prompt_id: {row}")
+
+    prompt = row.get("prompt") or row.get("caption") or row.get("description")
+    source = by_video.get(video_id)
+    if source is None and isinstance(prompt, str):
+        source = by_prompt.get(prompt.strip().strip('"'))
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = source.get("prompt") if source else None
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"video-paired-list row {video_id!r} missing prompt")
+
+    physical_laws = row.get("physical_laws")
+    if physical_laws is None and source:
+        physical_laws = source.get("physical_laws")
+    if isinstance(physical_laws, str):
+        physical_laws = [p.strip() for p in physical_laws.split(",") if p.strip()]
+    if physical_laws is not None and not isinstance(physical_laws, list):
+        raise ValueError(f"row {video_id!r}: physical_laws must be a list or comma-separated string")
+
+    dataset = row.get("dataset") or (source.get("dataset") if source else "") or ""
+    return VideoPair(
+        video_id=video_id,
+        prompt=prompt.strip().strip('"'),
+        baseline_video_path=_video_path_from_row(row, "baseline"),
+        trained_video_path=_video_path_from_row(row, "trained"),
+        physical_laws=physical_laws,
+        dataset=str(dataset),
+    )
+
+
+def load_video_paired_list(
+    path: pathlib.Path,
+    *,
+    prompt_source_json: pathlib.Path | None = None,
+) -> list[VideoPair]:
+    """Load JSON/JSONL/CSV/TSV rows describing baseline/trained video paths.
+
+    Accepted row fields:
+    ``video_id``/``scene_id``/``prompt_id``, ``prompt``, optional
+    ``physical_laws``, and either flat ``baseline_video_path`` /
+    ``trained_video_path`` or heldout-regen nested ``baseline.out_dir`` /
+    ``trained.out_dir`` records.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    elif suffix in (".csv", ".tsv"):
+        dialect = "excel-tab" if suffix == ".tsv" else "excel"
+        with path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f, dialect=dialect))
+    else:
+        payload = json.loads(path.read_text())
+        if isinstance(payload, dict):
+            rows = payload.get("pairs") or payload.get("results") or payload.get("video_pairs")
+        else:
+            rows = payload
+    if not isinstance(rows, list):
+        raise ValueError(f"{path} must contain a list, or an object with pairs/results/video_pairs")
+
+    prompt_source = _load_prompt_source(prompt_source_json)
+    pairs = [_normalize_video_pair(row, prompt_source) for row in rows if isinstance(row, dict)]
+    if not pairs:
+        raise ValueError(f"{path} yielded no video pairs")
+    seen: set[str] = set()
+    for pair in pairs:
+        if pair.video_id in seen:
+            raise ValueError(f"duplicate video_id in video-paired-list: {pair.video_id!r}")
+        seen.add(pair.video_id)
+    return pairs
+
+
+def prepare_video_pair_eval_inputs(
+    pairs: list[VideoPair],
+    work_dir: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Create evaluator-ready prompt JSON + per-leg video dirs from absolute paths."""
+    baseline_dir = work_dir / "videos" / "baseline"
+    trained_dir = work_dir / "videos" / "trained"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    trained_dir.mkdir(parents=True, exist_ok=True)
+    prompts: list[dict] = []
+    for pair in pairs:
+        for src, dst_dir in (
+            (pair.baseline_video_path, baseline_dir),
+            (pair.trained_video_path, trained_dir),
+        ):
+            dst = dst_dir / f"{pair.video_id}.mp4"
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+        entry = {
+            "video": pair.video_id,
+            "prompt": pair.prompt,
+            "dataset": pair.dataset,
+        }
+        if pair.physical_laws is not None:
+            entry["physical_laws"] = pair.physical_laws
+        prompts.append(entry)
+    prompts_json = work_dir / "video_paired_prompts.json"
+    prompts_json.write_text(
+        json.dumps({"prompts": prompts}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return prompts_json, baseline_dir, trained_dir
+
+
 # --- bootstrap --------------------------------------------------------------
 
 def _resolve_bootstrap_seed(seed_value: str | int) -> int:
@@ -547,6 +739,9 @@ def run_full_judge_eval(
     leg_label: str,
     out_dir: pathlib.Path,
     extra_eval_args: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> pathlib.Path:
     """Invoke ``serveandeval_9b.sh`` for one leg and return the eval-JSON path.
 
@@ -564,7 +759,10 @@ def run_full_judge_eval(
 
     cmd = ["bash", str(harness_script), *extra_eval_args, "--save_path", str(save_path)]
     print(f"=== running PhyJudge harness for leg={leg_label!r}: {' '.join(cmd)} ===")
-    completed = subprocess.run(cmd, check=False)
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
+    completed = subprocess.run(cmd, check=False, cwd=str(cwd) if cwd else None, env=env)
     if completed.returncode != 0:
         raise RuntimeError(
             f"PhyJudge harness exited with status {completed.returncode} "
@@ -823,15 +1021,38 @@ def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="PhyJudge-9B paired-delta scoring (v0 i2v-orig-init DPO).",
     )
-    p.add_argument("--probe-results-json", type=pathlib.Path, required=True,
+    p.add_argument("--probe-results-json", type=pathlib.Path, default=None,
                    help="Path to a probe-eval JSON; this script does NOT "
                         "invoke the harness for the probe step (run "
                         "serveandeval_9b.sh --limit 1 separately first).")
-    p.add_argument("--baseline-results-json", type=pathlib.Path, required=True,
+    p.add_argument("--baseline-results-json", type=pathlib.Path, default=None,
                    help="Pre-existing eval JSON for the baseline leg "
                         "(saved by serveandeval_9b.sh + run_eval.py).")
-    p.add_argument("--trained-results-json", type=pathlib.Path, required=True,
+    p.add_argument("--trained-results-json", type=pathlib.Path, default=None,
                    help="Pre-existing eval JSON for the trained leg.")
+    p.add_argument("--video-paired-list", type=pathlib.Path, default=None,
+                   help="JSON/JSONL/CSV/TSV list of paired video paths. "
+                        "Rows need video_id/scene_id/prompt_id, prompt, and "
+                        "baseline_video_path/trained_video_path, or nested "
+                        "heldout_regen baseline/trained out_dir records.")
+    p.add_argument("--wmbench-root", type=pathlib.Path,
+                   default=pathlib.Path("/shared/user60/worldmodel/wmbench"),
+                   help="WMBench repo root used when --video-paired-list "
+                        "runs PhyJudge directly.")
+    p.add_argument("--harness-script", type=pathlib.Path,
+                   default=pathlib.Path(DEFAULT_HARNESS_SCRIPT))
+    p.add_argument("--prompt-source-json", type=pathlib.Path, default=None,
+                   help="Optional WMBench prompt JSON used to fill missing "
+                        "prompt metadata / physical_laws in --video-paired-list. "
+                        "Defaults to <wmbench-root>/data/prompts/"
+                        "wmbench_humaneval_set.json when that file exists.")
+    p.add_argument("--judge-work-dir", type=pathlib.Path, default=None,
+                   help="Working dir for --video-paired-list prompt JSON and "
+                        "internal per-leg video dirs. Default: "
+                        "<out-manifest parent>/video_paired_eval.")
+    p.add_argument("--prompt-config", type=str, default="subq+human.yaml",
+                   help="Prompt config passed to serveandeval_9b.sh in "
+                        "--video-paired-list mode.")
     p.add_argument("--axis-mapping-json", type=pathlib.Path, default=None,
                    help="Optional JSON map {semantic_axis: probed_key} "
                         "for renaming when the probe spelling differs.")
@@ -864,10 +1085,9 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="Machine internal-IP last octet; auto-detected if "
                         "absent.")
     p.add_argument("--actually-run-judge", action="store_true",
-                   help="Reserved for the M6→M8 hand-off. Skeleton commit "
-                        "ignores this flag; the harness invocation lives "
-                        "in run_full_judge_eval and will be wired into "
-                        "main() once M6 lands the heldout videos.")
+                   help="Run the PhyJudge harness when --video-paired-list is "
+                        "provided. Without this flag, --video-paired-list only "
+                        "prepares evaluator inputs and exits with code 2.")
     return p
 
 
@@ -900,6 +1120,72 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(axis_mapping_override, dict):
             print(f"--axis-mapping-json must be a JSON object", file=sys.stderr)
             return 2
+
+    if args.video_paired_list is not None:
+        if not args.actually_run_judge:
+            print(
+                "--video-paired-list prepares direct video eval inputs but "
+                "requires --actually-run-judge to launch PhyJudge.",
+                file=sys.stderr,
+            )
+            return 2
+        prompt_source = args.prompt_source_json
+        if prompt_source is None:
+            default_prompt_source = args.wmbench_root / "data/prompts/wmbench_humaneval_set.json"
+            prompt_source = default_prompt_source if default_prompt_source.exists() else None
+        try:
+            video_pairs = load_video_paired_list(
+                args.video_paired_list,
+                prompt_source_json=prompt_source,
+            )
+            work_dir = args.judge_work_dir or (args.out_manifest.parent / "video_paired_eval")
+            prompts_json, baseline_dir, trained_dir = prepare_video_pair_eval_inputs(video_pairs, work_dir)
+        except Exception as exc:
+            _write_failure_manifest(
+                args.out_manifest,
+                failure_kind="video-paired-list-invalid",
+                failure_message=str(exc),
+                extra={"step": "load_video_paired_list"},
+            )
+            print(f"HALT video-paired-list-invalid: {exc}", file=sys.stderr)
+            return 2
+
+        eval_out = work_dir / "eval_json"
+        baseline_json = run_full_judge_eval(
+            args.harness_script,
+            "baseline",
+            eval_out,
+            [
+                "--videos_base", str(work_dir / "videos"),
+                "--prompts_json", str(prompts_json),
+                "-p", args.prompt_config,
+            ],
+            cwd=args.wmbench_root,
+            env_overrides={"MODEL_PREFIX": "baseline"},
+        )
+        trained_json = run_full_judge_eval(
+            args.harness_script,
+            "trained",
+            eval_out,
+            [
+                "--videos_base", str(work_dir / "videos"),
+                "--prompts_json", str(prompts_json),
+                "-p", args.prompt_config,
+            ],
+            cwd=args.wmbench_root,
+            env_overrides={"MODEL_PREFIX": "trained"},
+        )
+        args.probe_results_json = baseline_json
+        args.baseline_results_json = baseline_json
+        args.trained_results_json = trained_json
+
+    if args.probe_results_json is None or args.baseline_results_json is None or args.trained_results_json is None:
+        print(
+            "Provide --probe-results-json, --baseline-results-json, and "
+            "--trained-results-json, or use --video-paired-list --actually-run-judge.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Step 1 — probe.
     try:
