@@ -418,6 +418,12 @@ def main():
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--halt-on-low-noise", type=lambda s: s.lower() == "true", default=True)
+    p.add_argument(
+        "--cond-image-fallback-root",
+        type=pathlib.Path,
+        default=None,
+        help="If set, look up cond images by basename under this dir when the manifest path is missing. Useful for cross-machine deploys where the original /shared/... paths are not mounted.",
+    )
     args = p.parse_args()
 
     recipe_id = assert_recipe_pin(RECIPES_DIR, EXPECTED_RECIPE_ID)
@@ -448,12 +454,22 @@ def main():
 
     # Records
     records_all = load_pair_records(args.latent_manifest, args.post_t2_pair, args.t2_image_manifest)
-    # Filter pairs whose conditioning image is missing on this machine.
+    # Resolve cond image paths with an optional fallback root: if the original
+    # path is missing on this machine, look for the basename under
+    # ``--cond-image-fallback-root``. Pairs that resolve nowhere are dropped.
+    fallback_root = pathlib.Path(args.cond_image_fallback_root) if args.cond_image_fallback_root else None
     records: list[PairRecord] = []
     dropped: list[str] = []
     for r in records_all:
-        if pathlib.Path(r.cond_image_path).exists():
-            records.append(r)
+        original = pathlib.Path(r.cond_image_path)
+        resolved = None
+        if original.exists():
+            resolved = original
+        elif fallback_root is not None and (fallback_root / original.name).exists():
+            resolved = fallback_root / original.name
+        if resolved is not None:
+            r2 = dataclasses.replace(r, cond_image_path=str(resolved))
+            records.append(r2)
         else:
             dropped.append(f"{r.pair_id} ({r.cond_image_path})")
     if is_main:
