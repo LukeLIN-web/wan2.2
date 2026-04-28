@@ -234,7 +234,13 @@ def load_pair_records(
     latent_manifest_path: pathlib.Path,
     post_t2_pair_path: pathlib.Path,
     t2_image_manifest_path: pathlib.Path,
+    latent_root: pathlib.Path | None = None,
 ) -> list[PairRecord]:
+    """If `latent_root` is given, manifest entries' `latent_path` is treated as
+    relative to `latent_root` (basename or partial). This lets a manifest emitted
+    on box A (with absolute paths under /home/userA/...) be reused on box B
+    without sed-ing every line — pair with `--latent-root <dir>`.
+    """
     pairs_by_id: dict[str, dict] = {}
     with latent_manifest_path.open("rb") as f:
         for line in f:
@@ -242,6 +248,14 @@ def load_pair_records(
                 continue
             entry = json.loads(line)
             pid = entry["pair_id"]
+            if latent_root is not None:
+                # Treat latent_path as relative-or-basename; resolve against root.
+                lp = pathlib.Path(entry["latent_path"])
+                if not lp.is_absolute():
+                    entry["latent_path"] = str(latent_root / lp)
+                else:
+                    # absolute path that may not exist on this box; rebase by basename
+                    entry["latent_path"] = str(latent_root / lp.name)
             pairs_by_id.setdefault(pid, {})[entry["role"]] = entry
     pairs_by_id = {pid: roles for pid, roles in pairs_by_id.items() if "winner" in roles and "loser" in roles}
 
@@ -438,6 +452,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", type=pathlib.Path, default=pathlib.Path("/shared/user63/workspace/data/Wan/Wan2.2-I2V-A14B"))
     p.add_argument("--latent-manifest", type=pathlib.Path, required=True)
+    p.add_argument(
+        "--latent-root",
+        type=pathlib.Path,
+        default=None,
+        help="If set, manifest 'latent_path' entries are resolved against this dir (basename or relative). "
+             "Lets a manifest emitted on one box be reused on another without sed.",
+    )
     p.add_argument("--post-t2-pair", type=pathlib.Path, required=True)
     p.add_argument("--t2-image-manifest", type=pathlib.Path, required=True)
     p.add_argument("--out-dir", type=pathlib.Path, default=HERE / "ckpts")
@@ -497,7 +518,10 @@ def main():
         print(f"[init] world_size={world_size} rank={rank} device={device} run_dir={run_dir}", flush=True)
 
     # Records
-    records_all = load_pair_records(args.latent_manifest, args.post_t2_pair, args.t2_image_manifest)
+    records_all = load_pair_records(
+        args.latent_manifest, args.post_t2_pair, args.t2_image_manifest,
+        latent_root=args.latent_root,
+    )
     # Resolve cond image paths with an optional fallback root: if the original
     # path is missing on this machine, look for the basename under
     # ``--cond-image-fallback-root``. Pairs that resolve nowhere are dropped.
