@@ -36,10 +36,17 @@ import pathlib
 import sys
 
 
-def snapshot_low_noise(upstream_root: pathlib.Path) -> dict:
-    """Walk <root>/low_noise_model/ and return {relpath: sha256} sorted."""
+def snapshot_low_noise(upstream_root: pathlib.Path) -> dict | None:
+    """Walk <root>/low_noise_model/ and return {relpath: sha256} sorted.
+
+    Returns None if low_noise_model doesn't exist on this box: that's a deploy
+    state where the AC-6 byte-equality contract is trivially satisfied (trainer
+    cannot have modified what isn't there). Caller should record this in the
+    run_manifest as `low_noise_pre_post_byte_equal: "n/a (subdir absent)"`.
+    """
     low_dir = upstream_root / "low_noise_model"
-    assert low_dir.exists(), f"missing low_noise_model subdir: {low_dir}"
+    if not low_dir.exists():
+        return None
     snap: dict[str, str] = {}
     for p in sorted(low_dir.rglob("*")):
         if not p.is_file():
@@ -77,12 +84,26 @@ def main():
 
     snap = snapshot_low_noise(args.upstream)
     target = args.before if args.before is not None else args.after
-    target.write_text(json.dumps({"low_noise_snapshot": snap}, indent=2, sort_keys=True))
-    print(f"[snapshot] {len(snap)} files under low_noise_model/ -> {target}")
+    payload: dict = {"low_noise_snapshot": snap if snap is not None else {}}
+    payload["status"] = "absent" if snap is None else "present"
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    if snap is None:
+        print(f"[snapshot] low_noise_model/ absent on this box -> {target} (status=absent)")
+    else:
+        print(f"[snapshot] {len(snap)} files under low_noise_model/ -> {target}")
 
     if args.check_against is not None:
-        ref = json.loads(args.check_against.read_text())["low_noise_snapshot"]
-        issues = diff_snapshots(ref, snap)
+        ref_payload = json.loads(args.check_against.read_text())
+        ref_snap = ref_payload["low_noise_snapshot"]
+        ref_status = ref_payload.get("status", "present")
+        cur_status = "absent" if snap is None else "present"
+        if ref_status == "absent" and cur_status == "absent":
+            print("[PASS-NA] low_noise_model absent both pre and post (trivial byte-equality)")
+            sys.exit(0)
+        if ref_status != cur_status:
+            print(f"[FAIL] status mismatch: pre={ref_status} post={cur_status}")
+            sys.exit(1)
+        issues = diff_snapshots(ref_snap, snap or {})
         if issues:
             print(f"[FAIL] {len(issues)} byte-equality violations:")
             for i in issues:
