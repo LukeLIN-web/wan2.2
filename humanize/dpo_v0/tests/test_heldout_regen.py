@@ -259,6 +259,48 @@ def test_regen_all_dry_run_42_prompts(tmp_path: pathlib.Path):
     assert len(shas) == 1
 
 
+def test_limit_prompts_slices_deterministic(tmp_path: pathlib.Path):
+    """--limit-prompts N takes the first N selections in deterministic
+    prompt_id order — the same N prompts every run, regardless of rank
+    sharding applied later."""
+    root = _build_heldout_fixture(tmp_path)
+    records = heldout_regen.load_heldout_records(root)
+    image_manifest = heldout_regen.load_t2_image_manifest(root)
+    selections = heldout_regen.select_canonical_groups(records, image_manifest)
+    assert len(selections) == heldout_regen.EXPECTED_HELDOUT_PROMPTS
+
+    sliced = selections[:8]
+    assert len(sliced) == 8
+    pids = [s.prompt_id for s in sliced]
+    assert pids == sorted(pids)
+    sliced_again = heldout_regen.select_canonical_groups(records, image_manifest)[:8]
+    assert [s.prompt_id for s in sliced] == [s.prompt_id for s in sliced_again]
+
+
+def test_limit_prompts_with_world_size_sharding(tmp_path: pathlib.Path):
+    """--limit-prompts + --world-size compose: limit first, then shard."""
+    root = _build_heldout_fixture(tmp_path)
+    records = heldout_regen.load_heldout_records(root)
+    image_manifest = heldout_regen.load_t2_image_manifest(root)
+    selections = heldout_regen.select_canonical_groups(records, image_manifest)[:8]
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=1)
+    )
+    adapter = heldout_regen.dry_run_inference_adapter()
+    out_root = tmp_path / "run"
+    rank0 = heldout_regen.regen_all(selections, cfg_bytes, out_root, adapter, {}, rank=0, world_size=4)
+    rank1 = heldout_regen.regen_all(selections, cfg_bytes, out_root, adapter, {}, rank=1, world_size=4)
+    rank2 = heldout_regen.regen_all(selections, cfg_bytes, out_root, adapter, {}, rank=2, world_size=4)
+    rank3 = heldout_regen.regen_all(selections, cfg_bytes, out_root, adapter, {}, rank=3, world_size=4)
+    total = len(rank0) + len(rank1) + len(rank2) + len(rank3)
+    assert total == 8
+    seen = set()
+    for batch in (rank0, rank1, rank2, rank3):
+        for r in batch:
+            assert r["prompt_id"] not in seen
+            seen.add(r["prompt_id"])
+
+
 def test_regen_all_world_size_sharding(tmp_path: pathlib.Path):
     root = _build_heldout_fixture(tmp_path)
     records = heldout_regen.load_heldout_records(root)

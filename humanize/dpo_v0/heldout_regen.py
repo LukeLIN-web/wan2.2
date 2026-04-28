@@ -653,6 +653,12 @@ def main() -> int:
                         "0030832 round-3 attempt 5). If primary path missing, look for "
                         "<fallback_root>/<basename>; otherwise leave path as-is so loader "
                         "fails with the real error.")
+    p.add_argument("--limit-prompts", type=int, default=None,
+                   help="If set, run only the first N prompts after canonical selection "
+                        "(deterministic order by prompt_id). Used for M6 partial-heldout scope "
+                        "(e.g. 8-prompt smoke before full 42-prompt run). Applied AFTER "
+                        "selection so the same N prompts always come out, regardless of rank "
+                        "sharding (sharding is index-mod-world_size on top).")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
     p.add_argument("--rank", type=int, default=int(os.environ.get("RANK", "0")))
@@ -709,6 +715,21 @@ def main() -> int:
             if str(args.cond_image_fallback_root) in s.cond_image_path
         )
         print(f"[selection] {n_fallback}/{len(selections)} cond images resolved via fallback", flush=True)
+
+    # 3b. partial-heldout slice (M6 partial scope before full 42-prompt run)
+    if args.limit_prompts is not None:
+        if args.limit_prompts < 1:
+            raise SystemExit(f"--limit-prompts must be >= 1, got {args.limit_prompts}")
+        if args.limit_prompts > len(selections):
+            raise SystemExit(
+                f"--limit-prompts {args.limit_prompts} > {len(selections)} canonical prompts available"
+            )
+        selections = selections[: args.limit_prompts]
+        print(
+            f"[selection] sliced to first {args.limit_prompts} prompts (M6 partial scope); "
+            f"deterministic order by prompt_id",
+            flush=True,
+        )
 
     # 4. byte-identical generation_config
     res = args.resolution.lower().split("x")
@@ -778,6 +799,7 @@ def main() -> int:
         "compute_envelope": args.compute_envelope,
         "selection_rule": args.selection_rule,
         "n_selections": len(selections),
+        "limit_prompts": args.limit_prompts,
         "gen_config": gen_config,
         "gen_config_sha256": cfg_sha,
         "ckpt_args": ckpt_args,
