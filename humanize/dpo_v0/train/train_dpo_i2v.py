@@ -575,6 +575,15 @@ def main():
              "~28GB/rank. Required on 8x80GB after grad-ckpt is already enabled to clear "
              "step-0 OOM. Uses wan.distributed.fsdp.shard_model.",
     )
+    p.add_argument(
+        "--cache-root",
+        type=pathlib.Path,
+        default=None,
+        help="Persistent disk cache for cond VAE latents and T5 prompt encodings, "
+             "subdirs keyed by asset sha256 + shape so cache invalidates if VAE/T5/tokenizer "
+             "or target_w/h/frame_num change. Default: <DPO_ROOT>/cache. Cache miss => "
+             "rank0 encodes + writes; full hit => skip VAE/T5 load entirely (saves ~8 min boot).",
+    )
     # Round-4 double-pin args (rl2 spec b98b72b1). All four mutually optional;
     # round-4 launches must set all four together. Round-2 mode (no training_config)
     # still works for smoke tests / single-GPU dev.
@@ -748,61 +757,111 @@ def main():
             "no pairs left after cond-image existence filter; deploy is incomplete"
         )
 
-    # ---- VAE for cond image encoding (init-time only) ----
-    if is_main:
-        print(f"[load] VAE for cond image encoding ...", flush=True)
-    from wan.modules.vae2_1 import Wan2_1_VAE  # noqa: E402
-
-    vae = Wan2_1_VAE(z_dim=16, vae_pth=str(args.upstream / "Wan2.1_VAE.pth"), dtype=dtype, device=str(device))
-
+    # ---- cond latent cache (disk, keyed by VAE sha256 + shape + image md5) ----
     # Cache cond latents by image_md5 (rl2 round-2 review): same md5 = same image bytes,
     # so different paths pointing at the same content share one encode.
     md5_to_path: dict[str, str] = {}
     for r in records:
         if r.cond_image_md5 not in md5_to_path:
             md5_to_path[r.cond_image_md5] = r.cond_image_path
-    if is_main:
-        print(f"[cond-encode] encoding {len(md5_to_path)} unique cond images (by image_md5) ...", flush=True)
-    cond_latent_cache: dict[str, torch.Tensor] = {}
-    for md5, ip in md5_to_path.items():
-        z_cond_cpu = encode_conditioning_image(
-            vae, pathlib.Path(ip), args.target_w, args.target_h, args.frame_num, device, dtype,
-        )
-        cond_latent_cache[md5] = z_cond_cpu
-    # Free VAE GPU memory after init
-    del vae
-    gc.collect()
-    torch.cuda.empty_cache()
-    if is_main:
-        _mem("after VAE del+gc")
 
-    # ---- T5 (encode all unique prompts at init, then free) ----
-    if is_main:
-        print(f"[load] T5 encoder ...", flush=True)
-    from wan.modules.t5 import T5EncoderModel  # noqa: E402
-
-    text_encoder = T5EncoderModel(
-        text_len=512,
-        dtype=dtype,
-        device=device,
-        checkpoint_path=str(args.upstream / "models_t5_umt5-xxl-enc-bf16.pth"),
-        tokenizer_path=str(args.upstream / "google" / "umt5-xxl"),
+    cache_root = pathlib.Path(args.cache_root) if args.cache_root else (DPO_ROOT / "cache")
+    cond_cache_dir = cache_root / "cond_latent" / (
+        f"{asset_pins['vae_sha256'][:16]}_{args.target_w}x{args.target_h}_{args.frame_num}f"
     )
+    cond_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cond_to_encode = [(md5, ip) for md5, ip in md5_to_path.items()
+                      if not (cond_cache_dir / f"{md5}.pt").exists()]
+    if is_main:
+        print(f"[cond-cache] dir={cond_cache_dir} hit={len(md5_to_path) - len(cond_to_encode)}/"
+              f"{len(md5_to_path)} miss={len(cond_to_encode)}", flush=True)
+
+    if cond_to_encode:
+        if is_main:
+            print(f"[load] VAE for cond image encoding ({len(cond_to_encode)} miss) ...", flush=True)
+        from wan.modules.vae2_1 import Wan2_1_VAE  # noqa: E402
+
+        vae = Wan2_1_VAE(z_dim=16, vae_pth=str(args.upstream / "Wan2.1_VAE.pth"), dtype=dtype, device=str(device))
+        if is_main:
+            print(f"[cond-encode] encoding {len(cond_to_encode)} new cond images (rank0 only) ...", flush=True)
+            for md5, ip in cond_to_encode:
+                z_cond_cpu = encode_conditioning_image(
+                    vae, pathlib.Path(ip), args.target_w, args.target_h, args.frame_num, device, dtype,
+                )
+                tmp = cond_cache_dir / f".{md5}.pt.tmp"
+                torch.save(z_cond_cpu, tmp)
+                tmp.replace(cond_cache_dir / f"{md5}.pt")  # atomic publish
+        del vae
+        gc.collect()
+        torch.cuda.empty_cache()
+        if is_main:
+            _mem("after VAE del+gc")
+    elif is_main:
+        print("[cond-cache] full hit — skipping VAE load entirely", flush=True)
+
+    if is_distributed:
+        dist.barrier()  # rank0 finishes writing before non-zero ranks read
+
+    # All ranks load cond latents from disk
+    cond_latent_cache: dict[str, torch.Tensor] = {}
+    for md5 in md5_to_path:
+        cond_latent_cache[md5] = torch.load(
+            cond_cache_dir / f"{md5}.pt", map_location="cpu", weights_only=True
+        )
+
+    # ---- T5 prompt cache (disk, keyed by T5+tokenizer sha256 + text_len + prompt md5) ----
     unique_prompts = sorted({r.prompt for r in records})
+    prompt_cache_dir = cache_root / "prompt_t5" / (
+        f"{asset_pins['t5_sha256'][:16]}_{asset_pins['tokenizer_tree_sha256'][:16]}_t512"
+    )
+    prompt_cache_dir.mkdir(parents=True, exist_ok=True)
+    # Map prompt -> stable hash filename (md5 of UTF-8 bytes; collision-resistant enough for cache).
+    prompt_to_key = {p: hashlib.md5(p.encode("utf-8")).hexdigest() for p in unique_prompts}
+    prompt_to_encode = [p for p in unique_prompts
+                        if not (prompt_cache_dir / f"{prompt_to_key[p]}.pt").exists()]
     if is_main:
-        print(f"[prompt-encode] encoding {len(unique_prompts)} unique prompts ...", flush=True)
+        print(f"[prompt-cache] dir={prompt_cache_dir} hit={len(unique_prompts) - len(prompt_to_encode)}/"
+              f"{len(unique_prompts)} miss={len(prompt_to_encode)}", flush=True)
+
+    if prompt_to_encode:
+        if is_main:
+            print(f"[load] T5 encoder ({len(prompt_to_encode)} miss) ...", flush=True)
+        from wan.modules.t5 import T5EncoderModel  # noqa: E402
+
+        text_encoder = T5EncoderModel(
+            text_len=512,
+            dtype=dtype,
+            device=device,
+            checkpoint_path=str(args.upstream / "models_t5_umt5-xxl-enc-bf16.pth"),
+            tokenizer_path=str(args.upstream / "google" / "umt5-xxl"),
+        )
+        if is_main:
+            print(f"[prompt-encode] encoding {len(prompt_to_encode)} new prompts (rank0 only) ...", flush=True)
+            with torch.no_grad():
+                for prompt in prompt_to_encode:
+                    ctx_list = text_encoder([prompt], device)
+                    enc = ctx_list[0].detach().cpu()
+                    tmp = prompt_cache_dir / f".{prompt_to_key[prompt]}.pt.tmp"
+                    torch.save(enc, tmp)
+                    tmp.replace(prompt_cache_dir / f"{prompt_to_key[prompt]}.pt")
+        del text_encoder
+        gc.collect()
+        torch.cuda.empty_cache()
+        if is_main:
+            _mem("after T5 del+gc")
+    elif is_main:
+        print("[prompt-cache] full hit — skipping T5 load entirely", flush=True)
+
+    if is_distributed:
+        dist.barrier()  # rank0 finishes writing before non-zero ranks read
+
+    # All ranks load prompt encodings from disk
     prompt_cache: dict[str, torch.Tensor] = {}
-    with torch.no_grad():
-        for prompt in unique_prompts:
-            ctx_list = text_encoder([prompt], device)
-            # Codex round 2 P1: cache to CPU so del text_encoder actually reclaims T5 GPU memory.
-            prompt_cache[prompt] = ctx_list[0].detach().cpu()
-    # Free T5 (keep encoded tensors on CPU)
-    del text_encoder
-    gc.collect()
-    torch.cuda.empty_cache()
-    if is_main:
-        _mem("after T5 del+gc")
+    for prompt, key in prompt_to_key.items():
+        prompt_cache[prompt] = torch.load(
+            prompt_cache_dir / f"{key}.pt", map_location="cpu", weights_only=True
+        )
 
     # ---- Policy + reference WanModel ----
     if is_main:
