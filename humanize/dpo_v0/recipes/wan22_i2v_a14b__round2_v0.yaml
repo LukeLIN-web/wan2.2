@@ -1,0 +1,20 @@
+codec_normalization: yuv420p_to_rgb_bt709_full
+color_space: bt709-tv-range
+decoder:
+  ffmpeg: 4.4.2-0ubuntu0.22.04.1
+  imageio: 2.37.3
+  imageio_ffmpeg: 0.6.0
+first_frame_is_conditioning: true
+fps: 16
+frame_count_policy: first_n
+frame_num: 81
+frame_stride: 1
+pad_color:
+- 0
+- 0
+- 0
+resize_mode: letterbox_pad
+target_resolution:
+  aspect_ratio_router:
+    landscape: 832x480
+    portrait: 480x832
