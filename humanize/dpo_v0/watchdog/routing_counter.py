@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import pathlib
 import time
-from dataclasses import dataclass
 
 
 # AC-5.U2 raw boundary mirror: switch_DiT_boundary * 1000 = 900.
@@ -31,15 +30,6 @@ def detect_expert(raw_timestep: int) -> str:
 
 class LowNoiseRoutingError(RuntimeError):
     """Raised when a low-noise routing event is observed under the 100%-high-noise contract."""
-
-
-@dataclass
-class _Entry:
-    step: int
-    sampled_timestep_id: int
-    raw_timestep: int
-    detected_expert: str
-    pair_id: str
 
 
 class RoutingCounterTail:
@@ -69,7 +59,6 @@ class RoutingCounterTail:
         self.halt_on_low_noise = halt_on_low_noise
         self.high_count = 0
         self.low_count = 0
-        self._entries: list[_Entry] = []
 
     @property
     def total(self) -> int:
@@ -87,21 +76,13 @@ class RoutingCounterTail:
             self.high_count += 1
         else:
             self.low_count += 1
-        entry = _Entry(
-            step=int(step),
-            sampled_timestep_id=int(sampled_timestep_id),
-            raw_timestep=int(raw_timestep),
-            detected_expert=expert,
-            pair_id=pair_id,
-        )
-        self._entries.append(entry)
         record = {
-            "step": entry.step,
+            "step": int(step),
             "rank": self.rank,
-            "sampled_timestep_id": entry.sampled_timestep_id,
-            "raw_timestep": entry.raw_timestep,
-            "detected_expert": entry.detected_expert,
-            "pair_id": entry.pair_id,
+            "sampled_timestep_id": int(sampled_timestep_id),
+            "raw_timestep": int(raw_timestep),
+            "detected_expert": expert,
+            "pair_id": pair_id,
             "cum_high": self.high_count,
             "cum_low": self.low_count,
             "cum_fraction_high": round(self.high_count / max(1, self.total), 6),

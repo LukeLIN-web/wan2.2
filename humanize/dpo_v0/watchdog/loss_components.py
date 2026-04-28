@@ -87,8 +87,8 @@ class LossComponentLogger:
         t_raw: int,
         loss,
         beta: float,
-        components: Optional[Mapping[str, "object"]] = None,
-        extra: Optional[Mapping[str, "object"]] = None,
+        components: Optional[Mapping[str, object]] = None,
+        extra: Optional[Mapping[str, object]] = None,
     ) -> dict:
         loss_val = _to_float(loss)
         record = {
