@@ -22,6 +22,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -35,15 +36,31 @@ import torch
 HUMANIZE_DIR = pathlib.Path(__file__).resolve().parent
 RECIPES_DIR = HUMANIZE_DIR / "recipes"
 EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
-T3_SUBSET_JSON = pathlib.Path(
-    "/home/user1/.config/superpowers/worktrees/videodpoWan/rlcr-task-5/humanize/dpo_v0/T3_subset.json"
-)
-POST_T2_PAIR_JSON = pathlib.Path(
-    "/home/user1/.config/superpowers/worktrees/videodpoWan/rlcr-task-5/humanize/dpo_v0/out/20260427T201113Z/t2/post_t2_pair.json"
-)
-VIDEO_ROOT = pathlib.Path("/shared/user60/worldmodel/wmbench/data/videos")
-UPSTREAM = pathlib.Path("/shared/user63/workspace/data/Wan/Wan2.2-I2V-A14B")
+
+# All paths support env-var override so the encoder runs on boxes without
+# /shared mounted (juyi-finetune / juyi-videorl). Defaults are the nnmc59
+# canonical paths used during round-2 development.
+T3_SUBSET_JSON = pathlib.Path(os.environ.get(
+    "T3_SUBSET_JSON",
+    "/home/user1/.config/superpowers/worktrees/videodpoWan/rlcr-task-5/humanize/dpo_v0/T3_subset.json",
+))
+POST_T2_PAIR_JSON = pathlib.Path(os.environ.get(
+    "POST_T2_PAIR_JSON",
+    "/home/user1/.config/superpowers/worktrees/videodpoWan/rlcr-task-5/humanize/dpo_v0/out/20260427T201113Z/t2/post_t2_pair.json",
+))
+VIDEO_ROOT = pathlib.Path(os.environ.get(
+    "WMBENCH_VIDEO_ROOT",
+    "/shared/user60/worldmodel/wmbench/data/videos",
+))
+UPSTREAM = pathlib.Path(os.environ.get(
+    "WAN_UPSTREAM_DIR",
+    "/shared/user63/workspace/data/Wan/Wan2.2-I2V-A14B",
+))
 VAE_PATH = UPSTREAM / "Wan2.1_VAE.pth"
+VIDEODPOWAN_ROOT = pathlib.Path(os.environ.get(
+    "VIDEODPOWAN_ROOT",
+    str(HUMANIZE_DIR.parent.parent),  # default: ../../ from dpo_v0/
+))
 
 # Recipe values (pinned via recipe_id; do not edit without bumping recipe_id).
 TARGET_LANDSCAPE = (832, 480)  # (W, H)
@@ -266,7 +283,7 @@ def main(argv: list[str]) -> int:
     device = torch.device(args.device)
 
     print(f"loading Wan2_1_VAE on {device} dtype={args.dtype} ...")
-    sys.path.insert(0, "/shared/user60/worldmodel/rlvideo/videodpoWan")
+    sys.path.insert(0, str(VIDEODPOWAN_ROOT))
     from wan.modules.vae2_1 import Wan2_1_VAE
     vae = Wan2_1_VAE(z_dim=16, vae_pth=str(VAE_PATH), dtype=dtype_t, device=str(device))
     print("vae ready")
