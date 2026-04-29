@@ -29,6 +29,25 @@ def test_collect_lora_state_emits_diffsynth_native_weight_keys():
     assert meta["target_modules"] == ["block"]
 
 
+def test_collect_lora_state_strips_fsdp_wrapper_segments():
+    """Under FSDP, ``named_modules()`` injects ``_fsdp_wrapped_module.`` between every
+    wrapped layer and its child. Saved keys must match the un-wrapped DiffSynth topology
+    so the ckpt loads cleanly outside the trainer venv (e.g. in inference_smoke)."""
+    base = nn.Linear(3, 5, bias=False)
+    lora = trainer.LoRALinear(base, rank=2, alpha=2, dtype=torch.float32, device=torch.device("cpu"))
+
+    inner = nn.Module()
+    inner.q = lora
+    inner_wrap = nn.Module()
+    inner_wrap._fsdp_wrapped_module = inner
+    model = nn.Module()
+    model._fsdp_wrapped_module = inner_wrap
+
+    state, meta = trainer.collect_lora_state(model)
+    assert sorted(state) == ["q.lora_A.weight", "q.lora_B.weight"]
+    assert meta["target_modules"] == ["q"]
+
+
 def test_tokenizer_tree_sha256_uses_sorted_relpaths(tmp_path):
     tok = tmp_path / "tok"
     tok.mkdir()

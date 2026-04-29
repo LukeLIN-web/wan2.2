@@ -499,14 +499,21 @@ def inject_lora(model: nn.Module, target_re: re.Pattern, rank: int, alpha: float
 
 
 def collect_lora_state(model: nn.Module) -> tuple[dict[str, torch.Tensor], dict]:
-    """Walk model, collect DiffSynth-native ``.weight`` LoRA entries."""
+    """Walk model, collect DiffSynth-native ``.weight`` LoRA entries.
+
+    Under FSDP, ``named_modules()`` injects ``_fsdp_wrapped_module.`` between every
+    wrapped layer and its child. Those segments aren't part of the DiffSynth model
+    topology used at load time, so strip them so saved keys match the canonical
+    un-wrapped layout regardless of training-time wrapping.
+    """
     state: dict[str, torch.Tensor] = {}
     metadata = {"target_modules": []}
     for name, mod in model.named_modules():
         if isinstance(mod, LoRALinear):
-            state[f"{name}.lora_A.weight"] = mod.A.detach().T.cpu().contiguous()
-            state[f"{name}.lora_B.weight"] = mod.B.detach().T.cpu().contiguous()
-            metadata["target_modules"].append(name)
+            clean_name = name.replace("_fsdp_wrapped_module.", "")
+            state[f"{clean_name}.lora_A.weight"] = mod.A.detach().T.cpu().contiguous()
+            state[f"{clean_name}.lora_B.weight"] = mod.B.detach().T.cpu().contiguous()
+            metadata["target_modules"].append(clean_name)
             metadata["rank"] = mod.rank
             metadata["alpha"] = mod.alpha
     return state, metadata
