@@ -50,18 +50,20 @@ def test_assert_training_config_pin_round4():
     assert config["subset_pair_ids_sha256_hex16"] == "cf5d3e5fd528a3e0"
 
 
-def test_assert_training_config_pin_round4_lr1e5_uses_epoch_control():
+def test_assert_training_config_pin_round4_lr1e5_uses_sample_control():
     config_path = RECIPES_DIR / "training_config_round4_lr1e5.yaml"
     pin_file = RECIPES_DIR / "training_config_round4_lr1e5_sha256_pin"
     expected = pin_file.read_text(encoding="ascii").strip()
     config = trainer.assert_training_config_pin(config_path, expected)
     assert config["lr"] == 1.0e-5
-    assert config["num_epochs"] == 0.8
+    assert config["num_samples"] == 800
     assert "max_steps" not in config
+    assert "num_epochs" not in config
 
 
-def test_fractional_epoch_schedule_matches_prior_round4_length():
-    assert trainer.target_steps_for_epochs(num_epochs=0.8, steps_per_epoch=250) == 200
+def test_sample_schedule_matches_prior_round4_length():
+    # 800 samples / (4 ranks × batch_size 1) = 200 per-rank optimizer steps.
+    assert trainer.target_steps_for_samples(num_samples=800, samples_per_step=4) == 200
 
 
 def test_assert_training_config_pin_drift_raises():

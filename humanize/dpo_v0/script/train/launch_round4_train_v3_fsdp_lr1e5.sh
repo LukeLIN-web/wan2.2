@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Round-4 v3 lr=1e-5 control on juyi-finetune (4×A100). Mirrors v3 FSDP launcher with:
-#   * lr 5e-5 → 1e-5 (training_config_round4_lr1e5.yaml, sha256[:16]=88276313696b6245)
-#   * max_steps=200 → num_epochs=0.8 (same 200 optimizer steps on the 1k-pair/4-rank run)
+#   * lr 5e-5 → 1e-5 (training_config_round4_lr1e5.yaml, sha256[:16]=fcb67e33587e8420)
+#   * max_steps=200 → num_samples=800 (200 optimizer steps × 4 ranks × micro_batch=1 on the 1k-pair run)
 #   * --nproc_per_node 8 → 4
 # Decision: lukedecision task #39 — diagnose v3 FSDP lr=5e-5 vs lr=1e-5 stability at β=1000.
-# Pins (round-4 r5 lr=1e-5 control): recipe=6bef6e104cdd3442, train_cfg=88276313696b6245, pair_ids=cf5d3e5fd528a3e0
+# Pins (round-4 r5 lr=1e-5 control): recipe=6bef6e104cdd3442, train_cfg=fcb67e33587e8420, pair_ids=cf5d3e5fd528a3e0
 
 set -euo pipefail
 # shellcheck source=_common.sh
@@ -17,7 +17,7 @@ resolve_wandb
 cd "$DPO_DIR"
 
 expect_recipe="6bef6e104cdd3442"
-expect_train_cfg="88276313696b6245"
+expect_train_cfg="fcb67e33587e8420"
 expect_pair_ids="cf5d3e5fd528a3e0"
 verify_pins "$expect_recipe" "$expect_train_cfg" "$expect_pair_ids" \
   "$DPO_DIR/recipes/training_config_round4_lr1e5_sha256_pin"

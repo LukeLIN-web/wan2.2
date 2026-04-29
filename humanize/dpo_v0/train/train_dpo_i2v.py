@@ -74,7 +74,7 @@ def _wandb_init(args, ts, recipe_id, world_size, run_dir):
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "max_steps": args.max_steps,
-        "num_epochs": args.num_epochs,
+        "num_samples": args.num_samples,
         "seed_namespace": args.seed_namespace,
         "world_size": world_size,
         "dit_fsdp": args.dit_fsdp,
@@ -206,12 +206,12 @@ def assert_pair_ids_pin(
     return fresh
 
 
-def target_steps_for_epochs(num_epochs: float, steps_per_epoch: int) -> int:
-    if num_epochs <= 0:
-        raise ValueError(f"num_epochs must be > 0, got {num_epochs}")
-    if steps_per_epoch <= 0:
-        raise ValueError(f"steps_per_epoch must be > 0, got {steps_per_epoch}")
-    return max(1, math.ceil(num_epochs * steps_per_epoch))
+def target_steps_for_samples(num_samples: int, samples_per_step: int) -> int:
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be > 0, got {num_samples}")
+    if samples_per_step <= 0:
+        raise ValueError(f"samples_per_step must be > 0, got {samples_per_step}")
+    return max(1, math.ceil(num_samples / samples_per_step))
 
 
 def assert_model_asset_pins(upstream: pathlib.Path) -> dict[str, str]:
@@ -598,11 +598,11 @@ def main():
     p.add_argument("--tier", choices=["tier_a", "tier_b"], default="tier_a")
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument(
-        "--num-epochs",
-        type=float,
+        "--num-samples",
+        type=int,
         default=None,
-        help="Train for this many epochs over the per-rank DataLoader. Supports fractional values "
-             "such as 0.8. If set, it takes precedence over --max-steps.",
+        help="Total number of samples to train on across all ranks. Per-rank target_steps = "
+             "ceil(num_samples / (world_size * batch_size)). If set, takes precedence over --max-steps.",
     )
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=0.1)
@@ -655,7 +655,7 @@ def main():
         type=pathlib.Path,
         default=None,
         help="Round-4 training_config_round4.yaml path. When set, hyperparameters "
-             "(lr/num_epochs or max_steps/beta/lora_rank/lora_alpha/seed_namespace) are read from "
+             "(lr/num_samples or max_steps/beta/lora_rank/lora_alpha/seed_namespace) are read from "
              "the YAML and override CLI defaults.",
     )
     p.add_argument(
@@ -735,16 +735,16 @@ def main():
         training_config_dict = assert_training_config_pin(
             args.training_config_path, args.training_config_sha256_pin
         )
-        has_num_epochs = "num_epochs" in training_config_dict or "epochs" in training_config_dict
-        if has_num_epochs and "max_steps" in training_config_dict:
+        has_num_samples = "num_samples" in training_config_dict
+        if has_num_samples and "max_steps" in training_config_dict:
             raise SystemExit(
-                "training_config must set only one of num_epochs/epochs or max_steps."
+                "training_config must set only one of num_samples or max_steps."
             )
         # Override CLI defaults with YAML values (YAML is the source of truth for round-4).
         for cli_attr, yaml_key in (
             ("lr", "lr"),
             ("max_steps", "max_steps"),
-            ("num_epochs", "num_epochs"),
+            ("num_samples", "num_samples"),
             ("beta", "beta"),
             ("lora_rank", "lora_rank"),
             ("lora_alpha", "lora_alpha"),
@@ -752,14 +752,12 @@ def main():
         ):
             if yaml_key in training_config_dict:
                 setattr(args, cli_attr, training_config_dict[yaml_key])
-        if "epochs" in training_config_dict:
-            args.num_epochs = training_config_dict["epochs"]
-        if "max_steps" in training_config_dict and not has_num_epochs:
-            args.num_epochs = None
+        if "max_steps" in training_config_dict and not has_num_samples:
+            args.num_samples = None
         print(
             f"[training_config pin] OK: {args.training_config_sha256_pin} "
-            f"(lr={args.lr} num_epochs={args.num_epochs} "
-            f"max_steps={args.max_steps if args.num_epochs is None else None} beta={args.beta} "
+            f"(lr={args.lr} num_samples={args.num_samples} "
+            f"max_steps={args.max_steps if args.num_samples is None else None} beta={args.beta} "
             f"lora_rank={args.lora_rank} lora_alpha={args.lora_alpha} "
             f"seed_namespace={args.seed_namespace} "
             f"max_pairs={training_config_dict.get('max_pairs')})",
@@ -1036,22 +1034,23 @@ def main():
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_single, num_workers=0)
 
     steps_per_epoch = len(loader)
-    if args.num_epochs is not None:
-        args.num_epochs = float(args.num_epochs)
-        target_steps = target_steps_for_epochs(args.num_epochs, steps_per_epoch)
-        control_mode = "epoch"
+    samples_per_step = world_size  # batch_size=1 in the loader
+    if args.num_samples is not None:
+        args.num_samples = int(args.num_samples)
+        target_steps = target_steps_for_samples(args.num_samples, samples_per_step)
+        control_mode = "sample"
     else:
         if args.max_steps <= 0:
             raise ValueError(f"max_steps must be > 0, got {args.max_steps}")
         target_steps = int(args.max_steps)
         control_mode = "step"
-    target_epochs = target_steps / steps_per_epoch
+    target_samples = target_steps * samples_per_step
     if is_main:
         print(
-            f"[schedule] control={control_mode} num_epochs={args.num_epochs} "
+            f"[schedule] control={control_mode} num_samples={args.num_samples} "
             f"max_steps={args.max_steps if control_mode == 'step' else None} "
-            f"steps_per_epoch={steps_per_epoch} target_steps={target_steps} "
-            f"target_epochs={target_epochs:.6g}",
+            f"steps_per_epoch={steps_per_epoch} samples_per_step={samples_per_step} "
+            f"target_steps={target_steps} target_samples={target_samples}",
             flush=True,
         )
 
@@ -1297,12 +1296,14 @@ def main():
         manifest = {
             "tier": args.tier,
             "control_mode": control_mode,
-            "num_epochs": args.num_epochs,
+            "num_samples": args.num_samples,
             "max_steps": args.max_steps if control_mode == "step" else None,
             "target_steps": target_steps,
+            "target_samples": target_samples,
             "steps_per_epoch": steps_per_epoch,
+            "samples_per_step": samples_per_step,
             "actual_steps": step,
-            "actual_epochs": step / steps_per_epoch,
+            "actual_samples": step * samples_per_step,
             "lr": args.lr,
             "beta": args.beta,
             "lora_rank": args.lora_rank,
