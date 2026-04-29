@@ -1,4 +1,4 @@
-beta: 0.1
+beta: 1000
 dpo_loss_kind: sigmoid
 lora_alpha: 16
 lora_rank: 16
