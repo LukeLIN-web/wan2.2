@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Round-4 v3 lr=1e-5 β=100 sweep. Forks lr1e5 control with:
-#   * beta 1000 → 100 (training_config_round4_lr1e5_beta100.yaml, sha256[:16]=19c2a6d6bba0a59e)
-#   * everything else identical (lr=1e-5, lora_rank=16, num_samples=800 → 200 steps at 4 ranks)
-# nproc_per_node auto-detected from nvidia-smi; override with NPROC_PER_NODE env var.
-# Decision: diagnose β=1000 lr=1e-5 control (run 54xoj0uw) failure mode — clip at max_grad_norm=1.0
-# fires nearly every step under β=1000, degenerating updates to sign-SGD; β=100 should drop raw
-# grad ~10x and let real magnitude through. Pair with β=10 sweep to bracket the right scale.
-# Pins: recipe=6bef6e104cdd3442, train_cfg=19c2a6d6bba0a59e, pair_ids=cf5d3e5fd528a3e0
-
 set -euo pipefail
 # shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
@@ -18,7 +9,7 @@ resolve_wandb
 cd "$DPO_DIR"
 
 expect_recipe="6bef6e104cdd3442"
-expect_train_cfg="19c2a6d6bba0a59e"
+expect_train_cfg="f8fac068a3389ca0"
 expect_pair_ids="cf5d3e5fd528a3e0"
 verify_pins "$expect_recipe" "$expect_train_cfg" "$expect_pair_ids" \
   "$DPO_DIR/recipes/training_config_round4_lr1e5_beta100_sha256_pin"

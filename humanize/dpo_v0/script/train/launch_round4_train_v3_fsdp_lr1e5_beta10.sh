@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Round-4 v3 lr=1e-5 β=10 sweep. Forks lr1e5 control with:
-#   * beta 1000 → 10 (training_config_round4_lr1e5_beta10.yaml, sha256[:16]=33124f212de037d7)
-#   * everything else identical (lr=1e-5, lora_rank=16, num_samples=800 → 200 steps at 4 ranks)
-# nproc_per_node auto-detected from nvidia-smi; override with NPROC_PER_NODE env var.
-# Decision: paired with β=100 sweep to bracket the right DPO temperature. β=10 stress-tests the
-# "lower β = real magnitudes through clip" hypothesis; if β=10 outperforms β=100 outperforms
-# β=1000 monotonically, β was the sole bottleneck on run 54xoj0uw.
-# Pins: recipe=6bef6e104cdd3442, train_cfg=33124f212de037d7, pair_ids=cf5d3e5fd528a3e0
-
 set -euo pipefail
 # shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
@@ -18,7 +9,7 @@ resolve_wandb
 cd "$DPO_DIR"
 
 expect_recipe="6bef6e104cdd3442"
-expect_train_cfg="33124f212de037d7"
+expect_train_cfg="de5364f9127bc4d6"
 expect_pair_ids="cf5d3e5fd528a3e0"
 verify_pins "$expect_recipe" "$expect_train_cfg" "$expect_pair_ids" \
   "$DPO_DIR/recipes/training_config_round4_lr1e5_beta10_sha256_pin"
