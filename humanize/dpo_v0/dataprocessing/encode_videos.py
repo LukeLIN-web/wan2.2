@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
-import hashlib
 import json
 import os
 import pathlib
@@ -32,11 +31,21 @@ import numpy as np
 import safetensors.torch
 import torch
 
-# Keep the loader's recipe pin in lockstep with this script.
 HERE = pathlib.Path(__file__).resolve().parent
 DPO_ROOT = HERE.parent  # humanize/dpo_v0/
 RECIPES_DIR = DPO_ROOT / "recipes"
-EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
+
+# Make sibling modules importable whether invoked as `python encode_videos.py`
+# or `python -m humanize.dpo_v0.dataprocessing.encode_videos` / under pytest.
+if str(DPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(DPO_ROOT))
+
+from dataprocessing.build_round4_tier_b_1k import canonical_pair_ids_sha256  # noqa: E402
+from dataprocessing.manifest_writer import (  # noqa: E402
+    KNOWN_GOOD_RECIPE_ID,
+    _file_sha256,
+    assert_recipe_pins,
+)
 
 # All paths support env-var override so the encoder runs on boxes without
 # /shared mounted (juyi-finetune / juyi-videorl). Defaults are the nnmc59
@@ -70,25 +79,6 @@ FRAME_NUM = 81
 PAD_COLOR_BT709 = (0, 0, 0)
 
 
-def _file_sha256(path: pathlib.Path, buf: int = 4 * 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(buf), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _read_recipe_pin() -> str:
-    yaml_bytes = (RECIPES_DIR / "wan22_i2v_a14b__round2_v0.yaml").read_bytes()
-    fresh = hashlib.sha256(yaml_bytes).hexdigest()[:16]
-    on_disk = (RECIPES_DIR / "recipe_id").read_text(encoding="ascii").strip()
-    if not (fresh == on_disk == EXPECTED_RECIPE_ID):
-        raise ValueError(
-            f"recipe pin drift: fresh={fresh}, on_disk={on_disk}, expected={EXPECTED_RECIPE_ID}"
-        )
-    return on_disk
-
-
 def _heldout_blocklist(subset: dict) -> set[str]:
     """Extract the heldout filename set from a loaded T3_subset.json (AC-4 guard)."""
     return set(subset["heldout_excluded"]["scene_filenames"])
@@ -118,30 +108,33 @@ def _letterbox_pad(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarra
     return padded
 
 
-def _read_first_n_frames(video_path: pathlib.Path, frame_num: int, target_w: int, target_h: int) -> np.ndarray:
-    """Return [T, H, W, 3] uint8 RGB array of the first ``frame_num`` frames after letterbox pad."""
+def _read_video_frames(video_path: pathlib.Path, frame_num: int) -> tuple[np.ndarray, int, int]:
+    """Return ([T, H_target, W_target, 3] uint8 RGB after letterbox pad, src_w, src_h).
+
+    Single cv2.VideoCapture open: probes source W/H, picks the recipe target,
+    then decodes/pads the first ``frame_num`` frames in one pass.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"could not open video: {video_path}")
-    frames: list[np.ndarray] = []
     try:
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        target_w, target_h = _resolve_target(src_w, src_h)
+        frames: list[np.ndarray] = []
         while len(frames) < frame_num:
             ok, frame = cap.read()
             if not ok:
                 break
-            # cv2 reads BGR; recipe says color_space = bt709-tv-range, codec_normalization = yuv420p_to_rgb_bt709_full.
-            # cv2's default decode is full-range BGR; we convert to RGB and trust ffmpeg's BT.709 mapping.
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            padded = _letterbox_pad(rgb, target_w, target_h)
-            frames.append(padded)
+            frames.append(_letterbox_pad(rgb, target_w, target_h))
     finally:
         cap.release()
     if len(frames) < frame_num:
         raise RuntimeError(
             f"video has only {len(frames)} frames, recipe requires {frame_num}: {video_path}"
         )
-    arr = np.stack(frames, axis=0)
-    return arr  # [T, H, W, 3] uint8 RGB
+    return np.stack(frames, axis=0), target_w, target_h
 
 
 def _frames_to_tensor(frames_uint8: np.ndarray) -> torch.Tensor:
@@ -183,16 +176,8 @@ def encode_pair_role(
             f"AC-4 violation: heldout scene encode attempted: {filename} (pair {record['pair_id']}, role {role})"
         )
     src = _resolve_video_path(info)
-    if not src.exists():
-        raise FileNotFoundError(f"missing source video: {src}")
-    cap = cv2.VideoCapture(str(src))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    target_w, target_h = _resolve_target(width, height)
-
+    frames, target_w, target_h = _read_video_frames(src, FRAME_NUM)
     src_sha = _file_sha256(src)
-    frames = _read_first_n_frames(src, FRAME_NUM, target_w, target_h)
     video_tensor = _frames_to_tensor(frames).to(device=device, dtype=dtype)
     t0 = time.time()
     latents = vae.encode([video_tensor])  # [3, T, H, W] -> [16, T', H', W']
@@ -248,7 +233,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = ap.parse_args(argv[1:])
 
-    recipe_id = _read_recipe_pin()
+    recipe_id = assert_recipe_pins(RECIPES_DIR, expected_recipe_id=KNOWN_GOOD_RECIPE_ID)["recipe_id"]
     print(f"recipe_id pin OK: {recipe_id}")
 
     subset = json.loads(T3_SUBSET_JSON.read_bytes())
@@ -266,8 +251,7 @@ def main(argv: list[str]) -> int:
             )
         round4_data = json.loads(args.subset_pair_ids_json.read_bytes())
         pair_ids = list(round4_data["tier_b_round4_1k"]["pair_ids"])
-        canonical = ("\n".join(pair_ids) + "\n").encode("utf-8")
-        fresh = hashlib.sha256(canonical).hexdigest()[:16]
+        fresh = canonical_pair_ids_sha256(pair_ids)[:16]
         if fresh != args.pair_ids_sha256_pin:
             raise SystemExit(
                 f"pair_ids pin drift: fresh={fresh}, expected={args.pair_ids_sha256_pin}"

@@ -20,16 +20,13 @@ Status values:
 """
 
 import argparse
-import csv
 import hashlib
 import io
 import json
 import random
 import re
-import shutil
 import subprocess
-import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -221,22 +218,10 @@ def main(argv=None):
         if sr.get("error"):
             image_manifest[gid]["error"] = sr["error"]
 
-    # MD5 uniqueness across scene_filenames sharing the SAME basename.
-    # Per T1, each scene_filename appears in many groups; same filename should
-    # resolve to a single MD5 (cache enforces that). The check below is therefore
-    # a no-op by construction but logged as an invariant.
-    sf_to_md5 = {sf: e["image_md5"] for sf, e in scene_resolution.items()}
-    inconsistencies = []
-    for sf, e in scene_resolution.items():
-        if e["status"] == "ok":
-            # Re-resolve and compare just to surface any race / cache miss.
-            cands, _ = resolve_image_path(sf)
-            md5s = {file_md5(c) for c in cands if c.exists()}
-            if len(md5s) > 1:
-                inconsistencies.append({"scene_filename": sf, "md5_set": sorted(md5s)})
-
-    # Drop list: any group with status != ok (or whose scene was flagged inconsistent)
-    inconsistent_scenes = {x["scene_filename"] for x in inconsistencies}
+    # MD5 uniqueness across scene_filenames is enforced by md5_cache above
+    # (one MD5 per filename); no second pass needed.
+    inconsistencies: list = []
+    inconsistent_scenes: set = set()
     drop_list = []
     ok_pairs = []
     for p in pairs:

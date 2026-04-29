@@ -69,12 +69,6 @@ def _validate_pair(video_a: torch.Tensor, video_b: torch.Tensor) -> None:
         )
 
 
-def _to_fp32(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype is torch.float32:
-        return x
-    return x.to(dtype=torch.float32)
-
-
 def _bt709_luma(rgb: torch.Tensor) -> torch.Tensor:
     """Convert (T, 3, H, W) RGB in [-1, 1] to (T, 1, H, W) BT.709 luma."""
     r = rgb[:, 0:1]
@@ -153,8 +147,8 @@ def per_frame_metrics(video_a: torch.Tensor, video_b: torch.Tensor) -> dict[str,
             f"expected C in (1, 3) for luma conversion; got C={video_a.shape[1]}"
         )
 
-    a = _to_fp32(video_a)
-    b = _to_fp32(video_b)
+    a = video_a.float()
+    b = video_b.float()
 
     # L1 per frame: mean |a - b| over (C, H, W)
     diff = (a - b).abs()
@@ -181,20 +175,18 @@ def per_frame_metrics(video_a: torch.Tensor, video_b: torch.Tensor) -> dict[str,
     ssim_per_frame = _ssim_per_frame(luma_a, luma_b)  # (T,)
 
     T = a.shape[0]
-    per_frame = []
-    for i in range(T):
-        per_frame.append(
-            {
-                "frame_id": i,
-                "l1": float(l1_per_frame[i].item()),
-                "ssim_bt709": float(ssim_per_frame[i].item()),
-                "psnr_db": float(psnr_per_frame[i].item()),
-            }
-        )
-
-    l1_vals = [p["l1"] for p in per_frame]
-    ssim_vals = [p["ssim_bt709"] for p in per_frame]
-    psnr_vals = [p["psnr_db"] for p in per_frame]
+    l1_vals = l1_per_frame.tolist()
+    ssim_vals = ssim_per_frame.tolist()
+    psnr_vals = psnr_per_frame.tolist()
+    per_frame = [
+        {
+            "frame_id": i,
+            "l1": l1_vals[i],
+            "ssim_bt709": ssim_vals[i],
+            "psnr_db": psnr_vals[i],
+        }
+        for i in range(T)
+    ]
 
     # mean_psnr_db semantics:
     #   - all frames identical → +inf

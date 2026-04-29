@@ -36,6 +36,17 @@ import pathlib
 import sys
 
 
+_SHA_BUF = 4 * 1024 * 1024  # 4 MiB; matches file_sha_cache._BUF.
+
+
+def _stream_sha256(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(_SHA_BUF), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def snapshot_low_noise(upstream_root: pathlib.Path) -> dict | None:
     """Walk <root>/low_noise_model/ and return {relpath: sha256} sorted.
 
@@ -52,7 +63,7 @@ def snapshot_low_noise(upstream_root: pathlib.Path) -> dict | None:
         if not p.is_file():
             continue
         rel = p.relative_to(low_dir).as_posix()
-        snap[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        snap[rel] = _stream_sha256(p)
     return snap
 
 

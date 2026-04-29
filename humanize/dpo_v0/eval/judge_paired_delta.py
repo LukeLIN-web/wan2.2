@@ -237,33 +237,16 @@ class BootstrapCI:
 
 # --- probe ------------------------------------------------------------------
 
-def probe_phyjudge_axes(
-    probe_results_json: pathlib.Path,
+def probe_phyjudge_axes_from_payload(
+    payload: object,
     axis_mapping_override: dict[str, str] | None = None,
 ) -> tuple[list[str], AxisMapping]:
-    """Read a single probe-eval JSON and resolve the axis mapping.
+    """Resolve field names + axis mapping from an already-parsed probe payload.
 
-    The caller is responsible for invoking ``serveandeval_9b.sh`` with a
-    smoke video (``--limit 1`` etc.) before calling this function; the
-    probe step does not run the harness itself, it only reads back what
-    the harness wrote. This split keeps the probe deterministic when the
-    skeleton is exercised against pre-computed JSONs.
-
-    Returns ``(field_names, axis_mapping)``:
-
-    * ``field_names`` — the union of top-level keys and ``results[0]``
-      keys, sorted, ASCII-clean. Stamped verbatim in the manifest.
-    * ``axis_mapping`` — for each semantic axis (``SA``, ``PTV``,
-      ``persistence``), the per-result key whose value is that axis's
-      score. Defaults to identity. ``axis_mapping_override`` lets the
-      operator supply a non-identity map (e.g. ``{"SA":
-      "alignment_score"}``) which is then validated against the probe's
-      keys; an override that names a non-existent key halts.
-
-    Halts with :class:`JudgeAxisMissingError` if any composite axis is
-    unreachable.
+    Same contract as :func:`probe_phyjudge_axes` but operates on the
+    parsed dict so callers that already loaded the JSON once (e.g. to
+    derive secondary axes) don't pay for a second parse.
     """
-    payload = json.loads(probe_results_json.read_text())
     if not isinstance(payload, dict):
         raise JudgeAxisMissingError(
             f"probe JSON must be an object, got {type(payload).__name__}"
@@ -281,24 +264,19 @@ def probe_phyjudge_axes(
             f"probe results[0] must be an object, got {type(first_result).__name__}"
         )
 
-    top_level = sorted(payload.keys())
     per_result = sorted(first_result.keys())
-    field_names = sorted(set(top_level) | set(per_result))
+    field_names = sorted(set(payload.keys()) | set(first_result.keys()))
 
-    # Resolve axis mapping. Default is identity; override may rename.
     mapping: dict[str, str] = {}
     for axis in COMPOSITE_AXES:
-        if axis_mapping_override and axis in axis_mapping_override:
-            target = axis_mapping_override[axis]
-        else:
-            target = axis
+        target = (axis_mapping_override or {}).get(axis, axis)
         if target not in first_result:
             raise JudgeAxisMissingError(
                 f"composite axis {axis!r} maps to {target!r} but probe "
                 f"results[0] has no such key (available: {per_result})"
             )
         score = first_result[target]
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
             raise JudgeAxisMissingError(
                 f"composite axis {axis!r} → {target!r} is not numeric "
                 f"(got {type(score).__name__})"
@@ -306,6 +284,21 @@ def probe_phyjudge_axes(
         mapping[axis] = target
 
     return field_names, AxisMapping(mapping=mapping)
+
+
+def probe_phyjudge_axes(
+    probe_results_json: pathlib.Path,
+    axis_mapping_override: dict[str, str] | None = None,
+) -> tuple[list[str], AxisMapping]:
+    """Read a single probe-eval JSON and resolve the axis mapping.
+
+    Halts with :class:`JudgeAxisMissingError` if any composite axis is
+    unreachable. Defaults to identity mapping; ``axis_mapping_override``
+    renames a probe field (e.g. ``{"SA": "alignment_score"}``) and the
+    override target must exist in ``results[0]``.
+    """
+    payload = json.loads(probe_results_json.read_text())
+    return probe_phyjudge_axes_from_payload(payload, axis_mapping_override)
 
 
 def secondary_axis_keys(
@@ -1187,10 +1180,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # Step 1 — probe.
+    # Step 1 — probe + eligible secondary axes from one parse.
+    probe_payload = json.loads(args.probe_results_json.read_text())
     try:
-        field_names, axis_mapping = probe_phyjudge_axes(
-            args.probe_results_json,
+        field_names, axis_mapping = probe_phyjudge_axes_from_payload(
+            probe_payload,
             axis_mapping_override=axis_mapping_override,
         )
     except JudgeAxisMissingError as exc:
@@ -1203,8 +1197,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"HALT judge-axis-missing (probe): {exc}", file=sys.stderr)
         return 3
 
-    # Step 1b — eligible secondary axes from the same probe sample.
-    probe_payload = json.loads(args.probe_results_json.read_text())
     secondary_keys = secondary_axis_keys(
         probe_payload["results"][0],
         axis_mapping,

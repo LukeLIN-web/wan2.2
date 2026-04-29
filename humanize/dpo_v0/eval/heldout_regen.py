@@ -40,7 +40,6 @@ import hashlib
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import time
@@ -759,9 +758,10 @@ def main() -> int:
     )
     print(f"[selection] {len(selections)} canonical (prompt, group, image) triples", flush=True)
     if args.cond_image_fallback_root is not None:
+        fallback_root = args.cond_image_fallback_root
         n_fallback = sum(
             1 for s in selections
-            if str(args.cond_image_fallback_root) in s.cond_image_path
+            if fallback_root in pathlib.Path(s.cond_image_path).parents
         )
         print(f"[selection] {n_fallback}/{len(selections)} cond images resolved via fallback", flush=True)
 
