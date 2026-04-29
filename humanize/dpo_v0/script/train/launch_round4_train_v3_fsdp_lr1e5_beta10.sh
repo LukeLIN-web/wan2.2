@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Round-4 v3 lr=1e-5 β=10 sweep on juyi-finetune (4×A100). Forks lr1e5 control with:
+# Round-4 v3 lr=1e-5 β=10 sweep. Forks lr1e5 control with:
 #   * beta 1000 → 10 (training_config_round4_lr1e5_beta10.yaml, sha256[:16]=33124f212de037d7)
-#   * everything else identical (lr=1e-5, lora_rank=16, num_samples=800 → 200 steps × 4 ranks)
+#   * everything else identical (lr=1e-5, lora_rank=16, num_samples=800 → 200 steps at 4 ranks)
+# nproc_per_node auto-detected from nvidia-smi; override with NPROC_PER_NODE env var.
 # Decision: paired with β=100 sweep to bracket the right DPO temperature. β=10 stress-tests the
 # "lower β = real magnitudes through clip" hypothesis; if β=10 outperforms β=100 outperforms
 # β=1000 monotonically, β was the sole bottleneck on run 54xoj0uw.
@@ -25,7 +26,16 @@ verify_pins "$expect_recipe" "$expect_train_cfg" "$expect_pair_ids" \
 TRAINER_PY="$DPO_DIR/train/train_dpo_i2v.py"
 [[ -f "$TRAINER_PY" ]] || TRAINER_PY="$DPO_DIR/train_dpo_i2v.py"
 
-nohup torchrun --nproc_per_node=4 "$TRAINER_PY" \
+if [[ -z "${NPROC_PER_NODE:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NPROC_PER_NODE="$(nvidia-smi -L 2>/dev/null | wc -l)"
+  fi
+  NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+  [[ "$NPROC_PER_NODE" -ge 1 ]] || NPROC_PER_NODE=1
+fi
+echo "[launch] nproc_per_node=$NPROC_PER_NODE"
+
+nohup torchrun --nproc_per_node="$NPROC_PER_NODE" "$TRAINER_PY" \
   --tier tier_b \
   --upstream "$HOME/Wan2.2-I2V-A14B" \
   --latent-manifest "$DPO_DIR/latents/20260428T164038Z/tier_b_round4_1k/manifest.jsonl" \
@@ -43,7 +53,7 @@ nohup torchrun --nproc_per_node=4 "$TRAINER_PY" \
   --wandb-project "$WANDB_PROJECT" \
   --wandb-entity "$WANDB_ENTITY" \
   --wandb-mode "$WANDB_MODE_OPT" \
-  --wandb-run-name "round4-lr1e5-beta10-juyi-finetune-4rank-$(date -u +%Y%m%dT%H%M%SZ)" \
+  --wandb-run-name "round4-lr1e5-beta10-${NPROC_PER_NODE}rank-$(date -u +%Y%m%dT%H%M%SZ)" \
   > "$LOG_FILE" 2>&1 &
 
 print_launch_info "$!"
