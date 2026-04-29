@@ -23,6 +23,7 @@ import json
 import math
 import os
 import statistics
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,18 @@ import wandb
 DEFAULT_RUN_PATH = "lukelin/wanrl/9if26kr9"
 DEFAULT_TOKEN_PATH = Path("/shared/user60/worldmodel/rlvideo/videodpoWan/wandbtoken")
 DEFAULT_QUARTERS = "0:50,50:100,100:150,150:200"
+DEFAULT_HISTORY_MODE = "quick"
+DEFAULT_SAMPLES = 2000
+DEFAULT_TAIL_STEPS = 200
+DEFAULT_WINDOW_SCAN_KEYS = (
+    "loss",
+    "accuracy",
+    "acc_win50",
+    "margin",
+    "logit",
+    "grad_norm",
+    "grad_finite",
+)
 DEFAULT_KEYS = (
     "loss",
     "accuracy",
@@ -183,7 +196,11 @@ def load_wandb_rows(
     keys: tuple[str, ...],
     timeout: int,
     page_size: int,
-) -> tuple[Any, list[dict[str, Any]]]:
+    history_mode: str = DEFAULT_HISTORY_MODE,
+    samples: int = DEFAULT_SAMPLES,
+    tail_steps: int = DEFAULT_TAIL_STEPS,
+    ranges: list[tuple[str, int, int]] | None = None,
+) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
     if token_path is not None:
         token = token_path.read_text().strip()
         if not token:
@@ -195,20 +212,278 @@ def load_wandb_rows(
     os.environ.setdefault("WANDB_SILENT", "true")
     api = wandb.Api(timeout=timeout)
     run = api.run(run_path)
-    rows: list[dict[str, Any]] = []
-    for row in run.scan_history(keys=list(keys), page_size=page_size):
-        step = row.get("_step")
-        if step is None:
-            continue
-        slim: dict[str, Any] = {"_step": int(step)}
-        for key in keys:
-            if key in row:
-                slim[key] = row[key]
-        rows.append(slim)
-    rows.sort(key=lambda item: item["_step"])
+
+    if history_mode == "quick":
+        sampled_rows = _sample_slim_history(run=run, keys=keys, samples=samples)
+        last_step = _last_history_step(run)
+        tail_range = _tail_scan_range(last_step=last_step, tail_steps=tail_steps)
+        tail_rows = (
+            _scan_slim_history(
+                run=run,
+                keys=keys,
+                page_size=page_size,
+                scan_keys=keys,
+                min_step=tail_range[0],
+                max_step=tail_range[1],
+            )
+            if tail_range is not None
+            else []
+        )
+        if tail_range is not None and not tail_rows:
+            tail_rows = _scan_slim_history(
+                run=run,
+                keys=keys,
+                page_size=page_size,
+                scan_keys=DEFAULT_WINDOW_SCAN_KEYS,
+                min_step=tail_range[0],
+                max_step=tail_range[1],
+            )
+        rows = _merge_slim_rows(sampled_rows, tail_rows)
+        history_info = {
+            "mode": history_mode,
+            "complete": False,
+            "samples_requested": samples,
+            "sampled_rows": len(sampled_rows),
+            "tail_steps": tail_steps,
+            "tail_rows": len(tail_rows),
+            "tail_range": (
+                {"start": tail_range[0], "end_exclusive": tail_range[1]}
+                if tail_range is not None
+                else None
+            ),
+            "last_history_step": last_step,
+            "note": (
+                "Stats are based on sampled history plus an exact tail window; "
+                "use --history-mode full for complete scan_history stats."
+            ),
+        }
+    elif history_mode == "range-scan":
+        scan_ranges = _requested_scan_ranges(
+            run=run,
+            ranges=ranges or [],
+            tail_steps=tail_steps,
+        )
+        rows = _scan_slim_ranges(
+            run=run,
+            keys=keys,
+            page_size=page_size,
+            scan_ranges=scan_ranges,
+        )
+        history_info = {
+            "mode": history_mode,
+            "complete": False,
+            "scan_ranges": [
+                {"start": start, "end_exclusive": end}
+                for start, end in scan_ranges
+            ],
+            "tail_steps": tail_steps,
+            "note": (
+                "Stats are exact only within requested scan ranges; "
+                "use --history-mode full for complete scan_history stats."
+            ),
+        }
+    elif history_mode == "full":
+        rows = _scan_slim_history(
+            run=run,
+            keys=keys,
+            page_size=page_size,
+            scan_keys=keys,
+        )
+        history_info = {
+            "mode": history_mode,
+            "complete": True,
+            "scan": "scan_history(keys=...)",
+        }
+        if not rows:
+            print(
+                (
+                    "[wandb] scan_history(keys=...) returned 0 rows; "
+                    "falling back to full history scan and local key filtering."
+                ),
+                file=sys.stderr,
+            )
+            rows = _scan_slim_history(
+                run=run,
+                keys=keys,
+                page_size=page_size,
+                scan_keys=None,
+            )
+            history_info["scan"] = "scan_history()"
+    else:
+        raise SystemExit(
+            "bad --history-mode; expected one of: quick, range-scan, full"
+        )
+
     if not rows:
         raise SystemExit(f"no W&B history rows found for {run_path}")
-    return run, rows
+    return run, rows, history_info
+
+
+def _sample_slim_history(
+    run: Any,
+    keys: tuple[str, ...],
+    samples: int,
+) -> list[dict[str, Any]]:
+    if samples <= 0:
+        return []
+    rows = run.history(samples=samples, keys=list(keys), pandas=False)
+    return _merge_slim_rows(_slim_rows(rows, keys))
+
+
+def _scan_slim_history(
+    run: Any,
+    keys: tuple[str, ...],
+    page_size: int,
+    scan_keys: tuple[str, ...] | None,
+    min_step: int | None = None,
+    max_step: int | None = None,
+) -> list[dict[str, Any]]:
+    scan_kwargs: dict[str, Any] = {"page_size": page_size}
+    if scan_keys is not None:
+        scan_kwargs["keys"] = _scan_keys_with_step(scan_keys)
+    if min_step is not None:
+        scan_kwargs["min_step"] = min_step
+    if max_step is not None:
+        scan_kwargs["max_step"] = max_step
+    rows = _slim_rows(run.scan_history(**scan_kwargs), keys)
+    if min_step is not None or max_step is not None:
+        rows = [
+            row
+            for row in rows
+            if (
+                (min_step is None or row["_step"] >= min_step)
+                and (max_step is None or row["_step"] < max_step)
+            )
+        ]
+    return _merge_slim_rows(rows)
+
+
+def _scan_slim_ranges(
+    run: Any,
+    keys: tuple[str, ...],
+    page_size: int,
+    scan_ranges: list[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for start, end in scan_ranges:
+        range_rows = _scan_slim_history(
+            run=run,
+            keys=keys,
+            page_size=page_size,
+            scan_keys=keys,
+            min_step=start,
+            max_step=end,
+        )
+        if not range_rows:
+            range_rows = _scan_slim_history(
+                run=run,
+                keys=keys,
+                page_size=page_size,
+                scan_keys=DEFAULT_WINDOW_SCAN_KEYS,
+                min_step=start,
+                max_step=end,
+            )
+        rows.extend(range_rows)
+    return _merge_slim_rows(rows)
+
+
+def _scan_keys_with_step(keys: tuple[str, ...]) -> list[str]:
+    scan_keys = ["_step"]
+    for key in keys:
+        if key != "_step" and key not in scan_keys:
+            scan_keys.append(key)
+    return scan_keys
+
+
+def _slim_rows(
+    rows: Iterable[dict[str, Any]],
+    keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    slim_rows: list[dict[str, Any]] = []
+    for row in rows:
+        slim = _slim_row(row, keys)
+        if slim is not None:
+            slim_rows.append(slim)
+    return slim_rows
+
+
+def _slim_row(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+) -> dict[str, Any] | None:
+    step = row.get("_step")
+    if step is None:
+        return None
+    slim: dict[str, Any] = {"_step": int(step)}
+    for key in keys:
+        if key in row:
+            slim[key] = row[key]
+    return slim
+
+
+def _merge_slim_rows(*row_groups: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows_by_step: dict[int, dict[str, Any]] = {}
+    for rows in row_groups:
+        for row in rows:
+            step = int(row["_step"])
+            merged = rows_by_step.setdefault(step, {"_step": step})
+            for key, value in row.items():
+                if key == "_step":
+                    continue
+                merged[key] = value
+    return [rows_by_step[step] for step in sorted(rows_by_step)]
+
+
+def _last_history_step(run: Any) -> int | None:
+    value = finite_float(getattr(run, "lastHistoryStep", None))
+    if value is None:
+        summary = getattr(run, "summary", {}) or {}
+        value = finite_float(summary.get("_step"))
+    return int(value) if value is not None else None
+
+
+def _tail_scan_range(
+    last_step: int | None,
+    tail_steps: int,
+) -> tuple[int, int] | None:
+    if last_step is None or tail_steps <= 0:
+        return None
+    end = last_step + 1
+    start = max(0, end - tail_steps)
+    return start, end
+
+
+def _requested_scan_ranges(
+    run: Any,
+    ranges: list[tuple[str, int, int]],
+    tail_steps: int,
+) -> list[tuple[int, int]]:
+    last_step = _last_history_step(run)
+    upper = last_step + 1 if last_step is not None else None
+    scan_ranges: list[tuple[int, int]] = []
+    for _, start, end in ranges:
+        start = max(0, start)
+        if upper is not None:
+            end = min(end, upper)
+        if end > start:
+            scan_ranges.append((start, end))
+    tail_range = _tail_scan_range(last_step=last_step, tail_steps=tail_steps)
+    if tail_range is not None:
+        scan_ranges.append(tail_range)
+    if not scan_ranges and upper is not None:
+        scan_ranges.append((max(0, upper - max(tail_steps, 1)), upper))
+    return _merge_ranges(scan_ranges)
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+    return merged
 
 
 def build_summary(
@@ -216,6 +491,7 @@ def build_summary(
     rows: list[dict[str, Any]],
     ranges: list[tuple[str, int, int]],
     top_k: int,
+    history_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     margin_rows = [
         row for row in rows if finite_float(row.get("margin", row.get("logit"))) is not None
@@ -256,6 +532,7 @@ def build_summary(
             "created_at": str(run.created_at),
             "url": run.url,
         },
+        "history": history_info or {"mode": "unknown", "complete": None},
         "row_count": len(rows),
         "step_range": [rows[0]["_step"], rows[-1]["_step"]],
         "summary_subset": {
@@ -309,6 +586,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--page-size", type=int, default=1000)
+    parser.add_argument(
+        "--history-mode",
+        choices=("quick", "range-scan", "full"),
+        default=DEFAULT_HISTORY_MODE,
+        help=(
+            "quick uses sampled history plus an exact tail scan; range-scan "
+            "scans only --quarters and tail; full scans the entire run."
+        ),
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=DEFAULT_SAMPLES,
+        help="Sample count for --history-mode quick.",
+    )
+    parser.add_argument(
+        "--tail-steps",
+        type=int,
+        default=DEFAULT_TAIL_STEPS,
+        help="Exact trailing step window to scan for quick/range-scan modes.",
+    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args()
@@ -319,18 +617,23 @@ def main() -> None:
     token_path = None
     if args.token_path not in {"", "env", "none", "-"}:
         token_path = Path(args.token_path)
-    run, rows = load_wandb_rows(
+    run, rows, history_info = load_wandb_rows(
         run_path=args.run_path,
         token_path=token_path,
         keys=DEFAULT_KEYS,
         timeout=args.timeout,
         page_size=args.page_size,
+        history_mode=args.history_mode,
+        samples=args.samples,
+        tail_steps=args.tail_steps,
+        ranges=args.quarters,
     )
     summary = build_summary(
         run=run,
         rows=rows,
         ranges=args.quarters,
         top_k=args.top_k,
+        history_info=history_info,
     )
     print(json.dumps(round_floats(summary), indent=args.indent, sort_keys=True))
 
