@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import pathlib
-import sys
 
 import torch
 import torch.nn as nn
 
-HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))  # humanize/dpo_v0/
-
-from train import train_dpo_i2v as trainer  # noqa: E402
+from train import train_dpo_i2v as trainer
 
 
 def test_collect_lora_state_emits_diffsynth_native_weight_keys():

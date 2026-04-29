@@ -16,16 +16,11 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
-import sys
 
 import pytest
 import torch
 
-HERE = pathlib.Path(__file__).resolve().parent
-PKG_ROOT = HERE.parent  # humanize/dpo_v0/
-sys.path.insert(0, str(PKG_ROOT))
-
-from dataprocessing.manifest_writer import (  # noqa: E402
+from dataprocessing.manifest_writer import (
     COMPUTE_ENVELOPES_CANONICAL,
     EXPECTED_AGGREGATION_RULE,
     EXPECTED_DTYPE_POLICY,

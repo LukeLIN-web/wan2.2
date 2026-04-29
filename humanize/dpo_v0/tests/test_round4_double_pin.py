@@ -13,17 +13,13 @@ import hashlib
 import pathlib
 import subprocess
 import sys
-import tempfile
 
 import pytest
 import yaml
 
-HERE = pathlib.Path(__file__).resolve().parent
-DPO_ROOT = HERE.parent  # humanize/dpo_v0/
-sys.path.insert(0, str(DPO_ROOT))
+from train import train_dpo_i2v as trainer
 
-from train import train_dpo_i2v as trainer  # noqa: E402
-
+DPO_ROOT = pathlib.Path(__file__).resolve().parent.parent  # humanize/dpo_v0/
 RECIPES_DIR = DPO_ROOT / "recipes"
 
 

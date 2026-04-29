@@ -27,9 +27,8 @@ churn after the first warm-up is zero.
 
 The eval / inference manifests are byte-equivalent to a cold-recompute
 run, so existing AC-7.3 / paired-delta provenance is preserved. The
-cache is purely a startup-time optimization shared by all inference
-entrypoints (`inference_smoke.py`, and `heldout_regen.py` transitively
-via its inference_smoke dependency).
+cache is purely a startup-time optimization shared by inference
+entrypoints (rl5's external `inference_smoke.py`).
 """
 
 from __future__ import annotations
@@ -45,8 +44,8 @@ import pathlib
 #   -> cache at <upstream_root>/file_sha.cache.json (same JSON, separate section)
 CACHE_BASENAME = "file_sha.cache.json"
 
-# 4 MiB read buffer matches the canonical file_sha256 in inference_smoke,
-# so cold misses through this cache produce identical timing.
+# 4 MiB read buffer; cold-miss timing matches the canonical file_sha256
+# implementations used by callers (manifest_writer, encode_videos, etc.).
 _BUF = 4 * 1024 * 1024
 
 

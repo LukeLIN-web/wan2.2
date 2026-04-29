@@ -22,17 +22,12 @@ from __future__ import annotations
 
 import contextlib
 import math
-import sys
-import pathlib
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))  # humanize/dpo_v0/
-
-from train.dpo_loss import flow_matching_dpo_loss  # noqa: E402
+from train.dpo_loss import flow_matching_dpo_loss
 
 
 class MiniLoRALinear(nn.Module):

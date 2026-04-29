@@ -11,19 +11,11 @@ Five spec'd cases:
 from __future__ import annotations
 
 import math
-import sys
-import pathlib
 
 import pytest
 import torch
 
-# Local import path so this test runs from a checked-out videodpoWan tree
-HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
-from eval.identity_gate_metrics import (  # noqa: E402
-    gate_decision,
-    per_frame_metrics,
-)
+from eval.identity_gate_metrics import gate_decision, per_frame_metrics
 
 
 # Use a small frame size (>= SSIM window 11) and a small T to keep tests fast.

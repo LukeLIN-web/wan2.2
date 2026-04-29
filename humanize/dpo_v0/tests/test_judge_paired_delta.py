@@ -17,13 +17,10 @@ from __future__ import annotations
 
 import json
 import pathlib
-import sys
 
 import pytest
 
-HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))  # humanize/dpo_v0/
-from eval import judge_paired_delta as jpd  # noqa: E402
+from eval import judge_paired_delta as jpd
 
 
 # --- helpers ----------------------------------------------------------------

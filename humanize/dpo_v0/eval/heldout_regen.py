@@ -3,14 +3,14 @@
 Reads ``<T0_T3_ROOT>/splits/heldout.json`` (579 pairs / 245 groups / 42
 unique prompts) and ``<T0_T3_ROOT>/t2/image_manifest.json`` (1440 group
 entries), picks one canonical (group, image) per prompt under a
-deterministic rule, and runs ``inference_smoke.py`` twice per prompt
+deterministic rule, and runs rl5's ``inference_smoke.py`` twice per prompt
 (baseline ckpt + trained ckpt) under one byte-identical generation
 config.
 
-The actual generation work is delegated to ``inference_smoke.py`` —
-this module calls it via subprocess CLI (preferred for byte-identical
-config + a clean process boundary) or via the in-process Python API
-``inference_smoke.run_one_sample(...)``.
+Generation is delegated to an external ``inference_smoke.py`` (rl5's
+in-tree implementation) via a subprocess CLI — the orchestrator never
+imports inference_smoke in-process. Caller supplies the path via
+``--inference-smoke-py``.
 
 Plan: humanize/i2v.md AC-7.1, AC-7.2, AC-7.3, M6.
 
@@ -44,7 +44,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -431,286 +431,6 @@ def subprocess_inference_adapter(
     return adapter
 
 
-def python_api_inference_adapter(
-    run_one_sample: Callable,
-    UpstreamPaths: Optional[Callable] = None,
-    assert_recipe_pin: Optional[Callable] = None,
-    cache_pipe: bool = False,
-    build_pipeline: Optional[Callable] = None,
-) -> InferenceAdapter:
-    """Adapter that calls into rl5's ``inference_smoke.run_one_sample`` directly.
-
-    ACTUAL signature (verified against ``rlcr/task-6`` HEAD; rl1 caught
-    the spec/impl drift in #dpo:dac89b67 msg ``04170e0b``)::
-
-        run_one_sample(
-            *,
-            mode,                    # "baseline" | "trained"
-            out_dir: Path,
-            upstream: UpstreamPaths, # dataclass(upstream_root=Path)
-            torch_dtype,             # torch.dtype, e.g. torch.bfloat16
-            device: str,             # "cuda" | "cpu"
-            prompt: str,
-            cond_image_path: Path,
-            generation_config: dict,
-            generation_config_bytes: bytes,
-            lora_adapter_path: Optional[Path],   # None for baseline
-            compute_envelope: str,
-            recipe_id: str,                      # the 16-char pin, NOT the yaml path
-            high_noise_sha: Optional[str] = None,
-            low_noise_sha: Optional[str] = None,
-            pipe: Any = None,                    # cache_pipe path
-            lora_already_attached: bool = False, # cache_pipe path
-            lora_sha: Optional[str] = None,      # cache_pipe path
-        ) -> dict[str, Any]            # returns manifest dict incl. ckpt_shas
-
-    Pass the matching ``UpstreamPaths`` dataclass as the second arg
-    (typically ``inference_smoke.UpstreamPaths``); the adapter
-    constructs ``UpstreamPaths(upstream_root=Path(ckpt_args["upstream"]))``
-    each call. The recipe_id is read via ``assert_recipe_pin`` (default
-    is the orchestrator's local helper which delegates to manifest_writer).
-
-    Subprocess adapter remains the operational default — Python API
-    is opt-in. The process boundary is an escape valve for deploy
-    issues (env divergence, partial OOM recovery, GPU-context leak)
-    where the in-process adapter would take down the orchestrator.
-
-    ``cache_pipe`` (False by default — backward compat): when True, the
-    adapter holds a single ``WanVideoPipeline`` across all calls,
-    skipping the ~95 GB ``build_pipeline`` reload that dominates wall
-    time when one process serves N>>1 prompts. Required for full
-    42-prompt heldout regen at modest world_size (e.g. world_size=8 →
-    10-11 calls/rank → 10-11×95 GB rebuilds without this flag).
-
-    With ``cache_pipe=True`` the caller MUST iterate mode-batched per
-    rank (all baselines first, then all trained) — DiffSynth does not
-    expose a clean LoRA detach path, so a baseline call after a trained
-    call requires a pipe rebuild. The orchestrator's ``--mode-batched``
-    flag enforces this.
-
-    ``build_pipeline`` overrides the default (lazy-imported from
-    ``inference_smoke``); pass an explicit callable in tests so the
-    cache path is exercisable without GPU / DiffSynth.
-    """
-    if assert_recipe_pin is None:
-        # Late-bound to module-level wrapper to avoid forward-reference at
-        # import time. The module-level helper itself shells through to
-        # manifest_writer.assert_recipe_pins.
-        _assert_recipe_pin = globals()["assert_recipe_pin"]
-    else:
-        _assert_recipe_pin = assert_recipe_pin
-
-    # Process-local cache of the built pipeline + LoRA attachment + sharded
-    # SHA hashes. Mutated in-place across calls when cache_pipe=True; ignored
-    # otherwise. Keyed by (upstream_root, torch_dtype_name, device) — any
-    # mismatch across calls is a caller error and raises.
-    _state: dict[str, Any] = {
-        "pipe": None,
-        "lora_attached_path": None,
-        "upstream_root": None,
-        "torch_dtype_name": None,
-        "device": None,
-        "lora_sha": None,
-        "high_noise_sha": None,
-        "low_noise_sha": None,
-    }
-
-    def adapter(
-        run_kind: str,
-        prompt: str,
-        cond_image_path: str,
-        gen_config_bytes: bytes,
-        out_dir: pathlib.Path,
-        ckpt_args: dict,
-    ) -> dict:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        gen_cfg_path = out_dir / "gen_config.json"
-        gen_cfg_path.write_bytes(gen_config_bytes)
-        generation_config = json.loads(gen_config_bytes)
-
-        if "upstream" not in ckpt_args:
-            raise KeyError(
-                "python_api adapter requires ckpt_args['upstream'] "
-                "(canonical Wan2.2-I2V-A14B root)."
-            )
-        upstream_root = pathlib.Path(ckpt_args["upstream"])
-
-        if UpstreamPaths is None:
-            try:
-                from inference_smoke import UpstreamPaths as _UpstreamPaths  # type: ignore
-            except ImportError as exc:
-                raise ImportError(
-                    "python_api adapter needs the UpstreamPaths dataclass either passed "
-                    "explicitly or importable from inference_smoke; got: "
-                    f"{exc!r}"
-                ) from exc
-            upstream = _UpstreamPaths(upstream_root=upstream_root)
-        else:
-            upstream = UpstreamPaths(upstream_root=upstream_root)
-
-        # Resolve recipe_id (16-char pin string) from recipe_yaml override
-        # or default canonical layout under <orchestrator-pkg>/recipes/.
-        recipes_dir = (
-            pathlib.Path(ckpt_args["recipe_yaml"]).parent
-            if "recipe_yaml" in ckpt_args
-            else DPO_ROOT / "recipes"
-        )
-        recipe_id = _assert_recipe_pin(recipes_dir)
-
-        # torch_dtype + device: import lazily so the orchestrator's CPU-only
-        # paths (subprocess + dry_run) don't need torch loaded.
-        import torch  # type: ignore
-        dtype_name = generation_config.get("dtype", "bf16")
-        torch_dtype = {
-            "bf16": torch.bfloat16,
-            "bfloat16": torch.bfloat16,
-            "fp16": torch.float16,
-            "float16": torch.float16,
-            "fp32": torch.float32,
-            "float32": torch.float32,
-        }.get(dtype_name, torch.bfloat16)
-        device = ckpt_args.get("device", "cuda")
-
-        lora_adapter_path: Optional[pathlib.Path]
-        if run_kind == "baseline":
-            lora_adapter_path = None
-        elif run_kind == "trained":
-            if "trained_lora" not in ckpt_args:
-                raise KeyError(
-                    "trained run requires ckpt_args['trained_lora'] "
-                    "(LoRA safetensors path)."
-                )
-            lora_adapter_path = pathlib.Path(ckpt_args["trained_lora"])
-        else:
-            raise ValueError(f"unknown run_kind: {run_kind!r}")
-
-        compute_envelope = ckpt_args.get("compute_envelope", "single_gpu")
-
-        # Cache path: pre-build the pipe on first call, validate state
-        # consistency on subsequent calls, and decide whether to skip the
-        # LoRA attach inside run_one_sample.
-        pipe_kwargs: dict[str, Any] = {}
-        if cache_pipe:
-            # Validate (upstream_root, torch_dtype, device) stable across
-            # calls; mismatch signals an orchestrator error.
-            if _state["pipe"] is not None:
-                if _state["upstream_root"] != upstream_root:
-                    raise RuntimeError(
-                        "cached pipe was built for upstream_root "
-                        f"{_state['upstream_root']}; got {upstream_root} "
-                        "on later call. Rebuild required."
-                    )
-                if _state["torch_dtype_name"] != dtype_name:
-                    raise RuntimeError(
-                        f"cached pipe torch_dtype was {_state['torch_dtype_name']}; "
-                        f"got {dtype_name} on later call. Rebuild required."
-                    )
-                if _state["device"] != device:
-                    raise RuntimeError(
-                        f"cached pipe device was {_state['device']}; "
-                        f"got {device} on later call. Rebuild required."
-                    )
-            else:
-                # First call: build pipe up-front so the adapter (not
-                # run_one_sample) owns the cached reference.
-                if build_pipeline is None:
-                    try:
-                        from inference_smoke import build_pipeline as _build_pipeline  # type: ignore
-                    except ImportError as exc:
-                        raise ImportError(
-                            "cache_pipe=True requires inference_smoke.build_pipeline "
-                            "importable from PYTHONPATH; got: " f"{exc!r}"
-                        ) from exc
-                else:
-                    _build_pipeline = build_pipeline
-                print(
-                    f"[python_api_adapter] cache_pipe=True: building shared pipeline "
-                    f"once (upstream={upstream_root}, dtype={dtype_name}, device={device})",
-                    flush=True,
-                )
-                _state["pipe"] = _build_pipeline(
-                    upstream, torch_dtype=torch_dtype, device=device
-                )
-                _state["upstream_root"] = upstream_root
-                _state["torch_dtype_name"] = dtype_name
-                _state["device"] = device
-
-            # LoRA state management (no detach path in DiffSynth → caller
-            # MUST iterate mode-batched: all baselines, then all trained).
-            if run_kind == "baseline":
-                if _state["lora_attached_path"] is not None:
-                    raise RuntimeError(
-                        "cached pipe has LoRA "
-                        f"{_state['lora_attached_path']} attached; baseline "
-                        "run after trained run requires pipe rebuild because "
-                        "DiffSynth does not expose a clean detach. Iterate "
-                        "mode-batched (all baselines first, then all trained) "
-                        "via the orchestrator's --mode-batched flag."
-                    )
-                lora_already_attached = False
-            else:  # trained
-                attached = _state["lora_attached_path"]
-                if attached is not None and attached != lora_adapter_path:
-                    raise RuntimeError(
-                        f"cached pipe has LoRA {attached} attached; trained "
-                        f"run requested {lora_adapter_path}. Different LoRA "
-                        "paths within the same cached session require pipe "
-                        "rebuild (no detach support)."
-                    )
-                lora_already_attached = (attached == lora_adapter_path)
-
-            pipe_kwargs["pipe"] = _state["pipe"]
-            pipe_kwargs["lora_already_attached"] = lora_already_attached
-            if lora_already_attached and _state.get("lora_sha"):
-                pipe_kwargs["lora_sha"] = _state["lora_sha"]
-            if _state.get("high_noise_sha"):
-                pipe_kwargs["high_noise_sha"] = _state["high_noise_sha"]
-            if _state.get("low_noise_sha"):
-                pipe_kwargs["low_noise_sha"] = _state["low_noise_sha"]
-
-        t0 = time.time()
-        result = run_one_sample(
-            mode=run_kind,
-            out_dir=out_dir,
-            upstream=upstream,
-            torch_dtype=torch_dtype,
-            device=device,
-            prompt=prompt,
-            cond_image_path=pathlib.Path(cond_image_path),
-            generation_config=generation_config,
-            generation_config_bytes=gen_config_bytes,
-            lora_adapter_path=lora_adapter_path,
-            compute_envelope=compute_envelope,
-            recipe_id=recipe_id,
-            **pipe_kwargs,
-        )
-        wall = time.time() - t0
-
-        # Update cached state from manifest shas + lora attach side-effects.
-        if cache_pipe:
-            shas = result.get("ckpt_shas") if isinstance(result, dict) else None
-            if isinstance(shas, dict):
-                if shas.get("high_noise_base_sha256"):
-                    _state["high_noise_sha"] = shas["high_noise_base_sha256"]
-                if shas.get("low_noise_frozen_sha256"):
-                    _state["low_noise_sha"] = shas["low_noise_frozen_sha256"]
-                if run_kind == "trained" and shas.get("lora_adapter_sha256"):
-                    _state["lora_sha"] = shas["lora_adapter_sha256"]
-            if run_kind == "trained":
-                _state["lora_attached_path"] = lora_adapter_path
-
-        return {
-            "run_kind": run_kind,
-            "out_dir": str(out_dir),
-            "wall_seconds": round(wall, 2),
-            "result": result,
-            "ckpt_shas": (result.get("ckpt_shas") if isinstance(result, dict) else None)
-                         or _extract_ckpt_shas(out_dir),
-        }
-
-    return adapter
-
-
 def dry_run_inference_adapter() -> InferenceAdapter:
     """No-op adapter for orchestration testing without GPU.
 
@@ -834,15 +554,10 @@ def regen_all(
 
     ``mode_batched`` (False by default): when True, iterate each rank's
     assigned prompts in two passes — all baselines first, then all
-    trained — instead of interleaving baseline+trained per prompt. This
-    is required when the adapter caches a single pipeline across calls
-    (``python_api_inference_adapter(..., cache_pipe=True)``) because
-    DiffSynth does not expose a clean LoRA detach path: a trained call
-    leaves LoRA attached on ``pipe.dit``, so the next baseline call on
-    the same pipe would silently include the trained-mode weights.
-    Mode-batched ordering means LoRA gets attached exactly once per rank
-    (between the baseline pass and the trained pass) and stays attached
-    for the entire trained pass.
+    trained — instead of interleaving baseline+trained per prompt.
+    Useful when the underlying adapter benefits from amortizing
+    per-mode setup (e.g. external pipeline cache + LoRA attach) across
+    a contiguous run of same-mode calls.
 
     Resume semantics under ``mode_batched``: the per-prompt summary
     (``prompt_manifest.json``) is written only when both modes complete,
@@ -942,32 +657,30 @@ def main() -> int:
                    help="Run output root; per-prompt dirs land under <out_dir>/heldout_regen/<prompt_id>/.")
     p.add_argument("--recipes-dir", type=pathlib.Path, default=DPO_ROOT / "recipes",
                    help="Path to the dpo_v0 recipes/ dir (defaults to alongside this file).")
-    p.add_argument("--inference-smoke-py", type=pathlib.Path, default=HERE / "inference_smoke.py",
-                   help="Path to rl5's inference_smoke.py (used by subprocess adapter).")
-    p.add_argument("--adapter", choices=["subprocess", "python_api", "dry_run"], default="subprocess",
-                   help="Inference adapter to use. 'subprocess' shells out to inference_smoke.py "
-                        "(default; deploy escape valve via process boundary). 'python_api' imports "
-                        "inference_smoke.run_one_sample and calls it in-process (rl5 lock 5e8993eb / "
-                        "ac00949). 'dry_run' is a no-op for orchestration testing without GPU.")
+    p.add_argument("--inference-smoke-py", type=pathlib.Path, default=None,
+                   help="Path to rl5's inference_smoke.py. REQUIRED with --adapter subprocess.")
+    p.add_argument("--adapter", choices=["subprocess", "dry_run"], default="subprocess",
+                   help="Inference adapter to use. 'subprocess' shells out to rl5's "
+                        "inference_smoke.py (operational default; clean process boundary). "
+                        "'dry_run' is a no-op for orchestration testing without GPU.")
     p.add_argument("--trained-lora", type=str, default=None,
                    help="Path to LoRA adapter safetensors from M3/M4. REQUIRED with "
-                        "--adapter subprocess|python_api. Passed as --lora-adapter to "
-                        "inference_smoke for the trained run; baseline run takes no adapter.")
+                        "--adapter subprocess. Passed as --lora-adapter to inference_smoke "
+                        "for the trained run; baseline run takes no adapter.")
     p.add_argument("--low-noise-ckpt", type=str, default=None,
                    help="Optional explicit path to frozen low-noise expert; if omitted, "
                         "inference_smoke defaults to <upstream>/low_noise_model/ "
                         "(canonical sharded layout, AC-7.3 SHA stamped either way).")
     p.add_argument("--upstream", type=str, default=None,
-                   help="Canonical Wan2.2-I2V-A14B root. REQUIRED with --adapter subprocess|"
-                        "python_api. Used to construct UpstreamPaths for the python_api adapter "
-                        "and passed as --upstream to inference_smoke's CLI.")
+                   help="Canonical Wan2.2-I2V-A14B root. REQUIRED with --adapter subprocess. "
+                        "Passed as --upstream to inference_smoke's CLI.")
     p.add_argument("--recipe-yaml", type=str, default=None,
                    help="Optional recipe YAML override. Default = orchestrator-local "
                         "humanize/dpo_v0/recipes/wan22_i2v_a14b__round2_v0.yaml. "
                         "Passed as --recipe-yaml to inference_smoke.")
     p.add_argument("--device", type=str, default="cuda",
-                   help="Device for python_api adapter (passed to run_one_sample). "
-                        "Subprocess adapter relies on inference_smoke's --device.")
+                   help="Device tag stamped into ckpt_args. Subprocess adapter relies on "
+                        "inference_smoke's own --device.")
     p.add_argument("--seed", type=int, default=42,
                    help="Generation seed (byte-identical between baseline and trained).")
     p.add_argument("--sampler", type=str, default="uni_pc",
@@ -995,21 +708,9 @@ def main() -> int:
                         "sharding (sharding is index-mod-world_size on top).")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
-    p.add_argument("--cache-pipe", action="store_true",
-                   help="python_api adapter only: build the WanVideoPipeline (~95 GB) "
-                        "ONCE per rank-process and reuse it across all assigned prompts. "
-                        "Without this, each (prompt, mode) call rebuilds the pipeline — "
-                        "fine for round-2 M6 (16 ranks × 1 call/rank) but blows up for "
-                        "full 42-prompt × world_size=8 (10-11 calls/rank). Implies "
-                        "--mode-batched (DiffSynth has no LoRA detach path; trained run "
-                        "after baseline run requires LoRA attached, then it cannot be "
-                        "removed without rebuilding pipe).")
     p.add_argument("--mode-batched", action="store_true",
                    help="Per rank, run all baseline prompts first, then all trained "
-                        "prompts. Required when --cache-pipe is set; safe to enable "
-                        "without it (only changes call ordering, not byte-equality). "
-                        "Mode-batched ordering means LoRA attaches exactly once per rank "
-                        "(between baseline pass and trained pass).")
+                        "prompts. Only changes call ordering, not byte-equality.")
     p.add_argument("--rank", type=int, default=int(os.environ.get("RANK", "0")))
     p.add_argument("--world-size", type=int, default=int(os.environ.get("WORLD_SIZE", "1")))
     p.add_argument("--compute-envelope",
@@ -1021,16 +722,17 @@ def main() -> int:
                         "'multi_gpu_inference_seed_parallel' (DEC-6 i2v.md L76).")
     args = p.parse_args()
 
-    if args.adapter in ("subprocess", "python_api"):
+    if args.adapter == "subprocess":
         missing = []
         if args.upstream is None:
             missing.append("--upstream")
         if args.trained_lora is None:
             missing.append("--trained-lora")
+        if args.inference_smoke_py is None:
+            missing.append("--inference-smoke-py")
         if missing:
             print(
-                f"[heldout_regen] {', '.join(missing)} required with --adapter "
-                f"{args.adapter} (per rl5 inference_smoke.py actual CLI / Python API).",
+                f"[heldout_regen] {', '.join(missing)} required with --adapter subprocess.",
                 file=sys.stderr,
             )
             return 2
@@ -1106,20 +808,6 @@ def main() -> int:
             )
             return 2
         adapter = subprocess_inference_adapter(args.inference_smoke_py)
-    elif args.adapter == "python_api":
-        # Lazy-import so subprocess + dry_run paths don't require inference_smoke
-        # to be importable (it depends on heavy GPU libs that the orchestrator
-        # itself doesn't need).
-        try:
-            from inference_smoke import run_one_sample  # type: ignore
-        except ImportError as exc:
-            print(
-                f"[heldout_regen] --adapter python_api requires inference_smoke.run_one_sample "
-                f"importable from PYTHONPATH. ImportError: {exc}",
-                file=sys.stderr,
-            )
-            return 2
-        adapter = python_api_inference_adapter(run_one_sample, cache_pipe=args.cache_pipe)
     else:
         adapter = dry_run_inference_adapter()
 
@@ -1153,23 +841,12 @@ def main() -> int:
         "ckpt_args": ckpt_args,
         "rank": args.rank,
         "world_size": args.world_size,
-        "cache_pipe": args.cache_pipe,
-        "mode_batched": args.mode_batched or args.cache_pipe,
+        "mode_batched": args.mode_batched,
         "manifest_writer_schema_version": _MANIFEST_WRITER_SCHEMA_VERSION,
     }
     _mw_atomic_write_json(run_dir / "run_manifest.pre.json", run_manifest_pre)
 
     # 7. orchestration loop
-    if args.cache_pipe and not args.mode_batched:
-        print(
-            "[heldout_regen] --cache-pipe implies --mode-batched (no DiffSynth LoRA "
-            "detach path); enabling mode-batched iteration.",
-            flush=True,
-        )
-        mode_batched = True
-    else:
-        mode_batched = args.mode_batched
-
     results = regen_all(
         selections=selections,
         gen_config_bytes=gen_config_bytes,
@@ -1179,7 +856,7 @@ def main() -> int:
         resume=not args.no_resume,
         rank=args.rank,
         world_size=args.world_size,
-        mode_batched=mode_batched,
+        mode_batched=args.mode_batched,
     )
 
     run_manifest_post = dict(run_manifest_pre)
