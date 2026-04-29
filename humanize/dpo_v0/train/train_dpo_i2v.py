@@ -42,6 +42,7 @@ import pathlib
 import re
 import sys
 import time
+from collections import deque
 from contextlib import nullcontext
 
 
@@ -981,6 +982,7 @@ def main():
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_single, num_workers=0)
 
     losses: list[float] = []
+    acc_window: deque[int] = deque(maxlen=50)
     step = 0
     wall_start = time.time()
 
@@ -1113,10 +1115,38 @@ def main():
                 if is_main:
                     print(f"[step {step}] DPO FAILURE: {e}", flush=True)
                 raise
-            optimizer.step()
+
+            # Grad norm + clip every step. Clipping is mandatory under r5's β=1000:
+            # naive grad scale is ~10000x r4, so unclipped step would diverge to NaN.
+            # FSDP shards params; sum local sum-of-squares then all-reduce -> sqrt = global L2.
+            sq = torch.zeros((), device=device, dtype=torch.float32)
+            for p in policy.parameters():
+                if p.requires_grad and p.grad is not None:
+                    sq = sq + p.grad.detach().float().pow(2).sum()
+            if is_distributed:
+                dist.all_reduce(sq, op=dist.ReduceOp.SUM)
+            grad_norm = float(sq.sqrt().item())
+
+            max_grad_norm = 1.0
+            grad_finite = math.isfinite(grad_norm)
+            if not grad_finite:
+                # +inf or NaN: clipping would propagate NaN (inf * 0 = NaN). Drop the step.
+                if is_main:
+                    print(f"[step {step}] SKIP optimizer.step: grad_norm={grad_norm} (non-finite)", flush=True)
+                optimizer.zero_grad()
+            elif grad_norm > max_grad_norm:
+                scale = max_grad_norm / (grad_norm + 1e-6)
+                for p in policy.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        p.grad.detach().mul_(scale)
+
+            if grad_finite:
+                optimizer.step()
 
             # loss_val computed scalar-style above (no autograd through loss)
             losses.append(loss_val)
+            acc_window.append(int(logit > 0.0))
+            acc_win = sum(acc_window) / len(acc_window)
 
             if is_main and step % args.log_every == 0:
                 elapsed = time.time() - wall_start
@@ -1124,20 +1154,42 @@ def main():
                 vram_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024**3
                 print(
                     f"[step {step}/{args.max_steps}] pair={pid[:8]} t_raw={t_raw} loss={loss_val:.4f} "
+                    f"gnorm={grad_norm:.3g} margin={logit:.3g} "
                     f"elapsed={elapsed:.1f}s vram_peak={vram_alloc_gb:.2f}GB reserved={vram_reserved_gb:.2f}GB",
                     flush=True,
                 )
                 if wandb_mod is not None:
+                    # DPO standard decomposition (log p ≈ -mse, const omitted; sign-equivalent):
+                    #   reward_chosen   = β·(log π_w − log π_ref_w) ≈ β·(mse_ref_w − mse_pi_w)
+                    #   reward_rejected = β·(log π_l − log π_ref_l) ≈ β·(mse_ref_l − mse_pi_l)
+                    #   margin          = reward_chosen − reward_rejected = logit
+                    # Healthy training: chosen ↑, rejected ↓, margin ↑, accuracy → 1.
+                    beta_v = float(args.beta)
+                    mse_pi_w_v = float(mse_pi_w_scalar.item())
+                    mse_pi_l_v = float(mse_pi_l_scalar.item())
+                    mse_ref_w_v = float(mse_ref_w.item())
+                    mse_ref_l_v = float(mse_ref_l.item())
+                    chosen_reward = beta_v * (mse_ref_w_v - mse_pi_w_v)
+                    rejected_reward = beta_v * (mse_ref_l_v - mse_pi_l_v)
                     try:
                         wandb_mod.log({
                             "loss": loss_val,
                             "t_raw": t_raw,
                             "logit": logit,
+                            "margin": logit,
                             "delta": float(delta_val.item()),
-                            "mse_pi_w": float(mse_pi_w_scalar.item()),
-                            "mse_pi_l": float(mse_pi_l_scalar.item()),
-                            "mse_ref_w": float(mse_ref_w.item()),
-                            "mse_ref_l": float(mse_ref_l.item()),
+                            "grad_norm": grad_norm,
+                            "grad_finite": 1.0 if grad_finite else 0.0,
+                            "chosen_logp": -mse_pi_w_v,
+                            "rejected_logp": -mse_pi_l_v,
+                            "chosen_reward": chosen_reward,
+                            "rejected_reward": rejected_reward,
+                            "accuracy": 1.0 if logit > 0 else 0.0,
+                            "acc_win50": acc_win,
+                            "mse_pi_w": mse_pi_w_v,
+                            "mse_pi_l": mse_pi_l_v,
+                            "mse_ref_w": mse_ref_w_v,
+                            "mse_ref_l": mse_ref_l_v,
                             "c_w": c_w,
                             "elapsed_s": elapsed,
                             "vram_peak_alloc_gb": vram_alloc_gb,
