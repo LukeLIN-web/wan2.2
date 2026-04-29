@@ -15,16 +15,16 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import sys
 
 import pytest
 
-from eval import heldout_regen
+HERE = pathlib.Path(__file__).resolve().parent
+PKG_ROOT = HERE.parent          # humanize/dpo_v0/
+sys.path.insert(0, str(PKG_ROOT))
+sys.path.insert(0, str(PKG_ROOT.parent.parent))  # videodpoWan
 
-
-class _StubSubprocessResult:
-    returncode = 0
-    stdout = ""
-    stderr = ""
+from eval import heldout_regen  # noqa: E402
 
 
 # ---------- fixtures ----------
@@ -42,8 +42,11 @@ def _build_heldout_fixture(tmp_path: pathlib.Path) -> pathlib.Path:
     group_idx = 0
     for p in range(heldout_regen.EXPECTED_HELDOUT_PROMPTS):
         prompt = f"prompt {p}: a thing happens"
-        # 35*6 + 7*5 = 210 + 35 = 245 (== EXPECTED_HELDOUT_GROUPS)
-        n_groups = 6 if p < 35 else 5
+        # Spread 245 groups across 42 prompts; 245/42 ≈ 5.83.
+        n_groups = 6 if p < (heldout_regen.EXPECTED_HELDOUT_GROUPS - 5 * heldout_regen.EXPECTED_HELDOUT_PROMPTS) else 5
+        # Adjust so total is exactly 245.
+        n_groups = 6 if p < 5 else 5  # 5*6 + 37*5 = 30 + 185 = 215; need 245
+        n_groups = 6 if p < 35 else 5  # 35*6 + 7*5 = 210 + 35 = 245 ✓
         for g in range(n_groups):
             group_id = f"g{group_idx:04d}"
             group_idx += 1
@@ -329,9 +332,14 @@ def test_subprocess_adapter_emits_locked_cli(tmp_path: pathlib.Path, monkeypatch
     """Verify the subprocess command shape matches rl5's locked inference_smoke.py CLI."""
     captured: dict = {}
 
+    class _StubResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
     def fake_run(cmd, capture_output, text, timeout):
         captured["cmd"] = list(cmd)
-        return _StubSubprocessResult()
+        return _StubResult()
 
     monkeypatch.setattr(heldout_regen.subprocess, "run", fake_run)
 
@@ -378,11 +386,15 @@ def test_subprocess_adapter_emits_locked_cli(tmp_path: pathlib.Path, monkeypatch
 def test_subprocess_adapter_trained_mode(tmp_path: pathlib.Path, monkeypatch):
     captured: dict = {}
 
-    def fake_run(cmd, capture_output, text, timeout):
-        captured["cmd"] = list(cmd)
-        return _StubSubprocessResult()
+    class _StubResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
 
-    monkeypatch.setattr(heldout_regen.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        heldout_regen.subprocess, "run",
+        lambda cmd, capture_output, text, timeout: (captured.update({"cmd": list(cmd)}) or _StubResult()),
+    )
 
     fake_inference = tmp_path / "inference_smoke.py"
     fake_inference.write_text("# stub")
@@ -407,6 +419,211 @@ def test_subprocess_adapter_trained_mode(tmp_path: pathlib.Path, monkeypatch):
     assert "--lora-adapter" in cmd and cmd[cmd.index("--lora-adapter") + 1] == "/ckpt/lora.safetensors"
     assert "--baseline_ckpt" not in cmd
     assert "--trained_lora" not in cmd
+
+
+def test_python_api_adapter_signature_matches_rl5_actual(tmp_path: pathlib.Path):
+    """The python_api adapter must call run_one_sample with the ACTUAL
+    signature in rl5's inference_smoke.py on rlcr/task-6 (rl1 caught the
+    spec/impl drift in #dpo:dac89b67 msg `04170e0b`):
+
+        mode, out_dir, upstream, torch_dtype, device, prompt, cond_image_path,
+        generation_config, generation_config_bytes, lora_adapter_path,
+        compute_envelope, recipe_id
+
+    The adapter constructs UpstreamPaths(upstream_root=...) from
+    ckpt_args["upstream"], resolves recipe_id via assert_recipe_pin, and
+    forwards torch.bfloat16 / "cuda" defaults.
+    """
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    captured: dict = {}
+
+    def fake_run_one_sample(
+        *, mode, out_dir, upstream, torch_dtype, device, prompt, cond_image_path,
+        generation_config, generation_config_bytes, lora_adapter_path,
+        compute_envelope, recipe_id, high_noise_sha=None, low_noise_sha=None,
+    ):
+        captured.update(
+            mode=mode, out_dir=out_dir, upstream=upstream,
+            torch_dtype=torch_dtype, device=device,
+            prompt=prompt, cond_image_path=cond_image_path,
+            generation_config=generation_config,
+            generation_config_bytes=generation_config_bytes,
+            lora_adapter_path=lora_adapter_path,
+            compute_envelope=compute_envelope,
+            recipe_id=recipe_id,
+        )
+        return {
+            "mode": mode,
+            "ckpt_shas": {
+                "high_noise_base_sha256": "h0",
+                "low_noise_frozen_sha256": "l0",
+                **({"lora_adapter_sha256": "la"} if mode == "trained" else {}),
+            },
+        }
+
+    # Stub assert_recipe_pin so test doesn't need a real recipe YAML on disk.
+    def fake_assert_recipe_pin(recipes_dir):
+        return "6bef6e104cdd3442"
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=fake_assert_recipe_pin,
+    )
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    out = adapter(
+        run_kind="trained",
+        prompt="a thing",
+        cond_image_path="/fake/img.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out",
+        ckpt_args={
+            "trained_lora": "/ckpt/lora.safetensors",
+            "low_noise_ckpt": "/ckpt/low.safetensors",
+            "upstream": "/data/Wan2.2-I2V-A14B",
+            "recipe_yaml": "/recipes/r.yaml",
+            "compute_envelope": "multi_gpu_inference_seed_parallel",
+            "device": "cuda",
+        },
+    )
+    # Signature contract assertions
+    assert captured["mode"] == "trained"
+    assert captured["prompt"] == "a thing"
+    # Path conversion: cond_image_path str → pathlib.Path
+    assert isinstance(captured["cond_image_path"], pathlib.Path)
+    assert str(captured["cond_image_path"]) == "/fake/img.png"
+    # generation_config dict + generation_config_bytes paired
+    assert captured["generation_config"]["seed"] == 11
+    assert captured["generation_config_bytes"] == cfg_bytes
+    # UpstreamPaths constructed with Path
+    assert isinstance(captured["upstream"], FakeUpstreamPaths)
+    assert captured["upstream"].upstream_root == pathlib.Path("/data/Wan2.2-I2V-A14B")
+    # lora_adapter_path is Path for trained, None for baseline
+    assert captured["lora_adapter_path"] == pathlib.Path("/ckpt/lora.safetensors")
+    assert captured["compute_envelope"] == "multi_gpu_inference_seed_parallel"
+    assert captured["recipe_id"] == "6bef6e104cdd3442"
+    assert captured["device"] == "cuda"
+    # torch_dtype resolved from gen_config dtype string
+    import torch
+    assert captured["torch_dtype"] is torch.bfloat16
+    # ckpt_shas propagated from inner result
+    assert out["ckpt_shas"] == {
+        "high_noise_base_sha256": "h0",
+        "low_noise_frozen_sha256": "l0",
+        "lora_adapter_sha256": "la",
+    }
+
+
+def test_python_api_adapter_against_inference_smoke_real_signature():
+    """Cross-module signature integration test (BL-20260428-mock-not-import-
+    catches-spec-drift): verify the adapter passes EXACTLY the kwargs
+    rl5's actual ``run_one_sample`` accepts.
+
+    Uses ``inspect.signature`` on the real import — no GPU exec, no
+    diffsynth dependency, no torch model load. If a future commit
+    renames a kwarg or drops a parameter on either side, this test
+    flags it at test-time instead of M6-launch-time. The mock-only
+    ``test_python_api_adapter_signature_matches_rl5_actual`` above
+    encodes the orchestrator's call kwargs; this test verifies they
+    match the callee's actual parameter set.
+    """
+    import inspect
+    try:
+        from eval.inference_smoke import run_one_sample  # type: ignore
+    except ImportError as exc:
+        pytest.skip(f"inference_smoke not importable in this env: {exc}")
+
+    sig = inspect.signature(run_one_sample)
+    callee_param_names = set(sig.parameters.keys())
+
+    # Kwargs the orchestrator's python_api_inference_adapter passes
+    # (kept in sync with the adapter implementation manually — drift
+    # between this set and the adapter call site would make the
+    # adapter pass an undefined kwarg).
+    adapter_kwargs = {
+        "mode",
+        "out_dir",
+        "upstream",
+        "torch_dtype",
+        "device",
+        "prompt",
+        "cond_image_path",
+        "generation_config",
+        "generation_config_bytes",
+        "lora_adapter_path",
+        "compute_envelope",
+        "recipe_id",
+    }
+
+    missing_in_callee = adapter_kwargs - callee_param_names
+    assert not missing_in_callee, (
+        f"orchestrator passes kwargs that don't exist in run_one_sample: "
+        f"{sorted(missing_in_callee)}. signature drift between "
+        f"heldout_regen.python_api_inference_adapter and "
+        f"inference_smoke.run_one_sample. expected callee params: "
+        f"{sorted(callee_param_names)}"
+    )
+
+    # Optional params on callee (e.g. high_noise_sha / low_noise_sha cache)
+    # are fine — adapter just doesn't use them. Required params on callee
+    # that adapter DOESN'T pass would TypeError at call time:
+    callee_required = {
+        name for name, param in sig.parameters.items()
+        if param.default is inspect.Parameter.empty
+        and param.kind not in (inspect.Parameter.VAR_POSITIONAL,
+                               inspect.Parameter.VAR_KEYWORD)
+    }
+    missing_in_adapter = callee_required - adapter_kwargs
+    assert not missing_in_adapter, (
+        f"run_one_sample requires kwargs the adapter doesn't pass: "
+        f"{sorted(missing_in_adapter)}. signature drift in the other "
+        f"direction. orchestrator passes: {sorted(adapter_kwargs)}"
+    )
+
+
+def test_python_api_adapter_baseline_passes_none_lora(tmp_path: pathlib.Path):
+    """Baseline mode must pass lora_adapter_path=None to run_one_sample."""
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    captured: dict = {}
+
+    def fake_run_one_sample(*, mode, lora_adapter_path, **kw):
+        captured["mode"] = mode
+        captured["lora_adapter_path"] = lora_adapter_path
+        return {"mode": mode, "ckpt_shas": {"high_noise_base_sha256": "x"}}
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=lambda d: "6bef6e104cdd3442",
+    )
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    adapter(
+        run_kind="baseline",
+        prompt="x",
+        cond_image_path="/fake.png",
+        gen_config_bytes=cfg_bytes,
+        out_dir=tmp_path / "out_baseline",
+        ckpt_args={
+            "trained_lora": "/ckpt/lora.safetensors",  # ignored in baseline
+            "upstream": "/data/Wan2.2-I2V-A14B",
+        },
+    )
+    assert captured["mode"] == "baseline"
+    assert captured["lora_adapter_path"] is None
 
 
 def test_subprocess_adapter_requires_upstream(tmp_path: pathlib.Path):
@@ -488,6 +705,11 @@ def test_subprocess_adapter_propagates_ckpt_shas(tmp_path: pathlib.Path, monkeyp
     """When inference_smoke writes manifest.json with ckpt_shas, adapter surfaces it."""
     captured: dict = {}
 
+    class _StubResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
     def fake_run(cmd, capture_output, text, timeout):
         captured["cmd"] = list(cmd)
         # Simulate inference_smoke dropping a manifest with ckpt_shas in out_dir.
@@ -500,7 +722,7 @@ def test_subprocess_adapter_propagates_ckpt_shas(tmp_path: pathlib.Path, monkeyp
                 "low_noise_frozen_sha256": "bbbbb",
             },
         }))
-        return _StubSubprocessResult()
+        return _StubResult()
 
     monkeypatch.setattr(heldout_regen.subprocess, "run", fake_run)
 
@@ -600,11 +822,215 @@ def test_recipe_pin_passes_when_consistent(tmp_path: pathlib.Path):
     assert got == expected
 
 
-# ---------- mode-batched orchestration ----------
+# ---------- pipe-cache + mode-batched (round-4 N>>1 calls/rank) ----------
+
+
+import dataclasses
+
+
+def _build_pipe_cache_adapter(captured: list[dict]):
+    """Build a python_api adapter wired to fake build_pipeline + run_one_sample.
+
+    ``captured`` is appended one record per run_one_sample call so tests can
+    assert the (pipe-identity, lora_already_attached, lora_sha) wiring.
+    """
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    class FakePipe:
+        """Sentinel returned by build_pipeline; identity-tracked across calls."""
+
+        _next = 0
+
+        def __init__(self):
+            FakePipe._next += 1
+            self.id = FakePipe._next
+
+    build_count = {"n": 0}
+
+    def fake_build_pipeline(upstream, *, torch_dtype, device):
+        build_count["n"] += 1
+        return FakePipe()
+
+    def fake_run_one_sample(
+        *,
+        mode,
+        out_dir,
+        upstream,
+        torch_dtype,
+        device,
+        prompt,
+        cond_image_path,
+        generation_config,
+        generation_config_bytes,
+        lora_adapter_path,
+        compute_envelope,
+        recipe_id,
+        high_noise_sha=None,
+        low_noise_sha=None,
+        pipe=None,
+        lora_already_attached=False,
+        lora_sha=None,
+    ):
+        captured.append({
+            "mode": mode,
+            "prompt": prompt,
+            "pipe_id": pipe.id if pipe is not None else None,
+            "lora_already_attached": lora_already_attached,
+            "lora_sha_param": lora_sha,
+            "lora_adapter_path": lora_adapter_path,
+            "high_noise_sha": high_noise_sha,
+        })
+        return {
+            "mode": mode,
+            "ckpt_shas": {
+                "high_noise_base_sha256": "h0",
+                "low_noise_frozen_sha256": "l0",
+                **({"lora_adapter_sha256": "la"} if mode == "trained" else {}),
+            },
+        }
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=lambda rd: "6bef6e104cdd3442",
+        cache_pipe=True,
+        build_pipeline=fake_build_pipeline,
+    )
+    return adapter, build_count, FakePipe
+
+
+def _ckpt_args_for_pipe_cache():
+    return {
+        "trained_lora": "/ckpt/lora.safetensors",
+        "upstream": "/data/Wan2.2-I2V-A14B",
+        "recipe_yaml": "/recipes/r.yaml",
+        "compute_envelope": "multi_gpu_inference_seed_parallel",
+        "device": "cuda",
+    }
+
+
+def test_python_api_cache_pipe_builds_once_across_calls(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, build_count, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    # 5 baselines, then 5 trained — mode-batched order required by cache.
+    for i in range(5):
+        adapter("baseline", f"prompt {i}", "/img.png", cfg_bytes,
+                tmp_path / f"b{i}", ckpt_args)
+    for i in range(5):
+        adapter("trained", f"prompt {i}", "/img.png", cfg_bytes,
+                tmp_path / f"t{i}", ckpt_args)
+
+    # Single build_pipeline across all 10 calls (the whole point).
+    assert build_count["n"] == 1, f"expected 1 build, got {build_count['n']}"
+    # All 10 calls saw the same pipe identity.
+    pipe_ids = {c["pipe_id"] for c in captured}
+    assert pipe_ids == {1}
+    # Baseline calls: lora_already_attached=False
+    assert all(c["lora_already_attached"] is False for c in captured if c["mode"] == "baseline")
+    # First trained call: not yet attached → lora_already_attached=False
+    trained = [c for c in captured if c["mode"] == "trained"]
+    assert trained[0]["lora_already_attached"] is False
+    # Subsequent trained calls reuse: lora_already_attached=True + cached lora_sha
+    for t in trained[1:]:
+        assert t["lora_already_attached"] is True
+        assert t["lora_sha_param"] == "la"
+    # Sharded SHAs cached after first call (passed to run_one_sample on subsequent).
+    assert captured[0]["high_noise_sha"] is None
+    assert all(c["high_noise_sha"] == "h0" for c in captured[1:])
+
+
+def test_python_api_cache_pipe_rejects_baseline_after_trained(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, _, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    adapter("baseline", "p0", "/img.png", cfg_bytes, tmp_path / "b0", ckpt_args)
+    adapter("trained", "p0", "/img.png", cfg_bytes, tmp_path / "t0", ckpt_args)
+    with pytest.raises(RuntimeError, match="baseline run after trained"):
+        adapter("baseline", "p1", "/img.png", cfg_bytes, tmp_path / "b1", ckpt_args)
+
+
+def test_python_api_cache_pipe_rejects_different_lora_paths(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, _, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    adapter("trained", "p0", "/img.png", cfg_bytes, tmp_path / "t0", ckpt_args)
+    ckpt_args2 = dict(ckpt_args)
+    ckpt_args2["trained_lora"] = "/ckpt/other.safetensors"
+    with pytest.raises(RuntimeError, match="Different LoRA paths"):
+        adapter("trained", "p1", "/img.png", cfg_bytes, tmp_path / "t1", ckpt_args2)
+
+
+def test_python_api_cache_pipe_rejects_upstream_change(tmp_path: pathlib.Path):
+    captured: list[dict] = []
+    adapter, _, _ = _build_pipe_cache_adapter(captured)
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    ckpt_args = _ckpt_args_for_pipe_cache()
+
+    adapter("baseline", "p0", "/img.png", cfg_bytes, tmp_path / "b0", ckpt_args)
+    ckpt_args2 = dict(ckpt_args)
+    ckpt_args2["upstream"] = "/data/different/Wan2.2"
+    with pytest.raises(RuntimeError, match="upstream_root"):
+        adapter("baseline", "p1", "/img.png", cfg_bytes, tmp_path / "b1", ckpt_args2)
+
+
+def test_python_api_no_cache_pipe_omits_pipe_kwarg(tmp_path: pathlib.Path):
+    """Backward compat: when cache_pipe=False, run_one_sample receives no
+    pipe= kwarg (so it builds its own pipeline as before)."""
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeUpstreamPaths:
+        upstream_root: pathlib.Path
+
+    captured: dict = {}
+
+    def fake_run_one_sample(
+        *, mode, out_dir, upstream, torch_dtype, device, prompt, cond_image_path,
+        generation_config, generation_config_bytes, lora_adapter_path,
+        compute_envelope, recipe_id, high_noise_sha=None, low_noise_sha=None,
+        **extras,
+    ):
+        captured["extras"] = extras
+        return {"mode": mode, "ckpt_shas": {}}
+
+    adapter = heldout_regen.python_api_inference_adapter(
+        fake_run_one_sample,
+        UpstreamPaths=FakeUpstreamPaths,
+        assert_recipe_pin=lambda rd: "6bef6e104cdd3442",
+        # cache_pipe defaults to False
+    )
+    cfg_bytes = heldout_regen.serialize_generation_config(
+        heldout_regen.canonical_generation_config(seed=11)
+    )
+    adapter("baseline", "p0", "/img.png", cfg_bytes, tmp_path / "b0",
+            _ckpt_args_for_pipe_cache())
+    # No pipe / lora_already_attached / lora_sha kwargs leaked through.
+    assert captured["extras"] == {}
 
 
 def test_regen_all_mode_batched_runs_baselines_first(tmp_path: pathlib.Path):
-    """With --mode-batched, per rank: all baselines first, then all trained."""
+    """With --mode-batched, per rank: all baselines first, then all trained.
+
+    Verifies the call order at the adapter boundary so cache_pipe + LoRA
+    state machine is fed the right sequence.
+    """
     root = _build_heldout_fixture(tmp_path)
     selections = heldout_regen.select_canonical_groups(
         heldout_regen.load_heldout_records(root),
@@ -701,3 +1127,80 @@ def test_regen_all_mode_batched_resumes_completed_prompts(tmp_path: pathlib.Path
     assert call_order == ["baseline", "baseline", "trained", "trained"]
     assert len(results) == 3
     assert any(r.get("resumed") is True for r in results)
+
+
+def test_run_one_sample_pipe_param_skips_build(tmp_path: pathlib.Path):
+    """When pipe=<sentinel> is passed, run_one_sample skips build_pipeline.
+
+    Inject fake ``diffsynth.utils.data`` into sys.modules before importing
+    inference_smoke so the test runs on hosts without DiffSynth installed
+    (the orchestrator dev box). The lazy ``from diffsynth.utils.data
+    import save_video`` inside run_one_sample picks up our fake.
+    """
+    import types
+    fake_du = types.ModuleType("diffsynth.utils.data")
+    fake_du.save_video = lambda video, path, fps=1, quality=5: pathlib.Path(path).write_bytes(b"\x00")
+    fake_u = types.ModuleType("diffsynth.utils")
+    fake_u.data = fake_du
+    fake_diffsynth = sys.modules.setdefault("diffsynth", types.ModuleType("diffsynth"))
+    sys.modules.setdefault("diffsynth.utils", fake_u)
+    sys.modules.setdefault("diffsynth.utils.data", fake_du)
+
+    inference_smoke = pytest.importorskip("inference_smoke")
+    torch = pytest.importorskip("torch")
+
+    class FakePipe:
+        def __call__(self, **kw):
+            class _V:
+                def cpu(self): return self
+            return _V()
+
+    build_called = {"n": 0}
+    attach_called = {"n": 0}
+
+    def fake_build_pipeline(upstream, *, torch_dtype, device):
+        build_called["n"] += 1
+        return FakePipe()
+
+    def fake_attach_lora(pipe, lora_path):
+        attach_called["n"] += 1
+
+    import unittest.mock as mock
+    with mock.patch.object(inference_smoke, "build_pipeline", fake_build_pipeline), \
+         mock.patch.object(inference_smoke, "attach_lora", fake_attach_lora), \
+         mock.patch.object(inference_smoke, "sharded_ckpt_sha", lambda paths: "z" * 64), \
+         mock.patch.object(inference_smoke, "file_sha256", lambda p: "f" * 64):
+        cfg = inference_smoke.build_generation_config(
+            type("A", (), dict(
+                seed=1, num_inference_steps=1, cfg_scale=1.0, negative_prompt="",
+                height=64, width=64, num_frames=1, fps=1,
+                torch_dtype="bf16", switch_DiT_boundary=875,
+            ))()
+        )
+        cfg_bytes = inference_smoke.serialize_generation_config(cfg)
+
+        cached_pipe = FakePipe()
+        upstream = inference_smoke.UpstreamPaths(upstream_root=tmp_path / "wan")
+        cond = tmp_path / "cond.png"
+        from PIL import Image
+        Image.new("RGB", (64, 64)).save(cond)
+
+        manifest = inference_smoke.run_one_sample(
+            mode="baseline",
+            out_dir=tmp_path / "out",
+            upstream=upstream,
+            torch_dtype=torch.bfloat16,
+            device="cpu",
+            prompt="a thing",
+            cond_image_path=cond,
+            generation_config=cfg,
+            generation_config_bytes=cfg_bytes,
+            lora_adapter_path=None,
+            compute_envelope="single_gpu",
+            recipe_id="6bef6e104cdd3442",
+            pipe=cached_pipe,
+        )
+
+    assert build_called["n"] == 0, "build_pipeline must be skipped when pipe= is passed"
+    assert attach_called["n"] == 0
+    assert manifest["mode"] == "baseline"
