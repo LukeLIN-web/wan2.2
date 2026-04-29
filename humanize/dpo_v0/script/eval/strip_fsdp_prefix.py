@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Strip ``_fsdp_wrapped_module.`` prefix segments from a LoRA safetensors.
-
-Round-4 v3 intermediate ckpts (lora_step{50,100,150}.safetensors) were saved
-before commit 2d44f08 landed the trainer-side strip in collect_lora_state, so
-they carry FSDP-wrapped key names that DiffSynth's pipe.load_lora silently
-no-ops on. This is the inference-side workaround that round4_v3_phyjudge.md
-references; round-5+ ckpts won't need it.
-
-Usage: strip_fsdp_prefix.py --src <raw>.safetensors --dst <stripped>.safetensors
-"""
+"""Strip ``_fsdp_wrapped_module.`` prefix segments from a LoRA safetensors."""
 
 from __future__ import annotations
 

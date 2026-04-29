@@ -9,7 +9,7 @@ resolve_wandb
 cd "$DPO_DIR"
 
 expect_recipe="6bef6e104cdd3442"
-expect_train_cfg="e4643cd25b1e33ee"
+expect_train_cfg="2ae586e493a169d7"
 expect_pair_ids="cf5d3e5fd528a3e0"
 verify_pins "$expect_recipe" "$expect_train_cfg" "$expect_pair_ids" \
   "$DPO_DIR/recipes/training_config_round4_lr1e5_beta30_sha256_pin"

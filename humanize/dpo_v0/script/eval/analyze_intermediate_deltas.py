@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
-"""Compare step50 / step100 / step150 trained PhyJudge scores against the v3
-final-ckpt baseline scores, per axis, with paired delta + sign-test p-values.
-
-Reads:
-  --baseline-results PATH        v3 full-eval results.jsonl (84 records:
-                                 42 baseline + 42 trained). Only baseline rows
-                                 are used here.
-  --run-root PATH                v3_intermediate_<ts> root produced by
-                                 launch_v3_intermediate_regen.sh + scored by
-                                 launch_v3_intermediate_score.sh. Per-step
-                                 trained results.jsonl is auto-discovered at
-                                 <run-root>/scores/step<N>/<ts>/results.jsonl
-                                 (newest wins).
-  --steps "50 100 150"           which step ids to compare
-  --axes "SA PTV persistence inertia momentum"
-
-Mapping: each row's video path is parsed for its prompt_id directory segment
-(`heldout_regen/<prompt_id>/{baseline,trained}/...`); rows are paired by
-prompt_id. Baseline rows are filtered to mode=baseline by path inspection.
-
-Output: per-step Markdown table with mean Δ, +wins / −losses / =ties counts,
-and 2-tailed exact-binomial sign-test p (excluding ties), plus a JSON dump.
-"""
+"""Per-step PhyJudge paired-delta vs the v3 baseline (mean Δ + sign-test p)."""
 
 from __future__ import annotations
 
@@ -40,11 +18,7 @@ PROMPT_RE = re.compile(r"/heldout_regen/([0-9a-f]{12})/(baseline|trained)/")
 
 
 def _exact_binomial_two_tailed(k: int, n: int, p: float = 0.5) -> float:
-    """Exact two-tailed p-value for k successes in n trials at H0 prob=p.
-
-    Method: sum the probabilities of all outcomes whose pmf <= pmf(k);
-    handles ties at the observed pmf consistently with scipy's binom_test.
-    """
+    """Exact two-tailed p-value: sum pmf(i) for all i with pmf(i) <= pmf(k)."""
     if n == 0:
         return 1.0
 
@@ -55,8 +29,9 @@ def _exact_binomial_two_tailed(k: int, n: int, p: float = 0.5) -> float:
     eps = 1e-12
     total = 0.0
     for i in range(0, n + 1):
-        if _pmf(i) <= obs + eps:
-            total += _pmf(i)
+        pi = _pmf(i)
+        if pi <= obs + eps:
+            total += pi
     return min(1.0, total)
 
 
@@ -68,25 +43,16 @@ def _extract_prompt_and_mode(video_or_run_id: str) -> tuple[str, str] | None:
 
 
 def _row_axis_score(row: dict, axis: str) -> float | None:
-    """Pull a numeric score for an axis from a results.jsonl row.
-
-    The scorer shape is one of:
-      * row[axis] = {"score": 3, ...}
-      * row["scores"] = {axis: {"score": 3, ...} | 3}
-      * row[axis] = 3  (fallback)
-    """
-    cand = row.get(axis)
-    if cand is None and isinstance(row.get("scores"), dict):
-        cand = row["scores"].get(axis)
-    if isinstance(cand, dict):
-        cand = cand.get("score")
+    scores = row.get("scores")
+    if not isinstance(scores, dict):
+        return None
+    entry = scores.get(axis)
+    raw = entry.get("score") if isinstance(entry, dict) else None
     try:
-        out = float(cand)
+        out = float(raw)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(out):
-        return None
-    return out
+    return out if math.isfinite(out) else None
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -106,15 +72,16 @@ def _index_by_prompt(
 ) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for r in rows:
-        for key in ("video", "video_path", "run_id"):
-            if key in r and isinstance(r[key], str):
-                pm = _extract_prompt_and_mode(r[key])
-                if pm is not None:
-                    pid, mode = pm
-                    if want_mode is not None and mode != want_mode:
-                        break
-                    out[pid] = r
-                    break
+        video = r.get("video")
+        if not isinstance(video, str):
+            continue
+        pm = _extract_prompt_and_mode(video)
+        if pm is None:
+            continue
+        pid, mode = pm
+        if want_mode is not None and mode != want_mode:
+            continue
+        out[pid] = r
     return out
 
 
@@ -202,11 +169,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--baseline-results", type=Path, required=True,
                    help="v3 full-eval results.jsonl (baseline rows are filtered).")
-    p.add_argument("--run-root", type=Path, required=True,
-                   help="v3_intermediate_<ts> root mirrored on the score box.")
-    p.add_argument("--steps", default="50 100 150",
-                   help="space-separated step ids")
-    p.add_argument("--axes", default="SA PTV persistence inertia momentum")
+    p.add_argument("--run-root", type=Path, required=True)
+    p.add_argument("--steps", nargs="+", default=["50", "100", "150"])
+    p.add_argument("--axes", nargs="+",
+                   default=["SA", "PTV", "persistence", "inertia", "momentum"])
     p.add_argument("--out-md", type=Path, default=None)
     p.add_argument("--out-json", type=Path, default=None)
     args = p.parse_args()
@@ -218,8 +184,8 @@ def main() -> int:
         print(f"FATAL: run root not found: {args.run_root}", file=sys.stderr)
         return 2
 
-    axes = args.axes.split()
-    steps = args.steps.split()
+    axes = args.axes
+    steps = args.steps
 
     baseline_rows = _read_jsonl(args.baseline_results)
     baseline_by_prompt = _index_by_prompt(baseline_rows, want_mode="baseline")

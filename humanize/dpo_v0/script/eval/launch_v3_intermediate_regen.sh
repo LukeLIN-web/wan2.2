@@ -1,23 +1,4 @@
 #!/usr/bin/env bash
-# Round-4 v3 intermediate-step heldout regen (juyi-videorl, 8-rank).
-#
-# Generates 42 trained heldout videos for each of step50 / step100 / step150
-# from the v3 training run (ckpts/20260429T023311Z/), reusing the v3 final-ckpt
-# baseline videos via --baseline-from. Goal: locate the inflection step where
-# pair-pref has converged but PhyJudge degradation hasn't kicked in yet, so
-# round-5 can early-stop instead of paying for a full re-train at lower β/rank.
-#
-# Per-step wall ~75 min trained-only on 8-rank (~14 min/video / 8 ranks * 42
-# prompts + 1 build + 1 attach). 3 steps serial ≈ 4h.
-#
-# Env overrides (all optional unless noted):
-#   CKPT_ROOT      v3 training run dir (default: $REPO_ROOT/.../ckpts/20260429T023311Z)
-#   BASELINE_FROM  prior heldout_regen run dir whose 42 baselines should be reused
-#   OUT_ROOT       per-step output root (default: ~/gen_out/v3_intermediate_<ts>)
-#   STEPS_TO_EVAL space-separated step ids (default: "50 100 150")
-#   T0_T3_ROOT     T0_T3_root path on this box (default: $HOME/T0_T3_root)
-#   UPSTREAM       canonical Wan2.2-I2V-A14B root (default: $HOME/Wan2.2-I2V-A14B)
-
 set -euo pipefail
 # shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
@@ -78,4 +59,3 @@ for STEP in $STEPS_TO_EVAL; do
 done
 
 echo "[done] all steps regen complete -> $OUT_ROOT" | tee -a "$LOG_FILE"
-echo "[next] mirror to juyi-finetune, then bash launch_v3_intermediate_score.sh" | tee -a "$LOG_FILE"
