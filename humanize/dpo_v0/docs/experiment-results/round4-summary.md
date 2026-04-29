@@ -73,6 +73,15 @@ Completion: 2026-04-29 12:50 UTC. Round-4 closed without ratifiable ckpt.
 - U-shape: Q2 unlearning trough → Q3-Q4 strong recovery + convergence on pair-pref task.
 - Mid-run snapshot at step 34 (`acc_win50=0.57`) was misread as "stuck" (rl2 + rl7 premature amber) before final summary fetch corrected.
 
+Repro:
+```bash
+python humanize/dpo_v0/eval/analyze_wandb_dpo_run.py \
+  --run-path lukelin/wanrl/9if26kr9 \
+  --token-path /shared/user60/worldmodel/rlvideo/videodpoWan/wandbtoken
+```
+
+Metric read: W&B `accuracy` is the per-step sign bit emitted by `train_dpo_i2v.py` (`1.0 if margin/logit > 0 else 0.0`) and is expected to be noisy on raw step plots. `acc_win50` is the trainer-side rolling 50-step mean and is the metric used here for convergence interpretation.
+
 ### Lesson #1: monitor pipeline must fetch final summary
 - High-β DPO has expected mid-run unlearning trough due to asymmetric sigmoid saturation.
 - 9-step samples or step-N snapshots miss U-shape recovery.
@@ -104,7 +113,7 @@ Completion: 2026-04-29 12:50 UTC. Round-4 closed without ratifiable ckpt.
 
 ### Eval setup
 - 42 unique heldout prompts × 2 modes (baseline + trained) = 84 video generations
-- byte-identical generation_config (AC-7.2) verified at startup; gen_config_sha256 stamped
+- byte-identical generation_config (AC-7.2) verified at startup; `gen_config_sha256 = e31262d26c7c3cdeccf2ace12183e3021792dfb1219f68e7658c067348284288`
 - inference_steps=50 (locked), seed=42, sampler=uni_pc, resolution=832x480, num_frames=81
 - 8-rank seed-parallel on juyi-videorl 8×A100 with `--cache-pipe --mode-batched` (per rank: 1 build + 1 attach + N gens)
 - per-video wall ~14 min (50 step × ~17s/step + VAE encode/decode + save), total wall ~2h39m
@@ -157,24 +166,20 @@ Sign-test 2-tailed exact binomial on (+wins, −losses) excluding ties.
 
 ### Hypothesis B: tier_b pair noise leaks through preference signal
 - 1k tier_b pairs come from `wmbench` human-eval DB; winner ≠ truly better is possible (rater disagreement, axis mismatch with PhyJudge).
-- Same training config (β=1000 / lora_rank=16) on round-2 M4 (200-pair tier_b @ β=0.1 / lr=1e-5) presumably produced cleaner gradient signal but lower magnitude.
-- Discriminator: PhyJudge eval round-2 M4 ckpt (`juyi-finetune:~/m4_ckpt/lora_final_diffsynth.safetensors`) with v3-baseline reuse via `--baseline-from` flag (rl7 implemented in shared `heldout_regen.py`). ETA ~45 min on juyi-finetune 4-rank.
-- If M4 also regresses → tier_b pair noise dominant → pair selection / reward signal change needed.
-- If M4 holds or wins → training config (β / rank) dominant → Option A is the right re-train direction.
+- This cannot be diagnosed by comparing against round-2 M4: M4 changes too many axes at once (pair count, β, lr, rank, steps, and pipeline era), so it is not a valid discriminator.
+- Data-side follow-up needs a controlled label audit / pair-quality audit on the round-4 1k subset, or a controlled re-train that changes only the data selection while keeping the round-5 training regime fixed.
 
 ### Hypothesis C: both contribute
-- M4 PhyJudge data + Option A re-train can be run in parallel:
-  - juyi-finetune 4-rank M4 PhyJudge eval (~45 min, baseline reuse)
-  - juyi-videorl 8-rank Option A train (~7h28m)
-- Recombine signals after both done.
+- Plausible, but not separable from existing round-4 artifacts alone.
+- Round-5 should start with a controlled training-config ablation (Option A) and keep a separate data-quality audit path for tier_b.
 
 ## Artifacts inventory
 
 ### v3 (round-4 r5) ckpts
-- raw FSDP-wrapped: `juyi-videorl:~/videodpoWan-task20/humanize/dpo_v0/ckpts/20260429T023311Z/lora_final.safetensors` (153 MB, lora_rank=16)
+- raw FSDP-wrapped: `juyi-videorl:~/videodpoWan-task20/humanize/dpo_v0/ckpts/20260429T023311Z/lora_final.safetensors` (153 500 376 B, lora_rank=16, sha256 `18a5fd0be28ba0c7fedf6d295d84beb4268270f1a1c5508dc1aa9e44cd6ac689`)
 - intermediate: `lora_step{50,100,150}.safetensors` 同 dir
 - run_manifest.json 同 dir
-- stripped (DiffSynth-loadable): `juyi-finetune:~/m4_lora_gen_out/v3_round4/lora_final_stripped.safetensors`
+- stripped (DiffSynth-loadable): `juyi-finetune:~/m4_lora_gen_out/v3_round4/lora_final_stripped.safetensors` (153 440 328 B, 800 keys, sha256 `d97157a7c139dfbd3a2b7947687ec529fff2244c5ef9f4e1ec2118a30707f45a`)
 
 ### v3 PhyJudge eval
 - 84 videos (42 baseline + 42 trained): `juyi-videorl:~/gen_out/v3_full_strip_20260429T162925Z/20260429T162927Z/heldout_regen/`
@@ -209,4 +214,13 @@ Sign-test 2-tailed exact binomial on (+wins, −losses) excluding ties.
 
 - Round-4 closed without ratifiable ckpt.
 - Pipeline (trainer + orchestrator + scorer) is method-validated end-to-end via the strip-fix smoke and the 84-video full eval.
-- Round-5 entry awaits luke decision on Hypothesis A vs B vs C.
+- Round-5 entry awaits luke decision on Option A vs a controlled data-quality audit path; old M4 is not a discriminator.
+
+## Co-discovery credits
+
+- v3 training launch + monitor + final summary fetch: rl1
+- #39 control train (lr=1e-5) + train metrics interp: rl7 + rl1
+- Eval generator + cache_pipe + race fix + FSDP-prefix strip workaround: rl7
+- Trainer-side FSDP-prefix strip fix (round-N+ no-manual-strip): rl9 task #42 commit `2d44f08`
+- Scorer optimizations + per-axis paired-delta + sign-test analysis + bug detection (byte-equal trained=baseline): rl8 task #40
+- Dispatcher coordination + retracted Option A push (then re-endorsed when downstream data flipped the read): rl2

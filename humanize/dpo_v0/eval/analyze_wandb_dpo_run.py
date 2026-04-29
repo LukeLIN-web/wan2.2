@@ -37,6 +37,7 @@ DEFAULT_QUARTERS = "0:50,50:100,100:150,150:200"
 DEFAULT_HISTORY_MODE = "quick"
 DEFAULT_SAMPLES = 2000
 DEFAULT_TAIL_STEPS = 200
+DEFAULT_STRIDE = 10
 DEFAULT_WINDOW_SCAN_KEYS = (
     "loss",
     "accuracy",
@@ -200,6 +201,7 @@ def load_wandb_rows(
     samples: int = DEFAULT_SAMPLES,
     tail_steps: int = DEFAULT_TAIL_STEPS,
     ranges: list[tuple[str, int, int]] | None = None,
+    stride: int = DEFAULT_STRIDE,
 ) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
     if token_path is not None:
         token = token_path.read_text().strip()
@@ -316,6 +318,11 @@ def load_wandb_rows(
 
     if not rows:
         raise SystemExit(f"no W&B history rows found for {run_path}")
+    pre_stride_count = len(rows)
+    rows = _apply_stride(rows, stride)
+    history_info["stride"] = max(1, stride)
+    history_info["rows_pre_stride"] = pre_stride_count
+    history_info["rows_post_stride"] = len(rows)
     return run, rows, history_info
 
 
@@ -432,6 +439,19 @@ def _merge_slim_rows(*row_groups: Iterable[dict[str, Any]]) -> list[dict[str, An
                     continue
                 merged[key] = value
     return [rows_by_step[step] for step in sorted(rows_by_step)]
+
+
+def _apply_stride(
+    rows: list[dict[str, Any]],
+    stride: int,
+) -> list[dict[str, Any]]:
+    if stride <= 1 or len(rows) <= 2:
+        return rows
+    base = rows[0]["_step"]
+    kept = [row for row in rows if (row["_step"] - base) % stride == 0]
+    if rows[-1]["_step"] != kept[-1]["_step"]:
+        kept.append(rows[-1])
+    return kept
 
 
 def _last_history_step(run: Any) -> int | None:
@@ -607,6 +627,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TAIL_STEPS,
         help="Exact trailing step window to scan for quick/range-scan modes.",
     )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=DEFAULT_STRIDE,
+        help="Keep one row every STRIDE steps; pass 1 to disable subsampling.",
+    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--indent", type=int, default=2)
     return parser.parse_args()
@@ -627,6 +653,7 @@ def main() -> None:
         samples=args.samples,
         tail_steps=args.tail_steps,
         ranges=args.quarters,
+        stride=args.stride,
     )
     summary = build_summary(
         run=run,

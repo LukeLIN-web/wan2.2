@@ -1,40 +1,39 @@
 #!/usr/bin/env bash
-# Round-4 v3 lr=1e-5 control on juyi-finetune (4×A100). Mirrors v3 FSDP launcher with:
-#   * lr 5e-5 → 1e-5 (training_config_round4_lr1e5.yaml, sha256[:16]=fcb67e33587e8420)
-#   * max_steps=200 → num_samples=800 (200 optimizer steps × 4 ranks × micro_batch=1 on the 1k-pair run)
-#   * --nproc_per_node 8 → 4
-# Decision: lukedecision task #39 — diagnose v3 FSDP lr=5e-5 vs lr=1e-5 stability at β=1000.
-# Pins (round-4 r5 lr=1e-5 control): recipe=6bef6e104cdd3442, train_cfg=fcb67e33587e8420, pair_ids=cf5d3e5fd528a3e0
-
 set -euo pipefail
 # shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 init_paths "${BASH_SOURCE[0]}"
-# juyi-finetune env: torch 2.11.0+cu130, flash_attn 2.8.3, diffsynth, torchvision 0.26.0.
 activate_env wmbench-swift-train
 resolve_wandb
 cd "$DPO_DIR"
 
 expect_recipe="6bef6e104cdd3442"
-expect_train_cfg="fcb67e33587e8420"
+expect_train_cfg="e4643cd25b1e33ee"
 expect_pair_ids="cf5d3e5fd528a3e0"
 verify_pins "$expect_recipe" "$expect_train_cfg" "$expect_pair_ids" \
-  "$DPO_DIR/recipes/training_config_round4_lr1e5_sha256_pin"
+  "$DPO_DIR/recipes/training_config_round4_lr1e5_beta30_sha256_pin"
 
-# juyi-finetune's worktree predates rl1's commit 52cfe68 ("split flat layout"),
-# so the trainer may live at the pre-split path.
 TRAINER_PY="$DPO_DIR/train/train_dpo_i2v.py"
 [[ -f "$TRAINER_PY" ]] || TRAINER_PY="$DPO_DIR/train_dpo_i2v.py"
 
-nohup torchrun --nproc_per_node=4 "$TRAINER_PY" \
+if [[ -z "${NPROC_PER_NODE:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NPROC_PER_NODE="$(nvidia-smi -L 2>/dev/null | wc -l)"
+  fi
+  NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+  [[ "$NPROC_PER_NODE" -ge 1 ]] || NPROC_PER_NODE=1
+fi
+echo "[launch] nproc_per_node=$NPROC_PER_NODE"
+
+nohup torchrun --nproc_per_node="$NPROC_PER_NODE" "$TRAINER_PY" \
   --tier tier_b \
   --upstream "$HOME/Wan2.2-I2V-A14B" \
   --latent-manifest "$DPO_DIR/latents/20260428T164038Z/tier_b_round4_1k/manifest.jsonl" \
   --post-t2-pair "$HOME/T0_T3_root/t2/post_t2_pair.json" \
   --t2-image-manifest "$HOME/T0_T3_root/t2/image_manifest.json" \
   --cond-image-fallback-root "$HOME/cond_imgs" \
-  --training-config-path "$DPO_DIR/recipes/training_config_round4_lr1e5.yaml" \
+  --training-config-path "$DPO_DIR/recipes/training_config_round4_lr1e5_beta30.yaml" \
   --training-config-sha256-pin "$expect_train_cfg" \
   --subset-pair-ids-json "$DPO_DIR/out/round4/20260428T160839Z/T3_round4_tier_b_1k.json" \
   --pair-ids-sha256-pin "$expect_pair_ids" \
@@ -45,7 +44,7 @@ nohup torchrun --nproc_per_node=4 "$TRAINER_PY" \
   --wandb-project "$WANDB_PROJECT" \
   --wandb-entity "$WANDB_ENTITY" \
   --wandb-mode "$WANDB_MODE_OPT" \
-  --wandb-run-name "round4-lr1e5-control-juyi-finetune-4rank-$(date -u +%Y%m%dT%H%M%SZ)" \
+  --wandb-run-name "round4-lr1e5-beta30-${NPROC_PER_NODE}rank-$(date -u +%Y%m%dT%H%M%SZ)" \
   > "$LOG_FILE" 2>&1 &
 
 print_launch_info "$!"

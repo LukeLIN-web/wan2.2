@@ -1,11 +1,11 @@
-beta: 10
+beta: 30
 dpo_loss_kind: sigmoid
 lora_alpha: 16
 lora_rank: 16
 lr: 1.0e-05
 max_pairs: 1000
 micro_batch: 1
-num_samples: 200
+num_samples: 800
 round_tag: round-4
 sampling_band:
 - 901
