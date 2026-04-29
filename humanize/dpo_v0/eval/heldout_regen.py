@@ -746,6 +746,55 @@ def regen_one_prompt(
     return out
 
 
+def _reuse_baseline_from(
+    sel: "HeldoutPrompt",
+    prompt_dir: pathlib.Path,
+    gen_config_bytes: bytes,
+    baseline_from: pathlib.Path,
+) -> dict:
+    """Symlink baseline outputs from a prior run dir + return its manifest.
+
+    Skips the baseline generation pass when ``--baseline-from <run_dir>`` is
+    set. Validates that the prior baseline used a byte-identical
+    generation_config (AC-7.2) before reusing.
+    """
+    src_baseline_dir = baseline_from / "heldout_regen" / sel.prompt_id / "baseline"
+    if not src_baseline_dir.exists():
+        raise SystemExit(
+            f"--baseline-from: {src_baseline_dir} missing for prompt {sel.prompt_id}"
+        )
+    src_gen_cfg = src_baseline_dir / "gen_config.json"
+    if not src_gen_cfg.exists():
+        raise SystemExit(
+            f"--baseline-from: {src_gen_cfg} missing (cannot verify AC-7.2 byte-equality)"
+        )
+    if src_gen_cfg.read_bytes() != gen_config_bytes:
+        raise SystemExit(
+            f"--baseline-from: gen_config.json byte mismatch for {sel.prompt_id} "
+            f"(prior baseline was generated under a different config; not reusable)"
+        )
+    baseline_dir = prompt_dir / "baseline"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    # Mirror the run subdir (timestamp) layout so manifest paths in the
+    # reused side line up with what the orchestrator wrote on the prior run.
+    for entry in src_baseline_dir.iterdir():
+        target = baseline_dir / entry.name
+        if target.exists() or target.is_symlink():
+            continue
+        # Use absolute symlinks so the target resolves regardless of cwd.
+        target.symlink_to(entry.resolve())
+    # Synthesize an adapter-style record so the trained-pass loop can
+    # zip baseline + trained results uniformly.
+    return {
+        "run_kind": "baseline",
+        "out_dir": str(baseline_dir),
+        "wall_seconds": 0.0,
+        "result": {"reused_from": str(src_baseline_dir)},
+        "ckpt_shas": _extract_ckpt_shas(baseline_dir),
+        "reused": True,
+    }
+
+
 def regen_all(
     selections: list[HeldoutPrompt],
     gen_config_bytes: bytes,
@@ -756,6 +805,7 @@ def regen_all(
     rank: int = 0,
     world_size: int = 1,
     mode_batched: bool = False,
+    baseline_from: Optional[pathlib.Path] = None,
 ) -> list[dict]:
     """Drive the full 42-prompt loop, sharded by ``index % world_size``.
 
@@ -804,6 +854,11 @@ def regen_all(
                 existing["resumed"] = True
                 results.append(existing)
                 continue
+        if baseline_from is not None:
+            baseline_manifests[sel.prompt_id] = _reuse_baseline_from(
+                sel, prompt_dir, gen_config_bytes, baseline_from
+            )
+            continue
         baseline_dir = prompt_dir / "baseline"
         baseline_manifests[sel.prompt_id] = adapter(
             "baseline",
@@ -904,6 +959,13 @@ def main() -> int:
                         "of world_size.")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
+    p.add_argument("--baseline-from", type=pathlib.Path, default=None,
+                   help="Path to a prior `<out_dir>/<run_ts>` directory whose 42 "
+                        "baseline videos should be reused instead of re-generated. "
+                        "Skips the baseline pass entirely; only trained pass runs. "
+                        "Halts on AC-7.2 byte-equality violation (gen_config drift "
+                        "between prior run and current). ~50% wall save when comparing "
+                        "multiple ckpts under the same generation_config.")
     p.add_argument("--cache-pipe", action="store_true",
                    help="python_api adapter only: build the WanVideoPipeline (~95 GB) once per "
                         "rank and reuse it across calls. Implies --mode-batched (DiffSynth has "
@@ -1031,7 +1093,23 @@ def main() -> int:
     ckpt_args["device"] = args.device
 
     # 6. run-level dir + manifest
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # When multiple ranks share the same out_dir, only rank 0 picks the run
+    # timestamp; other ranks read the marker file rank 0 writes (avoids each
+    # rank getting a different timestamp dir + racing on run_manifest.pre.json).
+    marker_path = args.out_dir / ".run_ts"
+    if args.rank == 0:
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(ts)
+    else:
+        # Wait briefly for rank 0 to write the marker; bounded poll.
+        import time as _t
+        deadline = _t.time() + 60
+        while not marker_path.exists() and _t.time() < deadline:
+            _t.sleep(0.5)
+        if not marker_path.exists():
+            raise SystemExit(f"rank {args.rank}: timeout waiting for {marker_path}")
+        ts = marker_path.read_text().strip()
     run_dir = args.out_dir / ts
     run_dir.mkdir(parents=True, exist_ok=True)
     run_manifest_pre = {
@@ -1051,7 +1129,8 @@ def main() -> int:
         "mode_batched": args.mode_batched or args.cache_pipe,
         "manifest_writer_schema_version": _MANIFEST_WRITER_SCHEMA_VERSION,
     }
-    _mw_atomic_write_json(run_dir / "run_manifest.pre.json", run_manifest_pre)
+    if args.rank == 0:
+        _mw_atomic_write_json(run_dir / "run_manifest.pre.json", run_manifest_pre)
 
     # 7. orchestration loop
     if args.cache_pipe and not args.mode_batched:
@@ -1064,6 +1143,16 @@ def main() -> int:
     else:
         mode_batched = args.mode_batched
 
+    if args.baseline_from is not None and not mode_batched:
+        # baseline-from semantics live inside the mode_batched code path
+        # (the non-batched path interleaves baseline+trained per prompt).
+        print(
+            "[heldout_regen] --baseline-from implies --mode-batched (skipping "
+            "baseline pass requires the two-pass iteration order); enabling.",
+            flush=True,
+        )
+        mode_batched = True
+
     results = regen_all(
         selections=selections,
         gen_config_bytes=gen_config_bytes,
@@ -1074,16 +1163,24 @@ def main() -> int:
         rank=args.rank,
         world_size=args.world_size,
         mode_batched=mode_batched,
+        baseline_from=args.baseline_from,
     )
 
     run_manifest_post = dict(run_manifest_pre)
     run_manifest_post["results_count"] = len(results)
     run_manifest_post["complete"] = all(r.get("complete") for r in results)
     run_manifest_post["results"] = results
-    _mw_atomic_write_json(run_dir / "run_manifest.json", run_manifest_post)
+    # Each rank writes its own per-rank manifest (the per-rank `results` list
+    # only covers its sharded subset of prompts); a separate join step would
+    # merge them. Rank 0 also writes the canonical `run_manifest.json` as the
+    # primary entry for downstream consumers.
+    rank_manifest_path = run_dir / f"run_manifest.rank{args.rank}.json"
+    _mw_atomic_write_json(rank_manifest_path, run_manifest_post)
+    if args.rank == 0:
+        _mw_atomic_write_json(run_dir / "run_manifest.json", run_manifest_post)
     print(
         f"[done] regenerated {len(results)} prompts (rank {args.rank}/{args.world_size}); "
-        f"manifest at {run_dir / 'run_manifest.json'}",
+        f"manifest at {rank_manifest_path}",
         flush=True,
     )
     return 0
