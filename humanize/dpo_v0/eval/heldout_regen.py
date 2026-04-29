@@ -51,17 +51,14 @@ DPO_ROOT = HERE.parent  # humanize/dpo_v0/
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(DPO_ROOT))
 
-# rl8 task #16 manifest_writer (commit e096edf, schema version 1).
-# Adopted: assert_recipe_pins (3-way pin assert returning full pins dict)
-# + atomic_write_json (deterministic key order, .tmp + rename).
 from dataprocessing.manifest_writer import (  # noqa: E402
     MANIFEST_SCHEMA_VERSION as _MANIFEST_WRITER_SCHEMA_VERSION,
     assert_recipe_pins as _mw_assert_recipe_pins,
     atomic_write_json as _mw_atomic_write_json,
 )
 
-EXPECTED_RECIPE_ID = "6bef6e104cdd3442"  # AC-3.1, frozen in task-6 round 1
-EXPECTED_HELDOUT_PROMPTS = 42  # round-0 audit §3
+EXPECTED_RECIPE_ID = "6bef6e104cdd3442"  # AC-3.1
+EXPECTED_HELDOUT_PROMPTS = 42
 EXPECTED_HELDOUT_GROUPS = 245
 EXPECTED_HELDOUT_PAIRS = 579
 
@@ -70,13 +67,7 @@ EXPECTED_HELDOUT_PAIRS = 579
 
 
 def assert_recipe_pin(recipes_dir: pathlib.Path, expected: str = EXPECTED_RECIPE_ID) -> str:
-    """Thin wrapper around manifest_writer.assert_recipe_pins (3-way assert).
-
-    Returns the recipe_id string for backward compatibility with the
-    earlier 2-way wrapper. Callers wanting the full pins dict (for
-    splatting into a manifest) should call ``_mw_assert_recipe_pins``
-    directly.
-    """
+    """Wrapper around manifest_writer.assert_recipe_pins returning recipe_id only."""
     pins = _mw_assert_recipe_pins(recipes_dir, expected_recipe_id=expected)
     return pins["recipe_id"]
 
@@ -90,8 +81,7 @@ def load_heldout_records(t0_t3_root: pathlib.Path) -> list[dict]:
         raise ValueError(f"{path} is not a JSON array")
     if len(records) != EXPECTED_HELDOUT_PAIRS:
         raise ValueError(
-            f"heldout pair count mismatch: got {len(records)}, expected {EXPECTED_HELDOUT_PAIRS} "
-            f"(round-0 audit §3); refusing to proceed without explicit re-pin sign-off."
+            f"heldout pair count mismatch: got {len(records)}, expected {EXPECTED_HELDOUT_PAIRS}"
         )
     n_prompts = len({r["prompt"] for r in records})
     n_groups = len({r["group_id"] for r in records})
@@ -135,19 +125,12 @@ def _resolve_cond_image_path(
     primary: str,
     fallback_root: Optional[pathlib.Path],
 ) -> str:
-    """Resolve a canonical T2 image path, with optional cross-machine fallback.
+    """Resolve a canonical T2 image path with optional basename-keyed fallback.
 
-    Mirrors the trainer's ``--cond-image-fallback-root`` semantics from
-    rl1 commit ``0030832`` (round-3 attempt 5): if the primary absolute
-    path exists, return it; otherwise look for ``<fallback_root>/<basename>``
-    and return that if present. The fallback is basename-keyed because
-    the canonical manifest paths come from the dev box and may live
-    under different prefixes on juyi-finetune / juyi-videorl.
-
-    Returns the resolved path string. If neither primary nor fallback
-    exists, returns the primary path unchanged so the downstream
-    inference_smoke loader fails loudly with the real error rather than
-    a synthesized one (caller can always pre-check existence if needed).
+    If the primary absolute path exists, return it. Otherwise, if
+    ``<fallback_root>/<basename>`` exists, return that. Else return the
+    primary path unchanged so the downstream loader fails with the real
+    error instead of a synthesized one.
     """
     if pathlib.Path(primary).exists():
         return primary
@@ -236,40 +219,45 @@ def select_canonical_groups(
 
 def canonical_generation_config(
     seed: int,
-    sampler: str = "uni_pc",
+    sampler: str = "wan_default_flow_match",
     inference_steps: int = 50,
     guidance_scale: float = 5.0,
     negative_prompt: str = "",
     resolution: tuple[int, int] = (832, 480),
     num_frames: int = 81,
-    dtype: str = "bf16",
-    judge_preprocessing: str = "phygroundata.md#section-8",
+    fps: int = 16,
+    dtype: str = "torch.bfloat16",
+    switch_DiT_boundary: float = 0.875,
+    tiled: bool = True,
+    tile_size: tuple[int, int] = (30, 52),
+    tile_stride: tuple[int, int] = (15, 26),
+    rand_device: str = "cpu",
+    judge_preprocessing: str = "phygroundata.md_section8",
 ) -> dict:
     """The single shared generation_config dict.
 
-    Per AC-7.2: ``seed``, ``sampler``, ``inference_steps``,
-    ``guidance_scale``, ``negative_prompt``, ``resolution``,
-    ``num_frames=81``, ``dtype``, ``judge_preprocessing`` must be
-    byte-identical between baseline and trained runs. The dict is
-    serialized with ``sort_keys=True`` separators=(",", ":") so the
-    bytes are stable across Python instances.
-
-    Defaults mirror the parent plan / round-0 audit §5:
-      - ``inference_steps`` = 50 (DiffSynth I2V default in
-        ``inference_I2V_cont_after_train.py:71``)
-      - ``num_frames`` = 81 (AC-3.5)
-      - ``resolution`` = (832, 480) (parent-plan training resolution)
-      - ``dtype`` = "bfloat16" (DEC-2 dtype policy)
+    Schema matches ``inference_smoke.build_generation_config`` exactly so
+    the subprocess adapter can pass the dict via ``--gen-config-json``
+    and have ``run_one_sample`` consume it without translation.
+    Per AC-7.2 the bytes (sort_keys=True, separators=(",", ":")) must be
+    byte-identical between baseline and trained runs.
     """
     return {
         "seed": int(seed),
         "sampler": str(sampler),
-        "inference_steps": int(inference_steps),
-        "guidance_scale": float(guidance_scale),
+        "num_inference_steps": int(inference_steps),
+        "cfg_scale": float(guidance_scale),
         "negative_prompt": str(negative_prompt),
-        "resolution": [int(resolution[0]), int(resolution[1])],
+        "height": int(resolution[1]),
+        "width": int(resolution[0]),
         "num_frames": int(num_frames),
+        "fps": int(fps),
         "dtype": str(dtype),
+        "switch_DiT_boundary": float(switch_DiT_boundary),
+        "tiled": bool(tiled),
+        "tile_size": [int(tile_size[0]), int(tile_size[1])],
+        "tile_stride": [int(tile_stride[0]), int(tile_stride[1])],
+        "rand_device": str(rand_device),
         "judge_preprocessing": str(judge_preprocessing),
     }
 
@@ -283,20 +271,17 @@ def serialize_generation_config(cfg: dict) -> bytes:
 InferenceAdapter = Callable[[str, str, str, bytes, pathlib.Path, dict], dict]
 
 
-# Filenames inference_smoke.py is expected to drop in its out_dir
-# (per rl5 schema in #dpo:5db9718b msg `a76f4c8e`). The `ckpt_shas`
-# block lives at the top level of either file; we look at both.
+# Filenames inference_smoke.py drops in its out_dir; the ``ckpt_shas``
+# block lives at the top level of either file.
 _INFERENCE_SMOKE_MANIFEST_NAMES = ("manifest.json", "run_manifest.json")
 
 
 def _extract_ckpt_shas(out_dir: pathlib.Path) -> Optional[dict]:
-    """Read inference_smoke.py's per-run manifest and surface ``ckpt_shas``.
+    """Return ``ckpt_shas`` from inference_smoke's per-run manifest, or None.
 
-    Returns ``None`` if no manifest exists yet (e.g. dry-run, or the
-    inference smoke step did not write one). Caller decides whether the
-    absence is a hard fail (M6 production) or expected (dry_run / smoke
-    pre-launch). Per AC-7.3, ``ckpt_shas`` is the authoritative
-    "what was actually loaded" record (rl5 `a76f4c8e` option B).
+    Per AC-7.3, ``ckpt_shas`` is the authoritative "what was actually
+    loaded" record. None means no manifest yet (e.g. dry-run); caller
+    decides if that is fatal.
     """
     for name in _INFERENCE_SMOKE_MANIFEST_NAMES:
         path = out_dir / name
@@ -319,36 +304,14 @@ def subprocess_inference_adapter(
 ) -> InferenceAdapter:
     """Adapter that shells out to ``inference_smoke.py`` per sample.
 
-    CLI contract verified against rl5's actual ``inference_smoke.py`` on
-    ``rlcr/task-6`` (round-2 commit ``ac00949``, cherry-picked as
-    ``6b27fe7``). Earlier spec at msg ``5e8993eb`` drifted from the
-    landed implementation — this adapter targets the IMPLEMENTED CLI
-    (rl1 caught the drift in #dpo:dac89b67 msg ``04170e0b``):
-
-        inference_smoke.py
-          --upstream PATH                       # canonical Wan2.2-I2V-A14B root
-          --mode {both, baseline, trained}     # M6 uses baseline | trained
-          --lora-adapter PATH                  # trained mode only; baseline rejects it
-          --low-noise-ckpt PATH                # optional override; defaults to <upstream>/low_noise_model/
-          --gen-config-json PATH               # single source of truth bytes
-          --recipe-yaml PATH                   # optional; defaults to recipes/wan22_i2v_a14b__round2_v0.yaml
-          --prompt TEXT
-          --cond-image PATH
-          --out-dir PATH
-          --seed INT                           # default 0
-          --compute-envelope {single_gpu, dpo_multi_gpu_ddp,
-                              dpo_multi_gpu_zero2,
-                              multi_gpu_inference_seed_parallel}
-
     M6 invokes one prompt at a time, ``--mode baseline`` then
     ``--mode trained``, with the same ``--gen-config-json`` so
     byte-identicality is enforced by the file itself.
 
-    ``ckpt_args`` keys (orchestrator-level, translated to rl5 CLI flags):
+    ``ckpt_args`` keys:
       * ``upstream`` (REQUIRED) — canonical I2V-A14B root.
-      * ``trained_lora`` (REQUIRED for run_kind="trained") — LoRA
-        safetensors path; passed as ``--lora-adapter``. Baseline takes NO
-        adapter (inference_smoke rejects it at argparse).
+      * ``trained_lora`` (REQUIRED for run_kind="trained") — LoRA path,
+        passed as ``--lora-adapter``. Baseline rejects it at argparse.
       * ``low_noise_ckpt`` (optional) — explicit low-noise override.
       * ``recipe_yaml`` (optional) — canonical recipe YAML override.
       * ``compute_envelope`` (optional) — per-run envelope tag.
@@ -437,59 +400,26 @@ def python_api_inference_adapter(
     cache_pipe: bool = False,
     build_pipeline: Optional[Callable] = None,
 ) -> InferenceAdapter:
-    """Adapter that calls into rl5's ``inference_smoke.run_one_sample`` directly.
-
-    ACTUAL signature (verified against ``rlcr/task-6`` HEAD; rl1 caught
-    the spec/impl drift in #dpo:dac89b67 msg ``04170e0b``)::
-
-        run_one_sample(
-            *,
-            mode,                    # "baseline" | "trained"
-            out_dir: Path,
-            upstream: UpstreamPaths, # dataclass(upstream_root=Path)
-            torch_dtype,             # torch.dtype, e.g. torch.bfloat16
-            device: str,             # "cuda" | "cpu"
-            prompt: str,
-            cond_image_path: Path,
-            generation_config: dict,
-            generation_config_bytes: bytes,
-            lora_adapter_path: Optional[Path],   # None for baseline
-            compute_envelope: str,
-            recipe_id: str,                      # the 16-char pin, NOT the yaml path
-            high_noise_sha: Optional[str] = None,
-            low_noise_sha: Optional[str] = None,
-            pipe: Any = None,                    # cache_pipe path
-            lora_already_attached: bool = False, # cache_pipe path
-            lora_sha: Optional[str] = None,      # cache_pipe path
-        ) -> dict[str, Any]            # returns manifest dict incl. ckpt_shas
+    """Adapter that calls ``inference_smoke.run_one_sample`` in-process.
 
     Pass the matching ``UpstreamPaths`` dataclass as the second arg
     (typically ``inference_smoke.UpstreamPaths``); the adapter
     constructs ``UpstreamPaths(upstream_root=Path(ckpt_args["upstream"]))``
-    each call. The recipe_id is read via ``assert_recipe_pin`` (default
-    is the orchestrator's local helper which delegates to manifest_writer).
+    each call. The recipe_id is resolved via ``assert_recipe_pin``.
 
-    Subprocess adapter remains the operational default — Python API
-    is opt-in. The process boundary is an escape valve for deploy
-    issues (env divergence, partial OOM recovery, GPU-context leak)
-    where the in-process adapter would take down the orchestrator.
+    Subprocess adapter remains the default; this Python API is opt-in
+    and useful when the process boundary's overhead is unwanted.
 
-    ``cache_pipe`` (False by default — backward compat): when True, the
-    adapter holds a single ``WanVideoPipeline`` across all calls,
-    skipping the ~95 GB ``build_pipeline`` reload that dominates wall
-    time when one process serves N>>1 prompts. Required for full
-    42-prompt heldout regen at modest world_size (e.g. world_size=8 →
-    10-11 calls/rank → 10-11×95 GB rebuilds without this flag).
+    ``cache_pipe`` (default False): when True, holds a single
+    ``WanVideoPipeline`` across calls, skipping the ~95 GB
+    ``build_pipeline`` reload that dominates wall time at N>>1 prompts.
+    Caller MUST iterate mode-batched (all baselines, then all trained)
+    because DiffSynth has no clean LoRA detach path; a trained-then-
+    baseline transition requires a rebuild. ``--mode-batched`` enforces
+    this on the CLI.
 
-    With ``cache_pipe=True`` the caller MUST iterate mode-batched per
-    rank (all baselines first, then all trained) — DiffSynth does not
-    expose a clean LoRA detach path, so a baseline call after a trained
-    call requires a pipe rebuild. The orchestrator's ``--mode-batched``
-    flag enforces this.
-
-    ``build_pipeline`` overrides the default (lazy-imported from
-    ``inference_smoke``); pass an explicit callable in tests so the
-    cache path is exercisable without GPU / DiffSynth.
+    ``build_pipeline`` overrides the lazy import from ``inference_smoke``
+    so the cache path is exercisable in tests without GPU / DiffSynth.
     """
     if assert_recipe_pin is None:
         # Late-bound to module-level wrapper to avoid forward-reference at
@@ -827,28 +757,18 @@ def regen_all(
     world_size: int = 1,
     mode_batched: bool = False,
 ) -> list[dict]:
-    """Drive the full 42-prompt loop. Optional rank/world_size shards
-    selections across N processes by index modulo world_size — caller
-    invokes one ``regen_all`` per rank.
+    """Drive the full 42-prompt loop, sharded by ``index % world_size``.
 
-    ``mode_batched`` (False by default): when True, iterate each rank's
-    assigned prompts in two passes — all baselines first, then all
-    trained — instead of interleaving baseline+trained per prompt. This
-    is required when the adapter caches a single pipeline across calls
-    (``python_api_inference_adapter(..., cache_pipe=True)``) because
-    DiffSynth does not expose a clean LoRA detach path: a trained call
-    leaves LoRA attached on ``pipe.dit``, so the next baseline call on
-    the same pipe would silently include the trained-mode weights.
-    Mode-batched ordering means LoRA gets attached exactly once per rank
-    (between the baseline pass and the trained pass) and stays attached
-    for the entire trained pass.
+    ``mode_batched``: when True, run two passes per rank — all baselines
+    first, then all trained — instead of interleaving per prompt. Required
+    with ``cache_pipe=True`` because DiffSynth has no LoRA detach path:
+    LoRA stays attached after the first trained call, so trained must
+    not precede baseline on the same cached pipe.
 
-    Resume semantics under ``mode_batched``: the per-prompt summary
-    (``prompt_manifest.json``) is written only when both modes complete,
-    matching the non-batched path; partial completion leaves
-    per-mode dirs in place and the next run's resume check rebuilds
-    state from those dirs (the inner ``regen_one_prompt`` skip-if-complete
-    short-circuit kicks in for any prompt whose summary already exists).
+    Resume semantics under ``mode_batched`` match the non-batched path:
+    the per-prompt summary is only written once both modes succeed.
+    Partial completions leave per-mode dirs and the next run resumes via
+    ``regen_one_prompt``'s skip-if-complete short-circuit.
     """
     prompt_out_root = out_root / "heldout_regen"
     prompt_out_root.mkdir(parents=True, exist_ok=True)
@@ -936,49 +856,41 @@ def regen_all(
 def main() -> int:
     p = argparse.ArgumentParser(description="M6 heldout regen orchestration scaffold")
     p.add_argument("--t0-t3-root", type=pathlib.Path, required=True,
-                   help="<T0_T3_ROOT> as resolved by M0 audit (round-0 §1).")
+                   help="<T0_T3_ROOT> as resolved by M0 audit.")
     p.add_argument("--out-dir", type=pathlib.Path, required=True,
                    help="Run output root; per-prompt dirs land under <out_dir>/heldout_regen/<prompt_id>/.")
     p.add_argument("--recipes-dir", type=pathlib.Path, default=DPO_ROOT / "recipes",
-                   help="Path to the dpo_v0 recipes/ dir (defaults to alongside this file).")
+                   help="Path to the dpo_v0 recipes/ dir.")
     p.add_argument("--inference-smoke-py", type=pathlib.Path, default=HERE / "inference_smoke.py",
-                   help="Path to rl5's inference_smoke.py (used by subprocess adapter).")
+                   help="Path to inference_smoke.py (used by subprocess adapter).")
     p.add_argument("--adapter", choices=["subprocess", "python_api", "dry_run"], default="subprocess",
-                   help="Inference adapter to use. 'subprocess' shells out to inference_smoke.py "
-                        "(default; deploy escape valve via process boundary). 'python_api' imports "
-                        "inference_smoke.run_one_sample and calls it in-process (rl5 lock 5e8993eb / "
-                        "ac00949). 'dry_run' is a no-op for orchestration testing without GPU.")
+                   help="'subprocess' shells out to inference_smoke.py (default). "
+                        "'python_api' calls inference_smoke.run_one_sample in-process. "
+                        "'dry_run' is a no-op for orchestration testing without GPU.")
     p.add_argument("--trained-lora", type=str, default=None,
-                   help="Path to LoRA adapter safetensors from M3/M4. REQUIRED with "
-                        "--adapter subprocess|python_api. Passed as --lora-adapter to "
-                        "inference_smoke for the trained run; baseline run takes no adapter.")
+                   help="LoRA safetensors from M3/M4. REQUIRED with --adapter subprocess|python_api; "
+                        "passed as --lora-adapter for the trained run.")
     p.add_argument("--low-noise-ckpt", type=str, default=None,
-                   help="Optional explicit path to frozen low-noise expert; if omitted, "
-                        "inference_smoke defaults to <upstream>/low_noise_model/ "
-                        "(canonical sharded layout, AC-7.3 SHA stamped either way).")
+                   help="Optional explicit frozen low-noise expert path; defaults to "
+                        "<upstream>/low_noise_model/.")
     p.add_argument("--upstream", type=str, default=None,
-                   help="Canonical Wan2.2-I2V-A14B root. REQUIRED with --adapter subprocess|"
-                        "python_api. Used to construct UpstreamPaths for the python_api adapter "
-                        "and passed as --upstream to inference_smoke's CLI.")
+                   help="Canonical Wan2.2-I2V-A14B root. REQUIRED with --adapter subprocess|python_api.")
     p.add_argument("--recipe-yaml", type=str, default=None,
-                   help="Optional recipe YAML override. Default = orchestrator-local "
-                        "humanize/dpo_v0/recipes/wan22_i2v_a14b__round2_v0.yaml. "
-                        "Passed as --recipe-yaml to inference_smoke.")
+                   help="Optional recipe YAML override. Default = recipes/wan22_i2v_a14b__round2_v0.yaml.")
     p.add_argument("--device", type=str, default="cuda",
-                   help="Device for python_api adapter (passed to run_one_sample). "
-                        "Subprocess adapter relies on inference_smoke's --device.")
+                   help="Device for python_api adapter (passed to run_one_sample).")
     p.add_argument("--seed", type=int, default=42,
                    help="Generation seed (byte-identical between baseline and trained).")
-    p.add_argument("--sampler", type=str, default="uni_pc",
-                   help="Sampler name; defaults to 'uni_pc' per rl5 inference_smoke.py CLI lock.")
+    p.add_argument("--sampler", type=str, default="wan_default_flow_match",
+                   help="Sampler name stamped into gen_config.")
     p.add_argument("--inference-steps", type=int, default=50)
     p.add_argument("--guidance-scale", type=float, default=5.0)
     p.add_argument("--negative-prompt", type=str, default="")
     p.add_argument("--resolution", type=str, default="832x480",
                    help="WxH; defaults to 832x480 per parent-plan training resolution.")
     p.add_argument("--num-frames", type=int, default=81)
-    p.add_argument("--dtype", type=str, default="bf16",
-                   help="dtype tag stamped into gen_config; defaults to 'bf16' per rl5 schema.")
+    p.add_argument("--dtype", type=str, default="torch.bfloat16",
+                   help="dtype tag stamped into gen_config; matches inference_smoke schema.")
     p.add_argument("--selection-rule", choices=["first_alpha", "first_in_record_order"],
                    default="first_alpha")
     p.add_argument("--cond-image-fallback-root", type=pathlib.Path, default=None,
@@ -987,37 +899,25 @@ def main() -> int:
                         "<fallback_root>/<basename>; otherwise leave path as-is so loader "
                         "fails with the real error.")
     p.add_argument("--limit-prompts", type=int, default=None,
-                   help="If set, run only the first N prompts after canonical selection "
-                        "(deterministic order by prompt_id). Used for M6 partial-heldout scope "
-                        "(e.g. 8-prompt smoke before full 42-prompt run). Applied AFTER "
-                        "selection so the same N prompts always come out, regardless of rank "
-                        "sharding (sharding is index-mod-world_size on top).")
+                   help="Run only the first N prompts (deterministic order by prompt_id). "
+                        "Applied before rank sharding so the same N prompts come out regardless "
+                        "of world_size.")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
     p.add_argument("--cache-pipe", action="store_true",
-                   help="python_api adapter only: build the WanVideoPipeline (~95 GB) "
-                        "ONCE per rank-process and reuse it across all assigned prompts. "
-                        "Without this, each (prompt, mode) call rebuilds the pipeline — "
-                        "fine for round-2 M6 (16 ranks × 1 call/rank) but blows up for "
-                        "full 42-prompt × world_size=8 (10-11 calls/rank). Implies "
-                        "--mode-batched (DiffSynth has no LoRA detach path; trained run "
-                        "after baseline run requires LoRA attached, then it cannot be "
-                        "removed without rebuilding pipe).")
+                   help="python_api adapter only: build the WanVideoPipeline (~95 GB) once per "
+                        "rank and reuse it across calls. Implies --mode-batched (DiffSynth has "
+                        "no clean LoRA detach path).")
     p.add_argument("--mode-batched", action="store_true",
-                   help="Per rank, run all baseline prompts first, then all trained "
-                        "prompts. Required when --cache-pipe is set; safe to enable "
-                        "without it (only changes call ordering, not byte-equality). "
-                        "Mode-batched ordering means LoRA attaches exactly once per rank "
-                        "(between baseline pass and trained pass).")
+                   help="Per rank, run all baselines first then all trained. Required with "
+                        "--cache-pipe; safe to enable without it (only changes ordering).")
     p.add_argument("--rank", type=int, default=int(os.environ.get("RANK", "0")))
     p.add_argument("--world-size", type=int, default=int(os.environ.get("WORLD_SIZE", "1")))
     p.add_argument("--compute-envelope",
                    choices=["single_gpu", "dpo_multi_gpu_ddp", "dpo_multi_gpu_zero2",
                             "multi_gpu_inference_seed_parallel"],
                    default="single_gpu",
-                   help="DEC-6 envelope tag stamped into the run manifest. "
-                        "Inference defaults to 'single_gpu'; M6 4-rank parallel-by-seed is "
-                        "'multi_gpu_inference_seed_parallel' (DEC-6 i2v.md L76).")
+                   help="DEC-6 envelope tag stamped into the run manifest.")
     args = p.parse_args()
 
     if args.adapter in ("subprocess", "python_api"):
@@ -1028,8 +928,7 @@ def main() -> int:
             missing.append("--trained-lora")
         if missing:
             print(
-                f"[heldout_regen] {', '.join(missing)} required with --adapter "
-                f"{args.adapter} (per rl5 inference_smoke.py actual CLI / Python API).",
+                f"[heldout_regen] {', '.join(missing)} required with --adapter {args.adapter}.",
                 file=sys.stderr,
             )
             return 2
@@ -1062,7 +961,7 @@ def main() -> int:
         )
         print(f"[selection] {n_fallback}/{len(selections)} cond images resolved via fallback", flush=True)
 
-    # 3b. partial-heldout slice (M6 partial scope before full 42-prompt run)
+    # 3b. partial-heldout slice (deterministic order by prompt_id)
     if args.limit_prompts is not None:
         if args.limit_prompts < 1:
             raise SystemExit(f"--limit-prompts must be >= 1, got {args.limit_prompts}")
@@ -1071,11 +970,7 @@ def main() -> int:
                 f"--limit-prompts {args.limit_prompts} > {len(selections)} canonical prompts available"
             )
         selections = selections[: args.limit_prompts]
-        print(
-            f"[selection] sliced to first {args.limit_prompts} prompts (M6 partial scope); "
-            f"deterministic order by prompt_id",
-            flush=True,
-        )
+        print(f"[selection] sliced to first {args.limit_prompts} prompts", flush=True)
 
     # 4. byte-identical generation_config
     res = args.resolution.lower().split("x")
@@ -1136,7 +1031,7 @@ def main() -> int:
     ckpt_args["device"] = args.device
 
     # 6. run-level dir + manifest
-    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = args.out_dir / ts
     run_dir.mkdir(parents=True, exist_ok=True)
     run_manifest_pre = {

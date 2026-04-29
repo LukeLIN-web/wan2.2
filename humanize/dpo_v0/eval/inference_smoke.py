@@ -50,12 +50,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 def _resolve_recipes_dir() -> pathlib.Path:
-    # Older checkout layout: humanize/dpo_v0/inference_smoke.py with
-    #   recipes at humanize/dpo_v0/recipes/.
-    # Newer checkout layout: humanize/dpo_v0/eval/inference_smoke.py with
-    #   recipes at humanize/dpo_v0/recipes/.
-    # Walk parents until a candidate `recipes/recipe_id` sidecar is found,
-    # so the same source works in either checkout.
+    """Walk parents until ``recipes/recipe_id`` is found; tolerates flat or
+    eval/-subdir layouts."""
     for cand in (HERE / "recipes", HERE.parent / "recipes"):
         if (cand / "recipe_id").exists():
             return cand
@@ -64,9 +60,7 @@ def _resolve_recipes_dir() -> pathlib.Path:
 
 RECIPES_DIR = _resolve_recipes_dir()
 DPO_ROOT = RECIPES_DIR.parent  # humanize/dpo_v0/
-# AC-3.1 (videodpo/humanize/i2v.md line 26): recipe_id is frozen at this
-# value across the parent plan and the i2v plan; any drift halts before
-# any forward pass.
+# AC-3.1: frozen recipe_id; any drift halts before any forward pass.
 EXPECTED_RECIPE_ID = "6bef6e104cdd3442"
 
 # AC-3.5: hard scheduler/codec pins shared with the trainer.
@@ -74,10 +68,7 @@ SWITCH_DIT_BOUNDARY = 0.9
 NUM_FRAMES = 81
 FPS = 16
 
-# AC-6 / DEC-6 (i2v.md line 76, line 214): canonical envelope enum shared
-# across trainer (`dpo_multi_gpu_ddp` round-3 honest enum, `_zero2` round-4+
-# aspiration), inference smoke (`single_gpu` by contract), and M6 heldout
-# regen (`multi_gpu_inference_seed_parallel` 4-rank seed-parallel inference).
+# DEC-6: canonical envelope enum shared across trainer / smoke / M6.
 COMPUTE_ENVELOPES_CANONICAL = (
     "single_gpu",
     "dpo_multi_gpu_ddp",
@@ -103,11 +94,8 @@ DEFAULT_NEGATIVE_PROMPT = (
 
 def assert_recipe_pin(recipes_dir: pathlib.Path = RECIPES_DIR,
                       expected: str = EXPECTED_RECIPE_ID) -> str:
-    """Recompute sha256(canonical_yaml.bytes)[:16] and assert pin equality.
-
-    Mirrors the trainer's pin assertion so the smoke run shares the same
-    provenance contract.
-    """
+    """Recompute sha256(canonical_yaml.bytes)[:16] and 3-way assert against
+    on-disk pin and ``expected``."""
     yaml_bytes = (recipes_dir / "wan22_i2v_a14b__round2_v0.yaml").read_bytes()
     fresh = hashlib.sha256(yaml_bytes).hexdigest()[:16]
     on_disk = (recipes_dir / "recipe_id").read_text(encoding="ascii").strip()
@@ -127,14 +115,9 @@ def file_sha256(path: pathlib.Path, buf: int = 4 * 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-# Sidecar-cached aggregated shard sha256 is shared across every inference
-# entrypoint via humanize/dpo_v0/file_sha_cache.py (cache file at
-# <upstream_root>/file_sha.cache.json). Aggregation byte stream is
-# byte-equal to a cold recompute, so AC-7.3 manifest stamps are unchanged.
-# Import is layout-tolerant: inference_smoke.py lives at humanize/dpo_v0/
-# in older checkouts and humanize/dpo_v0/eval/ in newer ones; the util
-# always sits next to humanize/dpo_v0/, so we walk parents until we find
-# it.
+# Sidecar-cached aggregated shard sha256, shared via humanize/dpo_v0/file_sha_cache.py.
+# Layout-tolerant import: file_sha_cache.py sits next to humanize/dpo_v0/ regardless
+# of whether this file is at humanize/dpo_v0/ or humanize/dpo_v0/eval/.
 def _import_file_sha_cache():
     import importlib.util as _ilu
     here = pathlib.Path(__file__).resolve()
@@ -330,7 +313,7 @@ def serialize_generation_config(cfg: dict) -> bytes:
 
 
 def timestamp() -> str:
-    return datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def run_one_sample(
@@ -355,40 +338,22 @@ def run_one_sample(
 ) -> dict[str, Any]:
     """Run one inference sample and write video + manifest.
 
-    Public Python API used by both the CLI entry point and by the M6 heldout
-    regen orchestrator (`heldout_regen.py`'s ``python_api_inference_adapter``).
-    Returns the in-memory manifest dict so the caller can read back the
-    stamped ``ckpt_shas`` block (AC-7.3 load-side ground truth) and route
-    them into a per-prompt manifest without re-reading the file.
+    Public Python API used by the CLI entry point and by M6's heldout regen
+    orchestrator. Returns the manifest dict so the caller can read back
+    ``ckpt_shas`` (AC-7.3 load-side ground truth) without re-reading the file.
 
-    ``mode`` is ``"baseline"`` (no LoRA) or ``"trained"`` (LoRA on pipe.dit
-    high-noise only). The ``run_label`` directory under ``out_dir`` is the
-    same value, so the on-disk layout is ``out_dir/<mode>/<ts>/...``.
+    ``mode`` is ``"baseline"`` (no LoRA) or ``"trained"`` (LoRA on pipe.dit).
+    On-disk layout is ``out_dir/<mode>/<ts>/...``.
 
-    ``high_noise_sha`` / ``low_noise_sha`` are optional cached hashes from
-    ``sharded_ckpt_sha(...)``; passing them avoids recomputing the same
-    digest twice when the caller runs both modes back-to-back. If omitted,
-    they are computed inline.
+    ``high_noise_sha`` / ``low_noise_sha`` / ``lora_sha`` are optional caches;
+    when omitted they are computed inline.
 
-    ``pipe`` lets a multi-call caller (M6 heldout regen orchestrator with
-    ``world_size << len(prompts)``) build the ~95 GB Wan2.2-I2V-A14B
-    pipeline once and reuse it across many ``run_one_sample`` calls. When
-    ``None``, a fresh pipeline is built (single-call CLI default). When a
-    pipe is provided, the caller is responsible for: (1) building it from
-    the SAME ``upstream`` and ``torch_dtype`` / ``device`` that this call
-    will record into the manifest, (2) tracking LoRA attachment state via
-    ``lora_already_attached``.
-
-    ``lora_already_attached`` is True when the caller has already called
-    ``attach_lora(pipe, lora_adapter_path)`` for the same path. When True,
-    this function skips the attach call but still records ``lora_sha``
-    into the manifest. When False (default) and ``mode == "trained"``,
-    this function calls ``attach_lora`` itself. DiffSynth does not expose
-    a clean detach path, so the caller must rebuild ``pipe`` between
-    different LoRA paths or between trained → baseline transitions.
-
-    ``lora_sha`` lets the caller skip the per-call ``file_sha256`` of the
-    LoRA file when batching many trained runs against the same adapter.
+    ``pipe`` lets a multi-call caller (e.g. heldout regen with
+    ``world_size << len(prompts)``) build the ~95 GB pipeline once and reuse
+    it. When provided, the caller MUST build it from the same ``upstream`` /
+    ``torch_dtype`` / ``device`` recorded here, and track LoRA attach state
+    via ``lora_already_attached`` (DiffSynth has no clean detach path; rebuild
+    is required between different LoRA paths or trained→baseline).
     """
     if mode not in ("baseline", "trained"):
         raise ValueError(f"mode must be 'baseline' or 'trained'; got {mode!r}")
@@ -461,17 +426,11 @@ def run_one_sample(
     from diffsynth.utils.data import save_video
     save_video(video, str(video_path), fps=generation_config["fps"], quality=5)
 
-    # Per-shard SHAs are recorded by the loader's manifest at
-    # humanize/dpo_v0/loader/out/<ts>/{high_noise,low_noise}/manifest.json;
-    # we record the upstream root here and let the cross-reference happen
-    # via the loader manifest path stored alongside.
+    # AC-7.3: baseline stamps high_noise + low_noise SHAs; trained additionally
+    # stamps lora_adapter_sha. All three come from the load-side, so M6's
+    # `_extract_ckpt_shas` can trust the manifest as ground truth even when the
+    # on-disk path was rewritten by a deploy step.
     cond_image_sha = file_sha256(cond_image_path)
-    # AC-7.3 (i2v.md line 59): baseline run stamps original_high_noise_sha +
-    # low_noise_frozen_sha; trained run additionally stamps lora_adapter_sha.
-    # All three values come from the load-side (this process actually opened
-    # the file bytes), so the consumer (M6 orchestrator's
-    # `_extract_ckpt_shas`) can trust the manifest as ground truth even when
-    # the on-disk path was rewritten by a sed/scp deploy step.
     ckpt_shas: dict[str, Optional[str]] = {
         "high_noise_base_sha256": high_noise_sha,
         "low_noise_frozen_sha256": low_noise_sha,
@@ -480,8 +439,7 @@ def run_one_sample(
     manifest = {
         "schema_version": 1,
         "mode": mode,
-        # `run_label` retained for backward compatibility with consumers that
-        # were on luke's round-1 dual-mode field name; same value as `mode`.
+        # `run_label` retained for backward compatibility with older consumers.
         "run_label": mode,
         "run_dir": str(run_dir),
         "timestamp_utc": run_dir.name,
@@ -548,57 +506,38 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["both", "baseline", "trained"],
         default="both",
         help=(
-            "Which sample(s) to run. Default 'both' runs baseline followed by "
-            "trained under one shared generation_config (M5 / AC-7.0 smoke "
-            "contract). 'baseline' / 'trained' run a single sample for "
-            "callers that want to drive baseline + trained as separate "
-            "subprocess invocations (M6 heldout regen orchestrator)."
+            "'both' runs baseline followed by trained under one shared "
+            "generation_config (smoke). 'baseline' / 'trained' run a single "
+            "sample for callers driving them as separate subprocess invocations."
         ),
     )
     parser.add_argument(
         "--lora-adapter",
         type=pathlib.Path,
         default=None,
-        help=(
-            "Path to the trained LoRA safetensors. Produced by "
-            "train_dpo_i2v.py at the end of M3/M4. Required for "
-            "--mode in {both, trained}; rejected with --mode=baseline."
-        ),
+        help="LoRA safetensors. Required for --mode in {both, trained}; rejected with baseline.",
     )
     parser.add_argument(
         "--low-noise-ckpt",
         type=pathlib.Path,
         default=None,
-        help=(
-            "Optional explicit path to the frozen low-noise expert directory "
-            "or single-file ckpt. Defaults to <upstream>/low_noise_model/ "
-            "(canonical sharded layout). The path is recorded under "
-            "ckpt_paths.low_noise_frozen and its merged shard hash is "
-            "stamped under ckpt_shas.low_noise_frozen_sha256 (AC-7.3)."
-        ),
+        help="Optional explicit frozen low-noise expert path; defaults to <upstream>/low_noise_model/.",
     )
     parser.add_argument(
         "--gen-config-json",
         type=pathlib.Path,
         default=None,
         help=(
-            "Path to a pre-built generation_config.json (typically built once "
-            "by an upstream orchestrator like M6 heldout_regen.py and reused "
-            "across both baseline and trained runs). When given, the bytes "
-            "are loaded verbatim and used as the byte-identical config; the "
-            "argparse generation knobs are ignored to avoid drift."
+            "Path to a pre-built generation_config.json. When given, the bytes "
+            "are loaded verbatim as the byte-identical config; argparse generation "
+            "knobs are ignored to avoid drift."
         ),
     )
     parser.add_argument(
         "--recipe-yaml",
         type=pathlib.Path,
         default=None,
-        help=(
-            "Path to the canonical recipe YAML. Defaults to "
-            "<this_dir>/recipes/wan22_i2v_a14b__round2_v0.yaml. The "
-            "recipe_id pin assert is recomputed from the YAML bytes "
-            "(AC-3.1) before any forward pass."
-        ),
+        help="Recipe YAML; defaults to <this_dir>/recipes/wan22_i2v_a14b__round2_v0.yaml.",
     )
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument(
@@ -607,8 +546,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         required=True,
         help=(
             "Conditioning image. For the 42-prompt heldout pass this MUST "
-            "come from <T0_T3_ROOT>/t2/image_manifest.json (AC-7.1); the "
-            "smoke entrypoint trusts the caller."
+            "come from <T0_T3_ROOT>/t2/image_manifest.json (AC-7.1)."
         ),
     )
     parser.add_argument(
@@ -647,23 +585,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=str,
         default="single_gpu",
         choices=list(COMPUTE_ENVELOPES_CANONICAL),
-        help=(
-            "Stamped per-run; DEC-6 / i2v.md line 76 + line 214. "
-            "Smoke is single_gpu by contract. The full canonical enum "
-            "(`single_gpu`, `dpo_multi_gpu_ddp`, `dpo_multi_gpu_zero2`, "
-            "`multi_gpu_inference_seed_parallel`) is exposed so this "
-            "module's manifest can be cross-checked against trainer + "
-            "M6 orchestrator manifests under the same field domain."
-        ),
+        help="DEC-6 envelope tag stamped per-run. Smoke is single_gpu by contract.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help=(
-            "Validate args + recipe pin + upstream presence + serialize the "
-            "generation_config, then exit before constructing the pipeline. "
-            "Useful for unit-style checks without GPU."
-        ),
+        help="Validate args + pin + upstream + config, then exit before pipeline build.",
     )
     args = parser.parse_args(argv)
     args.torch_dtype = {
@@ -676,15 +603,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             f"--switch-DiT-boundary must be {SWITCH_DIT_BOUNDARY} (AC-3.5); "
             f"got {args.switch_DiT_boundary}"
         )
-    # AC-3.5 pins num_frames=81 / fps=16 for eval. The eval pipeline
-    # supplies these via `--gen-config-json` (canonical generation_config
-    # built by heldout_regen.py), which bypasses argparse entirely, so
-    # the eval contract is still enforced at the orchestrator level. The
-    # argparse defaults match the pin (81 / 16); we no longer assert
-    # equality here so dev / smoke runs can lower num_frames (e.g. 41,
-    # half the denoise) or fps (mp4 metadata only) without patching the
-    # source. The actual values are stamped into the per-run manifest's
-    # generation_config block, so any deviation is auditable.
+    # AC-3.5 pins num_frames=81 / fps=16 for the canonical eval, but the eval
+    # pipeline supplies these via --gen-config-json (which bypasses argparse).
+    # Argparse defaults match the pin; we don't assert equality so dev/smoke
+    # runs can lower num_frames or fps. Actual values are stamped per-run.
     if args.num_frames < 1:
         raise SystemExit(f"--num-frames must be >= 1; got {args.num_frames}")
     if (args.num_frames - 1) % 4 != 0:
@@ -696,9 +618,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     if args.fps < 1:
         raise SystemExit(f"--fps must be >= 1; got {args.fps}")
 
-    # Mode-conditioned arg validation. `both` and `trained` need the LoRA
-    # adapter; `baseline` rejects it (so a stray --lora-adapter never
-    # accidentally taints a baseline run by being silently ignored).
+    # Mode-conditioned LoRA validation: baseline rejects --lora-adapter so a
+    # stray flag never silently taints a baseline run.
     if args.mode in ("both", "trained") and args.lora_adapter is None:
         raise SystemExit(
             f"--mode={args.mode} requires --lora-adapter <path>; got None"

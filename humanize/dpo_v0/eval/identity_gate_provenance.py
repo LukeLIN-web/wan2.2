@@ -74,7 +74,7 @@ def main(argv: list[str]) -> int:
     verdict = "PASS" if sha_match and sidecar_match and agree else "FAIL"
     report = {
         "verdict": verdict,
-        "checked_at_utc": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "checked_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "policy_manifest": str(args.policy_manifest),
         "reference_manifest": str(args.reference_manifest),
         "policy_merged_state_sha256": policy_sha,

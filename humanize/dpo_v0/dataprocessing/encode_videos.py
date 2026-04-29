@@ -46,6 +46,7 @@ from dataprocessing.manifest_writer import (  # noqa: E402
     _file_sha256,
     assert_recipe_pins,
 )
+from file_sha_cache import cached_file_sha256  # noqa: E402
 
 # All paths support env-var override so the encoder runs on boxes without
 # /shared mounted (juyi-finetune / juyi-videorl). Defaults are the nnmc59
@@ -260,7 +261,7 @@ def main(argv: list[str]) -> int:
     print(f"selected tier={args.tier}, pairs={len(pair_ids)}")
 
     print(f"hashing VAE at {VAE_PATH} ...")
-    vae_sha = _file_sha256(VAE_PATH)
+    vae_sha = cached_file_sha256(VAE_PATH)
     print(f"vae_sha256 = {vae_sha}")
 
     dtype_t = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
@@ -272,7 +273,7 @@ def main(argv: list[str]) -> int:
     vae = Wan2_1_VAE(z_dim=16, vae_pth=str(VAE_PATH), dtype=dtype_t, device=str(device))
     print("vae ready")
 
-    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = args.out_root / ts / args.tier
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "manifest.jsonl"
@@ -282,13 +283,9 @@ def main(argv: list[str]) -> int:
         for pair_id in pair_ids:
             record = post_t2[pair_id]
             for role in ("winner", "loser"):
-                try:
-                    entry = encode_pair_role(
-                        record, role, vae, out_dir, recipe_id, vae_sha, blocklist, device, dtype_t,
-                    )
-                except Exception as e:
-                    print(f"FAIL {pair_id}/{role}: {e}")
-                    raise
+                entry = encode_pair_role(
+                    record, role, vae, out_dir, recipe_id, vae_sha, blocklist, device, dtype_t,
+                )
                 line = json.dumps(dataclasses.asdict(entry), sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
                 f.write(line)
                 f.flush()

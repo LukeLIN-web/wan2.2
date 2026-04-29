@@ -28,7 +28,6 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import os
 import pathlib
 import random
 import sys
@@ -86,7 +85,7 @@ def filter_present(tier_b_ids, pair_by_id, image_manifest, heldout_scenes):
             drops["image_status_not_ok"].append({"pair_id": pid, "status": im_entry.get("status")})
             continue
         image_path = im_entry["image_path"]
-        if not os.path.isfile(image_path):
+        if not pathlib.Path(image_path).is_file():
             drops["image_path_disk_missing"].append({"pair_id": pid, "image_path": image_path})
             continue
         if pair["filename"] in heldout_scenes:
@@ -147,7 +146,7 @@ def main(argv=None):
     pair_ids_sha256_full = canonical_pair_ids_sha256(selected)
     pair_ids_sha256_hex16 = pair_ids_sha256_full[:16]
 
-    utc = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    utc = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = pathlib.Path(args.out_dir) / utc
     out_dir.mkdir(parents=True, exist_ok=True)
 
