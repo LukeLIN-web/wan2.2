@@ -74,6 +74,7 @@ def _wandb_init(args, ts, recipe_id, world_size, run_dir):
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "max_steps": args.max_steps,
+        "num_epochs": args.num_epochs,
         "seed_namespace": args.seed_namespace,
         "world_size": world_size,
         "dit_fsdp": args.dit_fsdp,
@@ -203,6 +204,14 @@ def assert_pair_ids_pin(
         f"n_pairs={len(pair_ids)}"
     )
     return fresh
+
+
+def target_steps_for_epochs(num_epochs: float, steps_per_epoch: int) -> int:
+    if num_epochs <= 0:
+        raise ValueError(f"num_epochs must be > 0, got {num_epochs}")
+    if steps_per_epoch <= 0:
+        raise ValueError(f"steps_per_epoch must be > 0, got {steps_per_epoch}")
+    return max(1, math.ceil(num_epochs * steps_per_epoch))
 
 
 def assert_model_asset_pins(upstream: pathlib.Path) -> dict[str, str]:
@@ -588,6 +597,13 @@ def main():
     p.add_argument("--out-dir", type=pathlib.Path, default=DPO_ROOT / "ckpts")
     p.add_argument("--tier", choices=["tier_a", "tier_b"], default="tier_a")
     p.add_argument("--max-steps", type=int, default=200)
+    p.add_argument(
+        "--num-epochs",
+        type=float,
+        default=None,
+        help="Train for this many epochs over the per-rank DataLoader. Supports fractional values "
+             "such as 0.8. If set, it takes precedence over --max-steps.",
+    )
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--lora-rank", type=int, default=16)
@@ -639,7 +655,7 @@ def main():
         type=pathlib.Path,
         default=None,
         help="Round-4 training_config_round4.yaml path. When set, hyperparameters "
-             "(lr/max_steps/beta/lora_rank/lora_alpha/seed_namespace) are read from "
+             "(lr/num_epochs or max_steps/beta/lora_rank/lora_alpha/seed_namespace) are read from "
              "the YAML and override CLI defaults.",
     )
     p.add_argument(
@@ -678,6 +694,26 @@ def main():
 
     recipe_id = assert_recipe_pin(RECIPES_DIR, EXPECTED_RECIPE_ID)
     print(f"[recipe pin] OK: {recipe_id}", flush=True)
+
+    # Validate paired pin args before expensive model asset hashing so bad launch
+    # commands fail immediately and tests can exercise the guard with fake paths.
+    if args.training_config_path is not None and args.training_config_sha256_pin is None:
+        raise SystemExit(
+            "--training-config-path set without --training-config-sha256-pin; both required together."
+        )
+    if args.training_config_sha256_pin is not None and args.training_config_path is None:
+        raise SystemExit(
+            "--training-config-sha256-pin set without --training-config-path; both required together."
+        )
+    if args.subset_pair_ids_json is not None and args.pair_ids_sha256_pin is None:
+        raise SystemExit(
+            "--subset-pair-ids-json set without --pair-ids-sha256-pin; both required together."
+        )
+    if args.pair_ids_sha256_pin is not None and args.subset_pair_ids_json is None:
+        raise SystemExit(
+            "--pair-ids-sha256-pin set without --subset-pair-ids-json; both required together."
+        )
+
     asset_pins = assert_model_asset_pins(args.upstream)
     print(
         "[asset pins] OK: "
@@ -699,10 +735,16 @@ def main():
         training_config_dict = assert_training_config_pin(
             args.training_config_path, args.training_config_sha256_pin
         )
+        has_num_epochs = "num_epochs" in training_config_dict or "epochs" in training_config_dict
+        if has_num_epochs and "max_steps" in training_config_dict:
+            raise SystemExit(
+                "training_config must set only one of num_epochs/epochs or max_steps."
+            )
         # Override CLI defaults with YAML values (YAML is the source of truth for round-4).
         for cli_attr, yaml_key in (
             ("lr", "lr"),
             ("max_steps", "max_steps"),
+            ("num_epochs", "num_epochs"),
             ("beta", "beta"),
             ("lora_rank", "lora_rank"),
             ("lora_alpha", "lora_alpha"),
@@ -710,9 +752,14 @@ def main():
         ):
             if yaml_key in training_config_dict:
                 setattr(args, cli_attr, training_config_dict[yaml_key])
+        if "epochs" in training_config_dict:
+            args.num_epochs = training_config_dict["epochs"]
+        if "max_steps" in training_config_dict and not has_num_epochs:
+            args.num_epochs = None
         print(
             f"[training_config pin] OK: {args.training_config_sha256_pin} "
-            f"(lr={args.lr} max_steps={args.max_steps} beta={args.beta} "
+            f"(lr={args.lr} num_epochs={args.num_epochs} "
+            f"max_steps={args.max_steps if args.num_epochs is None else None} beta={args.beta} "
             f"lora_rank={args.lora_rank} lora_alpha={args.lora_alpha} "
             f"seed_namespace={args.seed_namespace} "
             f"max_pairs={training_config_dict.get('max_pairs')})",
@@ -988,6 +1035,26 @@ def main():
         sampler = None
         loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_single, num_workers=0)
 
+    steps_per_epoch = len(loader)
+    if args.num_epochs is not None:
+        args.num_epochs = float(args.num_epochs)
+        target_steps = target_steps_for_epochs(args.num_epochs, steps_per_epoch)
+        control_mode = "epoch"
+    else:
+        if args.max_steps <= 0:
+            raise ValueError(f"max_steps must be > 0, got {args.max_steps}")
+        target_steps = int(args.max_steps)
+        control_mode = "step"
+    target_epochs = target_steps / steps_per_epoch
+    if is_main:
+        print(
+            f"[schedule] control={control_mode} num_epochs={args.num_epochs} "
+            f"max_steps={args.max_steps if control_mode == 'step' else None} "
+            f"steps_per_epoch={steps_per_epoch} target_steps={target_steps} "
+            f"target_epochs={target_epochs:.6g}",
+            flush=True,
+        )
+
     losses: list[float] = []
     acc_window: deque[int] = deque(maxlen=50)
     step = 0
@@ -1009,11 +1076,12 @@ def main():
             state, meta = collect_lora_state(inner)
             safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
 
-    while step < args.max_steps:
+    epoch_index = 0
+    while step < target_steps:
         if sampler is not None:
-            sampler.set_epoch(step // max(1, len(dataset)))
-        for data in loader:
-            if step >= args.max_steps:
+            sampler.set_epoch(epoch_index)
+        for batch_in_epoch, data in enumerate(loader):
+            if step >= target_steps:
                 break
             pid = data["pair_id"]
             wlat = data["winner_latent"].to(device=device, dtype=dtype)
@@ -1159,8 +1227,10 @@ def main():
                 elapsed = time.time() - wall_start
                 vram_alloc_gb = torch.cuda.max_memory_allocated(device) / 1024**3
                 vram_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024**3
+                epoch_progress = epoch_index + (batch_in_epoch + 1) / steps_per_epoch
                 print(
-                    f"[step {step}/{args.max_steps}] pair={pid[:8]} t_raw={t_raw} loss={loss_val:.4f} "
+                    f"[step {step}/{target_steps}] epoch={epoch_progress:.4g}/{target_epochs:.4g} "
+                    f"pair={pid[:8]} t_raw={t_raw} loss={loss_val:.4f} "
                     f"gnorm={grad_norm:.3g} margin={logit:.3g} "
                     f"elapsed={elapsed:.1f}s vram_peak={vram_alloc_gb:.2f}GB reserved={vram_reserved_gb:.2f}GB",
                     flush=True,
@@ -1214,6 +1284,7 @@ def main():
                     print(f"[step {step}] saved {ckpt_path}", flush=True)
 
             step += 1
+        epoch_index += 1
 
     wall_seconds = time.time() - wall_start
 
@@ -1225,8 +1296,13 @@ def main():
     if is_main:
         manifest = {
             "tier": args.tier,
-            "max_steps": args.max_steps,
+            "control_mode": control_mode,
+            "num_epochs": args.num_epochs,
+            "max_steps": args.max_steps if control_mode == "step" else None,
+            "target_steps": target_steps,
+            "steps_per_epoch": steps_per_epoch,
             "actual_steps": step,
+            "actual_epochs": step / steps_per_epoch,
             "lr": args.lr,
             "beta": args.beta,
             "lora_rank": args.lora_rank,

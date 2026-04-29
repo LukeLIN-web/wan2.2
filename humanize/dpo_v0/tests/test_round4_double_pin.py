@@ -41,13 +41,27 @@ def test_assert_training_config_pin_round4():
     assert config["lr"] == 5.0e-5
     assert config["max_steps"] == 200
     assert config["max_pairs"] == 1000
-    assert config["beta"] == 0.1
+    assert config["beta"] == 1000
     assert config["lora_rank"] == 16
     assert config["lora_alpha"] == 16
     assert config["seed_namespace"] == "round4-tier_b-1k"
     assert config["sampling_band"] == [901, 999]
     assert config["round_tag"] == "round-4"
     assert config["subset_pair_ids_sha256_hex16"] == "cf5d3e5fd528a3e0"
+
+
+def test_assert_training_config_pin_round4_lr1e5_uses_epoch_control():
+    config_path = RECIPES_DIR / "training_config_round4_lr1e5.yaml"
+    pin_file = RECIPES_DIR / "training_config_round4_lr1e5_sha256_pin"
+    expected = pin_file.read_text(encoding="ascii").strip()
+    config = trainer.assert_training_config_pin(config_path, expected)
+    assert config["lr"] == 1.0e-5
+    assert config["num_epochs"] == 0.8
+    assert "max_steps" not in config
+
+
+def test_fractional_epoch_schedule_matches_prior_round4_length():
+    assert trainer.target_steps_for_epochs(num_epochs=0.8, steps_per_epoch=250) == 200
 
 
 def test_assert_training_config_pin_drift_raises():
