@@ -24,6 +24,7 @@ models/
 wandb/
 !.claude/settings.json
 *.sh
+!humanize/dpo_v0/script/**/*.sh
 *.tex
 *.jsonl
 humanize/dpo_v0/out/
