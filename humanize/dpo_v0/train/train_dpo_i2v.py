@@ -1228,7 +1228,7 @@ def main():
                 vram_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024**3
                 epoch_progress = epoch_index + (batch_in_epoch + 1) / steps_per_epoch
                 print(
-                    f"[step {step}/{target_steps}] epoch={epoch_progress:.4g}/{target_epochs:.4g} "
+                    f"[step {step}/{target_steps}] epoch={epoch_progress:.4g}/{(target_steps / steps_per_epoch):.4g} "
                     f"pair={pid[:8]} t_raw={t_raw} loss={loss_val:.4f} "
                     f"gnorm={grad_norm:.3g} margin={logit:.3g} "
                     f"elapsed={elapsed:.1f}s vram_peak={vram_alloc_gb:.2f}GB reserved={vram_reserved_gb:.2f}GB",
