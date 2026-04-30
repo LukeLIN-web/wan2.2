@@ -54,12 +54,15 @@ _verify_pin() {
   printf '%s' "$actual"
 }
 
-# Verify all three round-4 pins (recipe, training_config, pair_ids).
+# Verify all three pins (recipe, training_config, pair_ids).
 # Args: <expect_recipe> <expect_train_cfg> <expect_pair_ids> <train_cfg_pin_file>
+# Env override (round-5+): PAIR_IDS_PIN_FILE can point at a non-round-4
+# pair_ids pin file; default keeps the round-4 path so existing launchers are
+# unchanged.
 verify_pins() {
   local expect_recipe="$1" expect_train_cfg="$2" expect_pair_ids="$3" train_cfg_pin="$4"
   local recipe_pin="$DPO_DIR/recipes/recipe_id"
-  local pair_ids_pin="$DPO_DIR/out/round4/20260428T160839Z/pair_ids_sha256_hex16_pin"
+  local pair_ids_pin="${PAIR_IDS_PIN_FILE:-$DPO_DIR/out/round4/20260428T160839Z/pair_ids_sha256_hex16_pin}"
   local actual_recipe actual_train_cfg actual_pair_ids
   actual_recipe="$(_verify_pin recipe_id "$expect_recipe" "$recipe_pin")"
   actual_train_cfg="$(_verify_pin training_config_sha256 "$expect_train_cfg" "$train_cfg_pin")"
