@@ -1098,9 +1098,14 @@ def main() -> int:
     # rank getting a different timestamp dir + racing on run_manifest.pre.json).
     marker_path = args.out_dir / ".run_ts"
     if args.rank == 0:
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(ts)
+        # rl9 patch: honor existing .run_ts marker so resume idempotency hits
+        # the previously-completed run dir under the same out_dir.
+        if marker_path.exists() and not args.no_resume:
+            ts = marker_path.read_text().strip()
+        else:
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            args.out_dir.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(ts)
     else:
         # Wait briefly for rank 0 to write the marker; bounded poll.
         import time as _t
