@@ -528,6 +528,69 @@ def collect_lora_state(model: nn.Module) -> tuple[dict[str, torch.Tensor], dict]
     return state, metadata
 
 
+def load_lora_state(model: nn.Module, ckpt_path: pathlib.Path) -> tuple[int, int]:
+    """Load LoRA A/B weights from a DiffSynth-canonical safetensors file into
+    already-injected ``LoRALinear`` modules. Inverse of :func:`collect_lora_state`.
+
+    Must be called AFTER :func:`inject_lora` and BEFORE FSDP ``shard_model`` so
+    weights load into unsharded params; each rank loads the full LoRA from disk
+    in parallel and then FSDP shards them across ranks. The saved keys are
+    pre-FSDP-stripped (``_save_lora`` strips ``_fsdp_wrapped_module.`` segments
+    so the on-disk layout matches the un-wrapped topology), and pre-FSDP
+    ``named_modules()`` here also has no such segments, so keys line up
+    directly.
+
+    Returns ``(n_modules_loaded, n_orphan_keys_in_ckpt)``.
+    Raises if any model module has no matching ckpt key, or if rank shapes
+    disagree between ckpt and current ``--lora-rank``.
+    """
+    state = safetensors.torch.load_file(str(ckpt_path))
+
+    name_to_mod: dict[str, "LoRALinear"] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, LoRALinear):
+            clean = name.replace("_fsdp_wrapped_module.", "")
+            name_to_mod[clean] = mod
+
+    expected_keys: set[str] = set()
+    for clean in name_to_mod:
+        expected_keys.add(f"{clean}.lora_A.weight")
+        expected_keys.add(f"{clean}.lora_B.weight")
+    actual_keys = set(state.keys())
+
+    missing = sorted(expected_keys - actual_keys)
+    extra = sorted(actual_keys - expected_keys)
+    if missing:
+        raise RuntimeError(
+            f"--init-lora-from: ckpt at {ckpt_path} is missing {len(missing)} "
+            f"key(s) that the freshly-injected LoRALinear modules require. "
+            f"First 5: {missing[:5]}"
+        )
+
+    n_loaded = 0
+    for clean, mod in name_to_mod.items():
+        a_loaded = state[f"{clean}.lora_A.weight"]  # saved as [rank, in_features]
+        b_loaded = state[f"{clean}.lora_B.weight"]  # saved as [out_features, rank]
+        if a_loaded.shape[0] != mod.rank:
+            raise RuntimeError(
+                f"--init-lora-from: {clean}.lora_A rank mismatch "
+                f"(ckpt rank={a_loaded.shape[0]} vs --lora-rank={mod.rank})"
+            )
+        if b_loaded.shape[1] != mod.rank:
+            raise RuntimeError(
+                f"--init-lora-from: {clean}.lora_B rank mismatch "
+                f"(ckpt rank={b_loaded.shape[1]} vs --lora-rank={mod.rank})"
+            )
+        with torch.no_grad():
+            # Saved tensors are .T relative to internal storage (see collect_lora_state);
+            # transpose back to [in_features, rank] / [rank, out_features].
+            mod.A.data.copy_(a_loaded.T.to(dtype=mod.A.dtype, device=mod.A.device))
+            mod.B.data.copy_(b_loaded.T.to(dtype=mod.B.dtype, device=mod.B.device))
+        n_loaded += 1
+
+    return n_loaded, len(extra)
+
+
 # ---------- Routing counter ----------
 
 
@@ -680,6 +743,33 @@ def main():
         help="Expected sha256[:16] of the canonical newline-joined pair_ids. "
              "Required when --subset-pair-ids-json is set.",
     )
+    # Round-5 warm-start args (task #50). --init-lora-from continues training
+    # from a previous round's lora_final.safetensors; --save-optimizer-state
+    # is forward-looking infra so future round-N+1 can resume AdamW momentum.
+    p.add_argument(
+        "--init-lora-from",
+        type=pathlib.Path,
+        default=None,
+        help="Optional safetensors file with LoRA weights (DiffSynth canonical "
+             "<module>.lora_A.weight / .lora_B.weight format, post-FSDP-strip "
+             "per _save_lora). Loaded into freshly-injected LoRALinear modules "
+             "after inject_lora() and before FSDP shard_model(). Use to "
+             "warm-start from a previous round's lora_final.safetensors. "
+             "Rank/alpha must match --lora-rank/--lora-alpha; ckpt must cover "
+             "every injected module (no missing keys).",
+    )
+    p.add_argument(
+        "--save-optimizer-state",
+        type=lambda s: s.lower() == "true",
+        default=True,
+        help="If true (default), save AdamW optimizer state alongside "
+             "lora_*.safetensors at every save_every checkpoint to enable "
+             "round-N+1 momentum continuation paired with --init-lora-from. "
+             "Saved as <stem>_optim.pt next to lora_<stem>.safetensors. "
+             "Under FSDP this uses FSDP.optim_state_dict (collective; "
+             "rank0_only materialization) so each ckpt has a full optim "
+             "state, not sharded. Set false to disable for disk-tight runs.",
+    )
     # Wandb (rank-0 only; failures are non-fatal so training never depends on wandb).
     p.add_argument("--wandb-project", type=str, default=None,
                    help="Wandb project name. If unset (or --wandb-mode disabled), wandb is skipped.")
@@ -809,10 +899,23 @@ def main():
     )
 
     # Round-4 subset filter (rl2 spec b98b72b1). When --subset-pair-ids-json is
-    # set, restrict records to the canonical 1k subset and assert pair_ids pin.
+    # set, restrict records to the canonical N-pair subset and assert pair_ids
+    # pin. Round-4 used the wrapper key "tier_b_round4_1k"; round-5+ uses
+    # different wrapper keys (e.g. "tier_b_round5_warm_1202") so locate the
+    # single non-meta dict that has a ".pair_ids" list rather than hard-coding.
     if args.subset_pair_ids_json is not None:
         subset_data = json.loads(args.subset_pair_ids_json.read_bytes())
-        subset_pair_ids = subset_data["tier_b_round4_1k"]["pair_ids"]
+        wrapper_candidates = [
+            (k, v) for k, v in subset_data.items()
+            if isinstance(v, dict) and isinstance(v.get("pair_ids"), list)
+        ]
+        if len(wrapper_candidates) != 1:
+            raise RuntimeError(
+                f"--subset-pair-ids-json: expected exactly 1 top-level key with "
+                f"a 'pair_ids' list child, got {len(wrapper_candidates)}: "
+                f"{[k for k, _ in wrapper_candidates]}"
+            )
+        subset_pair_ids = wrapper_candidates[0][1]["pair_ids"]
         assert_pair_ids_pin(subset_pair_ids, args.pair_ids_sha256_pin)
         subset_set = set(subset_pair_ids)
         before = len(records_all)
@@ -995,6 +1098,22 @@ def main():
     if is_main:
         print(f"[lora] injected on {len(matched_names)} modules; sample: {matched_names[:6]}", flush=True)
 
+    # Round-5 warm-start: optionally load LoRA weights from a previous round's
+    # safetensors file. Must run AFTER inject_lora (modules to load into) and
+    # BEFORE FSDP shard_model (so each rank loads the full LoRA in parallel,
+    # then FSDP shards). All ranks read the same file; the file is small
+    # (~150 MB for rank=16 on Wan 14B) so concurrent reads are fine.
+    if args.init_lora_from is not None:
+        if not args.init_lora_from.is_file():
+            raise SystemExit(f"--init-lora-from: file not found: {args.init_lora_from}")
+        n_loaded, n_orphan = load_lora_state(policy, args.init_lora_from)
+        if is_main:
+            print(
+                f"[init-lora-from] loaded {n_loaded} LoRA modules from "
+                f"{args.init_lora_from} (ckpt orphan keys: {n_orphan})",
+                flush=True,
+            )
+
     # rl9 precondition for ref-via-disabled-LoRA: no dropout in policy. WanModel uses
     # RMSNorm (no running stats) and flash attention without attention_dropout, so this
     # should be empty — but assert defensively in case a future commit adds dropout.
@@ -1074,6 +1193,22 @@ def main():
             inner = policy.module if is_distributed else policy
             state, meta = collect_lora_state(inner)
             safetensors.torch.save_file(state, str(ckpt_path), metadata={k: str(v) for k, v in meta.items()})
+
+        # Round-5 fwd-looking: optionally save AdamW optimizer state alongside the LoRA
+        # ckpt so future round-N+1 can resume momentum (paired with --init-lora-from).
+        # Saved as <stem>_optim.pt next to lora_<stem>.safetensors.
+        if args.save_optimizer_state:
+            opt_path = ckpt_path.with_name(ckpt_path.stem + "_optim.pt")
+            if args.dit_fsdp and is_distributed:
+                # FSDP.optim_state_dict is a collective; all ranks must enter.
+                # The returned dict on rank 0 contains the full unsharded optim
+                # state; on other ranks it is empty / partial. Only rank 0 writes.
+                from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+                optim_state = _FSDP.optim_state_dict(policy, optimizer)
+                if is_main:
+                    torch.save(optim_state, opt_path)
+            elif is_main:
+                torch.save(optimizer.state_dict(), opt_path)
 
     epoch_index = 0
     while step < target_steps:

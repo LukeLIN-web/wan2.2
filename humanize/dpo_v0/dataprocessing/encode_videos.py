@@ -210,24 +210,30 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument(
         "--tier",
-        choices=["tier_a", "tier_b_first_n", "tier_b_round4_1k"],
+        choices=["tier_a", "tier_b_first_n", "tier_b_round4_1k", "tier_b_subset"],
         default="tier_a",
         help="tier_b_round4_1k reads pair_ids from --subset-pair-ids-json's "
              "'tier_b_round4_1k.pair_ids' field (round-4 task #19 output) and "
-             "asserts pair_ids sha256[:16] == --pair-ids-sha256-pin.",
+             "asserts pair_ids sha256[:16] == --pair-ids-sha256-pin. "
+             "tier_b_subset is the round-5+ generic equivalent: locates the "
+             "single top-level wrapper key in --subset-pair-ids-json that "
+             "contains a 'pair_ids' list, asserts the same sha pin, and emits "
+             "the latent manifest under <out-root>/<UTC>/<wrapper_key>/.",
     )
     ap.add_argument("--tier-b-n", type=int, default=200, help="if --tier tier_b_first_n, encode the first N pair_ids")
     ap.add_argument(
         "--subset-pair-ids-json",
         type=pathlib.Path,
         default=None,
-        help="Required when --tier tier_b_round4_1k: path to T3_round4_tier_b_1k.json (round-4 #19 output).",
+        help="Required when --tier tier_b_round4_1k or tier_b_subset: "
+             "path to a JSON file with a wrapper key containing pair_ids list.",
     )
     ap.add_argument(
         "--pair-ids-sha256-pin",
         type=str,
         default=None,
-        help="Required when --tier tier_b_round4_1k: expected sha256[:16] of newline-canonical pair_ids.",
+        help="Required when --tier tier_b_round4_1k or tier_b_subset: "
+             "expected sha256[:16] of newline-canonical pair_ids.",
     )
     ap.add_argument("--out-root", type=pathlib.Path, default=DPO_ROOT / "latents")
     ap.add_argument("--device", default="cuda:0")
@@ -241,11 +247,16 @@ def main(argv: list[str]) -> int:
     blocklist = _heldout_blocklist(subset)
     print(f"heldout blocklist size: {len(blocklist)}")
     post_t2 = {r["pair_id"]: r for r in json.loads(POST_T2_PAIR_JSON.read_bytes())}
+    # `tier_subdir` is the on-disk subdir under out_root/<UTC>/. For round-4
+    # tier_b_round4_1k it equals args.tier verbatim; for round-5+ tier_b_subset
+    # we lift the wrapper key out of the JSON so multiple round-5+ runs don't
+    # collide under a single "tier_b_subset" dir.
+    tier_subdir: str = args.tier
     if args.tier == "tier_a":
         pair_ids = list(subset["tier_a"]["pair_ids"])
     elif args.tier == "tier_b_first_n":
         pair_ids = list(subset["tier_b"]["pair_ids"])[: args.tier_b_n]
-    else:  # tier_b_round4_1k
+    elif args.tier == "tier_b_round4_1k":
         if args.subset_pair_ids_json is None or args.pair_ids_sha256_pin is None:
             raise SystemExit(
                 "--tier tier_b_round4_1k requires --subset-pair-ids-json AND --pair-ids-sha256-pin"
@@ -258,6 +269,32 @@ def main(argv: list[str]) -> int:
                 f"pair_ids pin drift: fresh={fresh}, expected={args.pair_ids_sha256_pin}"
             )
         print(f"pair_ids pin OK: {fresh} (n_pairs={len(pair_ids)})")
+    else:  # tier_b_subset (round-5+ generic)
+        if args.subset_pair_ids_json is None or args.pair_ids_sha256_pin is None:
+            raise SystemExit(
+                "--tier tier_b_subset requires --subset-pair-ids-json AND --pair-ids-sha256-pin"
+            )
+        subset_data = json.loads(args.subset_pair_ids_json.read_bytes())
+        wrapper_candidates = [
+            (k, v) for k, v in subset_data.items()
+            if isinstance(v, dict) and isinstance(v.get("pair_ids"), list)
+        ]
+        if len(wrapper_candidates) != 1:
+            raise SystemExit(
+                f"--tier tier_b_subset: --subset-pair-ids-json must have exactly "
+                f"one top-level key with a 'pair_ids' list child, got "
+                f"{len(wrapper_candidates)}: {[k for k, _ in wrapper_candidates]}. "
+                f"Bury audit-only pair_ids lists under meta.* to avoid clash."
+            )
+        wrapper_key, wrapper_val = wrapper_candidates[0]
+        pair_ids = list(wrapper_val["pair_ids"])
+        tier_subdir = wrapper_key  # latents/<UTC>/<wrapper_key>/
+        fresh = canonical_pair_ids_sha256(pair_ids)[:16]
+        if fresh != args.pair_ids_sha256_pin:
+            raise SystemExit(
+                f"pair_ids pin drift: fresh={fresh}, expected={args.pair_ids_sha256_pin}"
+            )
+        print(f"pair_ids pin OK: {fresh} (n_pairs={len(pair_ids)}, wrapper={wrapper_key})")
     print(f"selected tier={args.tier}, pairs={len(pair_ids)}")
 
     print(f"hashing VAE at {VAE_PATH} ...")
