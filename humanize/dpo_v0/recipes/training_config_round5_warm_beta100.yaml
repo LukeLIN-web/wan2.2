@@ -1,0 +1,14 @@
+beta: 100
+dpo_loss_kind: sigmoid
+lora_alpha: 16
+lora_rank: 16
+lr: 1.0e-05
+max_pairs: 1202
+micro_batch: 1
+num_samples: 1202
+round_tag: round-5-warm
+sampling_band:
+- 901
+- 999
+seed_namespace: round5-warm-tier_b-1202-cond-present
+subset_pair_ids_sha256_hex16: 680a7eec8090d48b
