@@ -238,7 +238,27 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out-root", type=pathlib.Path, default=DPO_ROOT / "latents")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    # Multi-process parallel encode: launch one process per GPU with the same
+    # --out-ts and (--world-size, --rank) ∈ {(M, 0), ..., (M, M-1)}; each
+    # process slices pair_ids[rank::world_size] (deterministic interleave) and
+    # writes its own manifest_rank<r>_of_<M>.jsonl shard. After all ranks
+    # finish, concat shards into manifest.jsonl for the trainer.
+    ap.add_argument("--world-size", type=int, default=1,
+                    help="Total number of parallel encode processes. Default 1 (single-process).")
+    ap.add_argument("--rank", type=int, default=0,
+                    help="This process's rank in [0, world_size). Slices pair_ids[rank::world_size].")
+    ap.add_argument("--out-ts", type=str, default=None,
+                    help="UTC timestamp string (YYYYMMDDTHHMMSSZ) shared across ranks of a "
+                         "parallel run so all shards land in the same out_dir. Required when "
+                         "--world-size > 1; auto-generated when single-process.")
     args = ap.parse_args(argv[1:])
+
+    if args.world_size < 1:
+        raise SystemExit(f"--world-size must be >= 1, got {args.world_size}")
+    if not (0 <= args.rank < args.world_size):
+        raise SystemExit(f"--rank must be in [0, {args.world_size}), got {args.rank}")
+    if args.world_size > 1 and not args.out_ts:
+        raise SystemExit("--out-ts is required when --world-size > 1 so all ranks share an out_dir")
 
     recipe_id = assert_recipe_pins(RECIPES_DIR, expected_recipe_id=KNOWN_GOOD_RECIPE_ID)["recipe_id"]
     print(f"recipe_id pin OK: {recipe_id}")
@@ -295,7 +315,17 @@ def main(argv: list[str]) -> int:
                 f"pair_ids pin drift: fresh={fresh}, expected={args.pair_ids_sha256_pin}"
             )
         print(f"pair_ids pin OK: {fresh} (n_pairs={len(pair_ids)}, wrapper={wrapper_key})")
-    print(f"selected tier={args.tier}, pairs={len(pair_ids)}")
+    print(f"selected tier={args.tier}, full pair_count={len(pair_ids)}")
+
+    # Multi-process slice (interleave). Pin asserted on FULL list above; we only
+    # slice for the work distribution. Single-process => slice == full list.
+    full_pair_count = len(pair_ids)
+    if args.world_size > 1:
+        pair_ids = pair_ids[args.rank::args.world_size]
+        print(
+            f"[rank {args.rank}/{args.world_size}] sliced pair_ids: "
+            f"{len(pair_ids)}/{full_pair_count} (interleave step={args.world_size})"
+        )
 
     print(f"hashing VAE at {VAE_PATH} ...")
     vae_sha = cached_file_sha256(VAE_PATH)
@@ -310,10 +340,13 @@ def main(argv: list[str]) -> int:
     vae = Wan2_1_VAE(z_dim=16, vae_pth=str(VAE_PATH), dtype=dtype_t, device=str(device))
     print("vae ready")
 
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = args.out_root / ts / args.tier
+    ts = args.out_ts or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = args.out_root / ts / tier_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = out_dir / "manifest.jsonl"
+    if args.world_size > 1:
+        manifest_path = out_dir / f"manifest_rank{args.rank}_of_{args.world_size}.jsonl"
+    else:
+        manifest_path = out_dir / "manifest.jsonl"
 
     n_done = 0
     with manifest_path.open("wb") as f:
