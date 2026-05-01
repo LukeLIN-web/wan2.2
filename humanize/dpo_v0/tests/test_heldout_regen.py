@@ -93,6 +93,31 @@ def _build_heldout_fixture(tmp_path: pathlib.Path) -> pathlib.Path:
     return root
 
 
+def _build_small_heldout_fixture(tmp_path: pathlib.Path, n_prompts: int = 3) -> pathlib.Path:
+    root = tmp_path / "small_t0_t3"
+    (root / "splits").mkdir(parents=True, exist_ok=True)
+    (root / "t2").mkdir(parents=True, exist_ok=True)
+    records = []
+    image_manifest = {}
+    for i in range(n_prompts):
+        gid = f"small_g{i:04d}"
+        prompt = f"small prompt {i}"
+        image_manifest[gid] = {
+            "image_path": f"/fake/{gid}.png",
+            "scene_filename": f"scene_{gid}.mp4",
+            "status": "ok",
+        }
+        records.append({
+            "pair_id": f"{gid}__pair0000",
+            "group_id": gid,
+            "prompt": prompt,
+            "split": "heldout",
+        })
+    (root / "splits" / "heldout.json").write_text(json.dumps(records))
+    (root / "t2" / "image_manifest.json").write_text(json.dumps(image_manifest))
+    return root
+
+
 # ---------- canonical-selection tests ----------
 
 
@@ -110,6 +135,38 @@ def test_load_heldout_rejects_wrong_count(tmp_path: pathlib.Path):
         heldout_regen.load_heldout_records(root)
 
 
+def test_load_heldout_allows_explicit_count_override(tmp_path: pathlib.Path):
+    root = _build_small_heldout_fixture(tmp_path, n_prompts=3)
+    records = heldout_regen.load_heldout_records(
+        root,
+        expected_pairs=3,
+        expected_groups=3,
+        expected_prompts=3,
+    )
+    assert len(records) == 3
+
+
+def test_load_heldout_skip_count_assert_for_eval_migration(tmp_path: pathlib.Path):
+    root = _build_small_heldout_fixture(tmp_path, n_prompts=3)
+    records = heldout_regen.load_heldout_records(root, skip_count_assert=True)
+    image_manifest = heldout_regen.load_t2_image_manifest(root)
+    selections = heldout_regen.select_canonical_groups(
+        records,
+        image_manifest,
+        expected_prompts=None,
+    )
+    assert len(selections) == 3
+
+
+def test_env_skip_count_assert_covers_selection(tmp_path: pathlib.Path, monkeypatch):
+    root = _build_small_heldout_fixture(tmp_path, n_prompts=3)
+    monkeypatch.setenv(heldout_regen.SKIP_COUNT_ASSERT_ENV, "1")
+    records = heldout_regen.load_heldout_records(root)
+    image_manifest = heldout_regen.load_t2_image_manifest(root)
+    selections = heldout_regen.select_canonical_groups(records, image_manifest)
+    assert len(selections) == 3
+
+
 def test_select_canonical_groups_returns_42(tmp_path: pathlib.Path):
     root = _build_heldout_fixture(tmp_path)
     records = heldout_regen.load_heldout_records(root)
@@ -123,6 +180,14 @@ def test_select_canonical_groups_returns_42(tmp_path: pathlib.Path):
     for s in selections:
         assert s.cond_image_path.startswith("/fake/")
         assert s.group_id in image_manifest
+
+
+def test_resolve_rank_device_maps_bare_cuda_only():
+    assert heldout_regen.resolve_rank_device("cuda", local_rank="3") == "cuda:3"
+    assert heldout_regen.resolve_rank_device("cuda:1", local_rank="3") == "cuda:1"
+    assert heldout_regen.resolve_rank_device("cpu", local_rank="3") == "cpu"
+    with pytest.raises(ValueError, match="LOCAL_RANK"):
+        heldout_regen.resolve_rank_device("cuda", local_rank="not-an-int")
 
 
 def test_select_rejects_missing_t2_entry(tmp_path: pathlib.Path):
@@ -362,6 +427,7 @@ def test_subprocess_adapter_emits_locked_cli(tmp_path: pathlib.Path, monkeypatch
             "upstream": "/data/Wan2.2-I2V-A14B",
             "recipe_yaml": "/recipes/r.yaml",
             "compute_envelope": "single_gpu",
+            "device": "cuda:2",
         },
     )
     cmd = captured["cmd"]
@@ -370,6 +436,7 @@ def test_subprocess_adapter_emits_locked_cli(tmp_path: pathlib.Path, monkeypatch
     assert "--low-noise-ckpt" in cmd and cmd[cmd.index("--low-noise-ckpt") + 1] == "/ckpt/low.safetensors"
     assert "--recipe-yaml" in cmd and cmd[cmd.index("--recipe-yaml") + 1] == "/recipes/r.yaml"
     assert "--compute-envelope" in cmd and cmd[cmd.index("--compute-envelope") + 1] == "single_gpu"
+    assert "--device" in cmd and cmd[cmd.index("--device") + 1] == "cuda:2"
     assert "--prompt" in cmd
     assert "--cond-image" in cmd
     assert "--out-dir" in cmd

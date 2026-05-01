@@ -1,7 +1,7 @@
 """M6 heldout regeneration orchestrator.
 
-Reads ``<T0_T3_ROOT>/splits/heldout.json`` (579 pairs / 245 groups / 42
-unique prompts) and ``<T0_T3_ROOT>/t2/image_manifest.json`` (1440 group
+Reads ``<T0_T3_ROOT>/splits/heldout.json`` (normally 579 pairs / 245 groups /
+42 unique prompts) and ``<T0_T3_ROOT>/t2/image_manifest.json`` (1440 group
 entries), picks one canonical (group, image) per prompt under a
 deterministic rule, and runs ``inference_smoke.py`` twice per prompt
 (baseline ckpt + trained ckpt) under one byte-identical generation
@@ -24,9 +24,10 @@ Hard contracts honoured here:
     fail.
   - heldout conditioning images come from <T0_T3_ROOT>/t2/image_manifest.json
     (canonical T2 mapping). We do NOT re-resolve at eval time.
-  - 42 unique prompts in heldout.json is asserted at startup (AC-7.1
+  - 42 unique prompts in heldout.json is asserted by default (AC-7.1
     is "the 42 heldout prompts"; the round-0 audit confirms 42 unique
-    prompts under 245 groups under 579 pairs).
+    prompts under 245 groups under 579 pairs). Eval-set migration or
+    n-prompt smoke runs must opt out explicitly.
   - recipe_id 6bef6e104cdd3442 (AC-3.1) is asserted before any
     generation call.
 """
@@ -61,6 +62,7 @@ EXPECTED_RECIPE_ID = "6bef6e104cdd3442"  # AC-3.1
 EXPECTED_HELDOUT_PROMPTS = 42
 EXPECTED_HELDOUT_GROUPS = 245
 EXPECTED_HELDOUT_PAIRS = 579
+SKIP_COUNT_ASSERT_ENV = "HELDOUT_REGEN_SKIP_COUNT_ASSERT"
 
 
 # ---------- canonical artifact loaders ----------
@@ -72,26 +74,39 @@ def assert_recipe_pin(recipes_dir: pathlib.Path, expected: str = EXPECTED_RECIPE
     return pins["recipe_id"]
 
 
-def load_heldout_records(t0_t3_root: pathlib.Path) -> list[dict]:
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_heldout_records(
+    t0_t3_root: pathlib.Path,
+    *,
+    expected_pairs: int = EXPECTED_HELDOUT_PAIRS,
+    expected_prompts: int = EXPECTED_HELDOUT_PROMPTS,
+    expected_groups: int = EXPECTED_HELDOUT_GROUPS,
+    skip_count_assert: bool = False,
+) -> list[dict]:
     path = t0_t3_root / "splits" / "heldout.json"
     if not path.exists():
         raise FileNotFoundError(f"heldout split missing: {path}")
     records = json.loads(path.read_bytes())
     if not isinstance(records, list):
         raise ValueError(f"{path} is not a JSON array")
-    if len(records) != EXPECTED_HELDOUT_PAIRS:
-        raise ValueError(
-            f"heldout pair count mismatch: got {len(records)}, expected {EXPECTED_HELDOUT_PAIRS}"
-        )
     n_prompts = len({r["prompt"] for r in records})
     n_groups = len({r["group_id"] for r in records})
-    if n_prompts != EXPECTED_HELDOUT_PROMPTS:
+    if skip_count_assert or _env_flag_enabled(SKIP_COUNT_ASSERT_ENV):
+        return records
+    if len(records) != expected_pairs:
         raise ValueError(
-            f"heldout unique-prompt count mismatch: got {n_prompts}, expected {EXPECTED_HELDOUT_PROMPTS}"
+            f"heldout pair count mismatch: got {len(records)}, expected {expected_pairs}"
         )
-    if n_groups != EXPECTED_HELDOUT_GROUPS:
+    if n_prompts != expected_prompts:
         raise ValueError(
-            f"heldout unique-group count mismatch: got {n_groups}, expected {EXPECTED_HELDOUT_GROUPS}"
+            f"heldout unique-prompt count mismatch: got {n_prompts}, expected {expected_prompts}"
+        )
+    if n_groups != expected_groups:
+        raise ValueError(
+            f"heldout unique-group count mismatch: got {n_groups}, expected {expected_groups}"
         )
     return records
 
@@ -147,6 +162,7 @@ def select_canonical_groups(
     image_manifest: dict,
     rule: str = "first_alpha",
     cond_image_fallback_root: Optional[pathlib.Path] = None,
+    expected_prompts: Optional[int] = EXPECTED_HELDOUT_PROMPTS,
 ) -> list[HeldoutPrompt]:
     """For each unique prompt, pick one canonical group + its T2 image.
 
@@ -207,11 +223,46 @@ def select_canonical_groups(
             )
         )
     selections.sort(key=lambda s: s.prompt_id)
-    if len(selections) != EXPECTED_HELDOUT_PROMPTS:
+    if (
+        expected_prompts is not None
+        and not _env_flag_enabled(SKIP_COUNT_ASSERT_ENV)
+        and len(selections) != expected_prompts
+    ):
         raise RuntimeError(
-            f"selected {len(selections)} canonical prompts, expected {EXPECTED_HELDOUT_PROMPTS}"
+            f"selected {len(selections)} canonical prompts, expected {expected_prompts}"
         )
     return selections
+
+
+def resolve_rank_device(device: str, local_rank: Optional[str] = None) -> str:
+    """Map bare ``cuda`` to ``cuda:<LOCAL_RANK>`` under torchrun."""
+    if local_rank is None:
+        local_rank = os.environ.get("LOCAL_RANK")
+    if device != "cuda" or local_rank in (None, ""):
+        return device
+    try:
+        idx = int(local_rank)
+    except ValueError as exc:
+        raise ValueError(f"LOCAL_RANK must be an integer, got {local_rank!r}") from exc
+    if idx < 0:
+        raise ValueError(f"LOCAL_RANK must be >= 0, got {idx}")
+    return f"cuda:{idx}"
+
+
+def bind_cuda_device_for_rank(device: str) -> None:
+    """Bind this process to its resolved cuda device when torch is available."""
+    if not device.startswith("cuda:"):
+        return
+    try:
+        idx = int(device.split(":", 1)[1])
+    except ValueError as exc:
+        raise ValueError(f"cuda device must be cuda:<int>, got {device!r}") from exc
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.set_device(idx)
 
 
 # ---------- generation_config + inference adapter ----------
@@ -354,6 +405,8 @@ def subprocess_inference_adapter(
             cmd += ["--recipe-yaml", str(ckpt_args["recipe_yaml"])]
         if "compute_envelope" in ckpt_args:
             cmd += ["--compute-envelope", str(ckpt_args["compute_envelope"])]
+        if "device" in ckpt_args:
+            cmd += ["--device", str(ckpt_args["device"])]
 
         if run_kind == "baseline":
             # Baseline takes NO --lora-adapter (inference_smoke rejects it).
@@ -957,11 +1010,21 @@ def main() -> int:
                    help="Run only the first N prompts (deterministic order by prompt_id). "
                         "Applied before rank sharding so the same N prompts come out regardless "
                         "of world_size.")
+    p.add_argument("--skip-heldout-count-assert", action="store_true",
+                   default=_env_flag_enabled(SKIP_COUNT_ASSERT_ENV),
+                   help=f"Allow subset/eval-migration heldout manifests whose counts differ "
+                        f"from 579/245/42. Also enabled by {SKIP_COUNT_ASSERT_ENV}=1.")
+    p.add_argument("--expected-heldout-pairs", type=int, default=EXPECTED_HELDOUT_PAIRS,
+                   help="Expected heldout pair count when count asserts are enabled.")
+    p.add_argument("--expected-heldout-groups", type=int, default=EXPECTED_HELDOUT_GROUPS,
+                   help="Expected heldout group count when count asserts are enabled.")
+    p.add_argument("--expected-heldout-prompts", type=int, default=EXPECTED_HELDOUT_PROMPTS,
+                   help="Expected unique prompt count when count asserts are enabled.")
     p.add_argument("--no-resume", action="store_true",
                    help="Disable per-prompt skip-if-complete idempotency.")
     p.add_argument("--baseline-from", type=pathlib.Path, default=None,
-                   help="Path to a prior `<out_dir>/<run_ts>` directory whose 42 "
-                        "baseline videos should be reused instead of re-generated. "
+                   help="Path to a prior `<out_dir>/<run_ts>` directory whose baseline "
+                        "videos should be reused instead of re-generated. "
                         "Skips the baseline pass entirely; only trained pass runs. "
                         "Halts on AC-7.2 byte-equality violation (gen_config drift "
                         "between prior run and current). ~50% wall save when comparing "
@@ -981,6 +1044,7 @@ def main() -> int:
                    default="single_gpu",
                    help="DEC-6 envelope tag stamped into the run manifest.")
     args = p.parse_args()
+    args.device = resolve_rank_device(args.device)
 
     if args.adapter in ("subprocess", "python_api"):
         missing = []
@@ -1000,7 +1064,13 @@ def main() -> int:
     print(f"[recipe] pin OK: {recipe_id}", flush=True)
 
     # 2. heldout split
-    records = load_heldout_records(args.t0_t3_root)
+    records = load_heldout_records(
+        args.t0_t3_root,
+        expected_pairs=args.expected_heldout_pairs,
+        expected_prompts=args.expected_heldout_prompts,
+        expected_groups=args.expected_heldout_groups,
+        skip_count_assert=args.skip_heldout_count_assert,
+    )
     image_manifest = load_t2_image_manifest(args.t0_t3_root)
     print(
         f"[heldout] {len(records)} pairs / {len({r['group_id'] for r in records})} groups / "
@@ -1014,6 +1084,9 @@ def main() -> int:
         image_manifest,
         rule=args.selection_rule,
         cond_image_fallback_root=args.cond_image_fallback_root,
+        expected_prompts=(
+            None if args.skip_heldout_count_assert else args.expected_heldout_prompts
+        ),
     )
     print(f"[selection] {len(selections)} canonical (prompt, group, image) triples", flush=True)
     if args.cond_image_fallback_root is not None:
@@ -1063,6 +1136,7 @@ def main() -> int:
             return 2
         adapter = subprocess_inference_adapter(args.inference_smoke_py)
     elif args.adapter == "python_api":
+        bind_cuda_device_for_rank(args.device)
         # Lazy-import so subprocess + dry_run paths don't require inference_smoke
         # to be importable (it depends on heavy GPU libs that the orchestrator
         # itself doesn't need).

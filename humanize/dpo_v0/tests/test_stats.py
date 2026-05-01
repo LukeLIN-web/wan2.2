@@ -123,8 +123,10 @@ def test_bonferroni_alpha():
         stats.bonferroni_alpha(0, 1)
 
 
-def test_prompt_class_covers_42():
-    assert len(stats.PROMPT_CLASS) == 42
+def test_prompt_class_covers_eval_v2():
+    assert len(stats.PROMPT_CLASS) == 43
+    counts = {cls: list(stats.PROMPT_CLASS.values()).count(cls) for cls in "ABCDEFG"}
+    assert counts == {"A": 15, "B": 9, "C": 6, "D": 5, "E": 1, "F": 4, "G": 3}
     assert set(stats.PROMPT_CLASS.values()) == {"A", "B", "C", "D", "E", "F", "G"}
 
 
