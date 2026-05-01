@@ -87,11 +87,58 @@ strong-constraint prompt in v1; v2 adds 3 more strong-constraint A prompts).
 
 ### eval-v1 freeze marker
 
-eval-v1 numbers are frozen at git tag `<tag-name-tbd>` (or commit `ad8fd28`
-which is the round-5 lora_final verdict commit, just before eval-v2 takes
-effect via `humanize/dpo_v0/eval/PROMPT_CLASS.json` v2 update). To reproduce
-any eval-v1 read, check out at this commit and use the pre-`d177b1a`
-PROMPT_CLASS.json (12 A / 3 E / 3 G).
+eval-v1 numbers are frozen at git commit `ad8fd28` (the round-5 lora_final
+verdict commit, immediately before eval-v2 takes effect via
+`humanize/dpo_v0/eval/PROMPT_CLASS.json` v2 update at `da1e56c`). To
+reproduce any eval-v1 read, check out at `ad8fd28` and use the
+pre-`da1e56c` PROMPT_CLASS.json (12 A / 3 E / 3 G).
+
+### Eval-v2 paired sign-test on round-5 (closure check)
+
+Re-run the round-5 vs round-4 paired sign-test on the v2 n=43 set to confirm
+that the v2 prompt re-balance does not flip the round-5 verdict. (If it had,
+the round-5 ckpt status would need re-evaluation; per the result below it
+does not.)
+
+| field | value |
+|---|---|
+| n_aligned | 43 |
+| n_pos (round-5 better) | 5 |
+| n_neg (round-4 better) | 18 |
+| n_zero (tied) | 20 |
+| p (two-sided binomial) | 0.0106 |
+| reject H₀ at α=0.05 | true |
+| direction | favoring round-4 |
+| **eval-v2 round-5 verdict** | **`fail`** (same as eval-v1) |
+
+For reference, on the same v2 set, round-5 vs baseline axes-avg Δ = +0.019
+[−0.093, +0.130], p=1.000, within-noise.
+
+### eval-v2 reference jsonls (sha-pinned)
+
+These per-axis flat jsonls (43 prompts × 5 axes = 215 rows each) are the
+canonical inputs to `humanize/dpo_v0/eval/stats.py paired-sign-test` for
+round-6+ winner comparisons against round-4 β=100 lora_final v2.
+
+| jsonl (`juyi-finetune:/tmp/...`) | sha256 | provenance |
+|---|---|---|
+| `round4_beta100_lora_final_v2.jsonl` | `e87a140dec375b69f6b46e4384c082eee502a86916645d5f6dbc3e96c12ee83b` | 40 v1-shared pids from `~/gen_out/round4_lr1e5_FULL42_beta100_final_20260430T132455Z/` (filtered to drop 2 E pids) + 3 new A pids from `~/gen_out/eval_v2_baseline_plus_r4_n3_20260501T031745Z/scores_perprompt/<pid>/trained/` |
+| `round5_lora_final_v2.jsonl` | `bdbb54932bc6a5360386703a094f391a0f1af53dac00433289bee7c859ecf208` | 40 v1-shared pids from `~/gen_out/round5_lora_final_n42_20260501T000726Z/scores_perprompt/<pid>/` (filtered to drop 2 E pids) + 3 new A pids from `~/gen_out/eval_v2_round5_n3_20260501T035037Z/scores_perprompt/<pid>/` |
+| `v3_baseline_v2.jsonl` | `02cd4a3899c8eb479cf9485170d7aed966522d5d1ac108181e173d9376157536` | 40 v1-shared pids from `~/gen_out/v3_full_strip_20260429T162925Z/scores/20260429T193214Z/results.jsonl` (filtered to drop 2 E pids) + 3 new A pids' baseline scores from `~/gen_out/eval_v2_baseline_plus_r4_n3_20260501T031745Z/scores_perprompt/<pid>/baseline/` |
+
+Build script: `juyi-finetune:/tmp/build_eval_v2_flat.py` (reproducible
+v2 jsonl assembly from v1 sources + 3 new pids; appended-mode safe).
+
+### Round-6 implications
+
+Round-6 (`humanize/dpo_v0/docs/exp-plan/round6_plan.md`) is pre-registered
+to use:
+- `round4_beta100_lora_final_v2.jsonl` as the n=43 paired sign-test
+  reference (criterion: round-6 vs round-4 v2, p<0.05 favoring round-6 = pass)
+- `v3_baseline_v2.jsonl` as the round-6-vs-baseline informational
+  reference (not verdict-binding)
+- `score perprompt` outputs from round-6 lora_final eval (TBD path
+  `~/gen_out/round6_lora_final_n43_<TS>/`)
 
 ### Hot-patches needing to be committed (non-blocking)
 
