@@ -9,8 +9,8 @@ resolve_wandb
 cd "$DPO_DIR"
 
 expect_recipe="6bef6e104cdd3442"          # inherited recipe_id pin
-expect_train_cfg="TBD_AFTER_YAML_REPIN"   # filled in after Codex re-pins the yaml post-sampler
-expect_pair_ids="TBD_SAMPLER_RUN_OUTPUT"  # filled in after Codex runs the sampler on juyi-videorl
+expect_train_cfg="3431fd826fc5662a"       # sha256[:16] of round-7 fresh v2aligned yaml
+expect_pair_ids="a262b7153f58c37f"        # sampler output, b-mode=repeat (982 unique, 42 B-class dups)
 
 ROUND7_OUT_DIR="${ROUND7_OUT_DIR:-$(ls -1d "$DPO_DIR"/out/round7/*/ 2>/dev/null | sort | tail -1 | sed 's:/$::')}"
 SUBSET_PAIR_IDS_JSON="${SUBSET_PAIR_IDS_JSON:-${ROUND7_OUT_DIR}/T3_round7_v2aligned_1024.json}"

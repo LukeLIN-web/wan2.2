@@ -11,4 +11,4 @@ sampling_band:
 - 901
 - 999
 seed_namespace: round7-fresh-tier_b-1024-cond-present
-subset_pair_ids_sha256_hex16: TBD_SAMPLER_RUN_OUTPUT
+subset_pair_ids_sha256_hex16: a262b7153f58c37f
