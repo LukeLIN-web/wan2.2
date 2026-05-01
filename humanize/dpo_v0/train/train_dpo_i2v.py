@@ -926,6 +926,19 @@ def main():
         help="Expected sha256[:16] of the canonical newline-joined pair_ids. "
              "Required when --subset-pair-ids-json is set.",
     )
+    p.add_argument(
+        "--allow-repeated-pair-ids",
+        type=lambda s: s.lower() == "true",
+        default=False,
+        help="If true, --subset-pair-ids-json may contain duplicate pair_ids "
+             "and the trainer iterates the subset list as a multiset (each "
+             "duplicate emits an additional training step). The latent manifest "
+             "is required to cover the unique pid set, not the full list. "
+             "Authorised case: round-7 A 路 with 42 B-class repeats — see "
+             "humanize/dpo_v0/docs/exp-plan/round7draft.md §'B rescue + E "
+             "zero-buffer policy' fallback (ii). Default false preserves "
+             "round-4/5/6 set-based filter semantics and ordering.",
+    )
     # Round-5 warm-start args (task #50). --init-lora-from continues training
     # from a previous round's lora_final.safetensors; --save-optimizer-state
     # is forward-looking infra so future round-N+1 can resume AdamW momentum.
@@ -1129,22 +1142,41 @@ def main():
             )
         subset_pair_ids = wrapper_candidates[0][1]["pair_ids"]
         assert_pair_ids_pin(subset_pair_ids, args.pair_ids_sha256_pin)
-        subset_set = set(subset_pair_ids)
         before = len(records_all)
-        records_all = [r for r in records_all if r.pair_id in subset_set]
-        if is_main_pre := (int(os.environ.get("LOCAL_RANK", "0")) == 0):
-            print(
-                f"[pair_ids pin] OK: {args.pair_ids_sha256_pin} "
-                f"(subset={len(subset_pair_ids)}, manifest_intersect={len(records_all)}, "
-                f"manifest_total={before})",
-                flush=True,
-            )
-        if len(records_all) < len(subset_pair_ids):
-            missing = sorted(subset_set - {r.pair_id for r in records_all})
-            raise RuntimeError(
-                f"latent manifest is missing {len(missing)} of {len(subset_pair_ids)} subset pair_ids; "
-                f"sample missing: {missing[:5]}"
-            )
+        if args.allow_repeated_pair_ids:
+            unique_subset = set(subset_pair_ids)
+            records_by_pid = {r.pair_id: r for r in records_all}
+            missing = unique_subset - set(records_by_pid.keys())
+            if missing:
+                raise RuntimeError(
+                    f"latent manifest is missing {len(missing)} of {len(unique_subset)} unique "
+                    f"subset pair_ids; sample missing: {sorted(missing)[:5]}"
+                )
+            records_all = [records_by_pid[pid] for pid in subset_pair_ids]
+            if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                n_dup = len(subset_pair_ids) - len(unique_subset)
+                print(
+                    f"[pair_ids pin] OK (multiset): {args.pair_ids_sha256_pin} "
+                    f"(subset={len(subset_pair_ids)}, unique={len(unique_subset)}, "
+                    f"duplicates={n_dup}, manifest_total={before})",
+                    flush=True,
+                )
+        else:
+            subset_set = set(subset_pair_ids)
+            records_all = [r for r in records_all if r.pair_id in subset_set]
+            if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                print(
+                    f"[pair_ids pin] OK: {args.pair_ids_sha256_pin} "
+                    f"(subset={len(subset_pair_ids)}, manifest_intersect={len(records_all)}, "
+                    f"manifest_total={before})",
+                    flush=True,
+                )
+            if len(records_all) < len(subset_pair_ids):
+                missing = sorted(subset_set - {r.pair_id for r in records_all})
+                raise RuntimeError(
+                    f"latent manifest is missing {len(missing)} of {len(subset_pair_ids)} subset pair_ids; "
+                    f"sample missing: {missing[:5]}"
+                )
 
     # Resolve cond image paths with an optional fallback root: if the original
     # path is missing on this machine, look for the basename under
