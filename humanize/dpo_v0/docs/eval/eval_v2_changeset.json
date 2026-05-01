@@ -1,0 +1,74 @@
+{
+  "version": "eval-v2",
+  "created_utc": "2026-05-01T00:59:47Z",
+  "trigger": "execute after round-5 lora_final n=42 verdict on eval-v1 is rendered",
+  "rationale": "rebalance class A:E from 12:3 to 15:1 to reduce noise on n=3 E and add multi-body collision diversity",
+  "diff_from_v1": {
+    "remove": [
+      {
+        "pid": "36e42af19937",
+        "class_v1": "E",
+        "reason": "double-row dominoes + rotating-stick trigger; physics resembles A-class collision more than 3-level causal chain",
+        "prompt": "Two rows of alternating black and white dominoes are set up on a wooden table with a gap between the two rows. A wooden stick attached to a rotating platform rotates clockwise and knocks the first domino in the first row. The dominoes in the first row topple over one by one, bridging the gap and causing the second row to also topple. Static shot with no camera movement."
+      },
+      {
+        "pid": "9d500eec2188",
+        "class_v1": "E",
+        "reason": "finger pokes CD stack creating gap; weakest causal chain in E (single action, no propagation)",
+        "prompt": "A person's finger pokes a stack of CDs, creating a small gap between the top two discs."
+      }
+    ],
+    "keep_in_E": [
+      {
+        "pid": "e7815fab19d6",
+        "reason": "purest 3-level chain: stick -> duck displacement -> domino chain reaction",
+        "prompt": "A yellow rubber duck is positioned in the middle of a line of black and white dominoes on a wooden table. A stick attached to a black rotating platform rotates clockwise and knocks the first domino block. The dominoes topple over in a chain reaction, knocking the rubber duck. Static shot with no camera movement."
+      }
+    ],
+    "add": [
+      {
+        "pid": "366d2a1252b3",
+        "class_v2": "A",
+        "subtopic": "rolling -> multi-body collision chain (kettlebell + duck via tube)",
+        "prompt": "A light beige coffee table with a black kettlebell and a yellow rubber duck on it. A grey tennis ball rolls out of the black tube sitting on the table and towards the duck and kettlebell. The tennis ball collides with the rubber duck, pushing it across the table. Static shot with no camera movement."
+      },
+      {
+        "pid": "5b7bb71f101d",
+        "class_v2": "A",
+        "subtopic": "3-ball collision (no-string Newton-cradle geometry)",
+        "prompt": "A light-colored coffee table with two tennis balls, one orange and one brown, placed near the center back to back. A grey tennis ball rolls out of a black pipe sitting on the table and towards the other two balls. The rolling grey ball collides with the stationary balls, causing them to scatter. Static shot with no camera movement."
+      },
+      {
+        "pid": "d8b29a78eed7",
+        "class_v2": "A",
+        "subtopic": "block-vs-block-gate rigid impact + structural collapse",
+        "prompt": "A pink block is being lowered towards a simple structure made of colorful blocks resembling a gate. The pink block hits the gate structure, causing it to collapse. Static shot with no camera movement."
+      }
+    ]
+  },
+  "target_distribution_v2": {
+    "A_collision": 15,
+    "B_destruction": 9,
+    "C_fluid": 6,
+    "D_optical": 5,
+    "E_chain": 1,
+    "F_rolling": 4,
+    "G_projectile": 3,
+    "total": 42
+  },
+  "downstream_actions_after_verdict": [
+    "regen v3 baseline videos for the 3 new A pids on juyi-finetune 4-rank, ~13 min wall",
+    "score new baseline videos via physground env, ~5 min",
+    "edit humanize/dpo_v0/docs/eval/evalprompt.md (move 2 E pids out, add 3 A pids, update class headers)",
+    "regen humanize/dpo_v0/eval/PROMPT_CLASS.json from updated evalprompt.md",
+    "re-eval round-4 lora_final and round-5 lora_final on the 3 new A pids only (other 39 reuse from prior eval-v1 runs)",
+    "create humanize/dpo_v0/docs/eval/CHANGELOG.md recording the v1 -> v2 transition with affected reference numbers",
+    "freeze eval-v1 reference: round-4 lora_final +0.114 axes-avg becomes historical, no longer canonical for round-6+"
+  ],
+  "source_data_for_new_pids": {
+    "pair_json": "/shared/user59/eval_l40s_test/T0_T3_root/pair.json",
+    "image_manifest": "/shared/user59/eval_l40s_test/T0_T3_root/t2/image_manifest.json",
+    "picker_script": "humanize/dpo_v0/script/eval/pick_eval_v2_A_prompts.py",
+    "picker_seed_namespace": "manual override (auto-shuffle picked 366d/3f8d/d180; 3f8d demoted as kinetic-sand deformation closer to B; final picks chosen for collision purity + subtopic diversity)"
+  }
+}

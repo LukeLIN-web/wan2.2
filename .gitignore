@@ -23,6 +23,8 @@ models/
 .claude/*
 wandb/
 !.claude/settings.json
+!humanize/dpo_v0/docs/eval/eval_v2_changeset.json
+!humanize/dpo_v0/eval/PROMPT_CLASS.json
 *.sh
 !humanize/dpo_v0/script/**/*.sh
 *.tex
