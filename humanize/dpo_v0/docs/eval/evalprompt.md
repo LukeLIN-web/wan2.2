@@ -3,20 +3,18 @@
 源: `<T0_T3_ROOT>/splits/heldout.json` — 579 pair / 245 group / **42 unique prompt**。
 `prompt_id = sha256(prompt)[:12]`。
 
-## 实验当前使用的二分类（experiment-results 里唯一被引用的）
+## 实验当前使用的分类（howtoreport.md §一 #3 后）
 
-| class | n | 代表 prompt_id | 用法 |
-|---|---|---|---|
-| **collision**（多体碰撞，运动量交换为核心物理约束） | 1 | `2455740c4d45` (Newton's cradle) | round-4/5 stuck-prompt watch；axes-mean ≥1.4 是 round-5 step-100 协议的恢复门槛 |
-| **non-collision**（其余全部） | 41 | — | round-4 lora_final 的 +0.127 reference 就在这一桶 |
-
-> 当前实验文档中 "per-prompt-class breakdown" 就是这一刀切，没有用更细的语义分类。"collision class n=1" 是个长期被吐槽的局限——多体碰撞的真实判据需要至少 3-5 个 prompt 才不致退化为 Newton's cradle 单点指标。
+**eval-v2 起 collision/non-collision 二分类 (n=1 vs n=41) 已废**。所有 per-class
+breakdown 一律用下面 A-G 7 类，n<5 仅 raw-Δ-only 不计 CI。`evalprompt.md` 是
+权威 class-pid 映射文件，`humanize/dpo_v0/eval/PROMPT_CLASS.json` 是它的机器
+可读副本（stats.py 启动时 import）。
 
 ## 按物理现象的细分（建议用于 round-6+ 的 class composite）
 
 按视频里被 PhyJudge 5 轴（SA / PTV / persistence / inertia / momentum）实际考察的核心物理事件分组。每条 prompt 只归一个主类（按事件最难/最显著的物理约束）。
 
-### A. 多体碰撞 / 反弹（collision & rebound, n=11）
+### A. 多体碰撞 / 反弹（collision & rebound, n=15 in eval-v2）
 碰撞瞬间的动量传递 + 反弹角/速度
 
 | pid | caption 摘要 |
@@ -33,6 +31,9 @@
 | `cb4c5cd47231` | 两滑冰者相撞 |
 | `ad664fa349ef` | 冲浪者相撞 |
 | `31cd7275ca92` | 锤子掷出弹一次 |
+| `366d2a1252b3` | 网球出管→撞鸭子+哑铃（rolling→multi-body collision chain）⭐ eval-v2 NEW |
+| `5b7bb71f101d` | 灰球出管→撞双静止球（3-ball, no-string Newton-cradle geometry）⭐ eval-v2 NEW |
+| `d8b29a78eed7` | 粉块下压→门状方块结构倒塌（block-vs-block-gate rigid impact）⭐ eval-v2 NEW |
 
 ### B. 破坏 / 形变（fracture & destruction, n=9）
 刚体或脆性材料发生不可逆形变/断裂
@@ -72,14 +73,19 @@
 | `488e8d91cff5` | 白船在峡谷水面镜面反射 |
 | `6b48a3f28874` | 玻璃后机器人受灯光反光变化 |
 
-### E. 链式 / 多级触发（chain reaction & cascading, n=3）
+### E. 链式 / 多级触发（chain reaction & cascading, n=1 in eval-v2）
 A 触发 B 触发 C 的多级因果
 
 | pid | caption 摘要 |
 |---|---|
-| `e7815fab19d6` | 旋转杆 → 鸭子 → 多米诺 |
-| `36e42af19937` | 两排多米诺 + 旋转杆隔空触发 |
-| `9d500eec2188` | 手指戳 CD 堆隔出缝隙 |
+| `e7815fab19d6` | 旋转杆 → 鸭子 → 多米诺 (purest 3-level chain) |
+
+> **eval-v2 changeset** (`docs/eval/eval_v2_changeset.json` + `eb4da377`): removed
+> from E:
+> - `36e42af19937` (双排多米诺+旋转杆) — physics resembles A multi-body collision
+>   more than 3-level causal chain; demoted from class.
+> - `9d500eec2188` (手指戳 CD 堆) — weakest causal chain (single action, no
+>   propagation); demoted from class.
 
 ### F. 滚动 / 滑动 / 持续动量（rolling & gliding, n=4）
 摩擦/势能转动能/匀速滑行
@@ -102,6 +108,27 @@ A 触发 B 触发 C 的多级因果
 
 ### 类间汇总
 
+#### eval-v2 (current, 2026-05-01)
+
+| class | n | 占比 |
+|---|---|---|
+| A 多体碰撞/反弹 | 15 | 35.7% |
+| B 破坏/形变 | 9 | 21.4% |
+| C 流体/液体 | 6 | 14.3% |
+| D 阴影/反射 | 5 | 11.9% |
+| E 链式触发 | 1 | 2.4% |
+| F 滚动/滑动 | 4 | 9.5% |
+| G 抛掷/弹道 | 2 | 4.8% |
+| 合计 | 42 | 100% |
+
+> 注：A 类含 `31cd7275ca92`（锤子弹一次），兼具弹道+碰撞，归 A。eval-v2
+> 在 A 类新增 3 条 (`366d2a1252b3` / `5b7bb71f101d` / `d8b29a78eed7`) 提升
+> collision-class 信噪比；E 类移除 2 条 (`36e42af19937` 物理像 A，`9d500eec2188`
+> 因果最弱) 仅留 1 条最纯 3-level chain。G 类一直是 2 条不是上一版表头写的 3 条
+> （历史 typo，eval-v2 表头同步修正）。
+
+#### eval-v1 (frozen 2026-04-30, retained for historical reference)
+
 | class | n | 占比 |
 |---|---|---|
 | A 多体碰撞/反弹 | 12 | 28.6% |
@@ -110,10 +137,11 @@ A 触发 B 触发 C 的多级因果
 | D 阴影/反射 | 5 | 11.9% |
 | E 链式触发 | 3 | 7.1% |
 | F 滚动/滑动 | 4 | 9.5% |
-| G 抛掷/弹道 | 3 | 7.1% |
-| 合计 | 42 | 100% |
+| G 抛掷/弹道 | 2 | 4.8% (heading typo "n=3" ignored — actual n=2) |
+| 合计 | 41 + 1 unmapped | 97.6% |
 
-> 注：A 类有 12 条而非上文表格的 11 条，含 `31cd7275ca92`（锤子弹一次），它兼具弹道+碰撞，归 A。
+> eval-v1 reference numbers (round-4 lora_final, etc.) are **historical only**
+> from eval-v2 forward. See `humanize/dpo_v0/docs/eval/CHANGELOG.md`.
 
 ## 与 PhyJudge 5 轴的对应直觉
 

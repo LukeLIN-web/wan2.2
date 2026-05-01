@@ -1,6 +1,8 @@
 {
-  "version": "1",
+  "version": "2",
   "source": "humanize/dpo_v0/docs/eval/evalprompt.md",
+  "changeset_ref": "humanize/dpo_v0/docs/eval/eval_v2_changeset.json",
+  "transition_log": "humanize/dpo_v0/docs/eval/CHANGELOG.md",
   "classes": {
     "A": "多体碰撞 / 反弹",
     "B": "破坏 / 形变",
@@ -23,6 +25,9 @@
     "cb4c5cd47231": "A",
     "ad664fa349ef": "A",
     "31cd7275ca92": "A",
+    "366d2a1252b3": "A",
+    "5b7bb71f101d": "A",
+    "d8b29a78eed7": "A",
     "1b1c06c5ff1c": "B",
     "eef5be6cabd2": "B",
     "d858e0d67470": "B",
@@ -44,8 +49,6 @@
     "488e8d91cff5": "D",
     "6b48a3f28874": "D",
     "e7815fab19d6": "E",
-    "36e42af19937": "E",
-    "9d500eec2188": "E",
     "5fdbe9f87762": "F",
     "48255a441729": "F",
     "80cc85fa7fa7": "F",
