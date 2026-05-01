@@ -1,521 +1,410 @@
-"""Canonical statistics helpers for round-N PhyJudge eval reports.
-
-Single source of truth for the numbers that go into
-``docs/experiment-results/round*_v3_*.md`` — md authors must call these
-functions instead of hand-computing aggregates. See
-``docs/experiment-results/howtoreport.md`` for the reporting rules these
-helpers exist to support.
-
-Conventions
------------
-- A "score record" is a dict with at least::
-
-      {"pair_id": str, "axis": str, "score": int}  # score in {1, 2, 3, 4}
-
-  with optional ``role`` / ``prompt_id`` keys. Aggregations are keyed by
-  ``prompt_id`` (sha256(prompt)[:12]) when present, otherwise ``pair_id``.
-
-- A "delta record" is a dict::
-
-      {"prompt_id": str, "axis": str, "delta": float}
-
-  i.e. trained.score - baseline.score for the same (prompt_id, axis).
-
-- ``axes_avg`` per prompt = mean over the 5 axes
-  ``["SA", "PTV", "persistence", "inertia", "momentum"]``.
-
-- All bootstrap CIs are **prompt-level resamples** (not per-axis or
-  per-pair-id resamples) — howtoreport.md §四 fixes this protocol.
-
-The five canonical axes (and their fixed order):
-"""
-
 from __future__ import annotations
 
+import hashlib
 import json
-import math
+import os
 import pathlib
-import random
-from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-AXES: tuple[str, ...] = ("SA", "PTV", "persistence", "inertia", "momentum")
-"""The five PhyJudge axes in canonical order. Reports must list axes in
-this order and never invent additional ones."""
+import numpy as np
 
-CLASS_A_G_PROMPT_IDS: dict[str, list[str]] = {
-    # Source of truth: docs/eval/evalprompt.md §按物理现象的细分
-    "A": [  # 多体碰撞 / 反弹 (n=12)
-        "2455740c4d45", "24d86e4e0339", "e0dae745a2a3", "e90b3f54bffb",
-        "2559ab47b909", "1a0d4f1d8b1a", "3719b41ec796", "70d3b1b89e19",
-        "5f68f5951b6b", "cb4c5cd47231", "ad664fa349ef", "31cd7275ca92",
-    ],
-    "B": [  # 破坏 / 形变 (n=9)
-        "1b1c06c5ff1c", "eef5be6cabd2", "d858e0d67470", "242e01f46c08",
-        "61345a00dfb5", "8f8b14d04c41", "8d44a2958eb4", "f6cad0ea56a8",
-        "58db668bc142",
-    ],
-    "C": [  # 流体 / 液体动力学 (n=6)
-        "8b8d6d0a9919", "2be476eeac0d", "e38a4396df92", "fa37196314bf",
-        "252b84def499", "1a44aba35343",
-    ],
-    "D": [  # 阴影 / 反射 / 光学 (n=5)
-        "75f6acbf5ba7", "261fccfc811f", "7977e8df650c", "488e8d91cff5",
-        "6b48a3f28874",
-    ],
-    "E": [  # 链式 / 多级触发 (n=3)
-        "e7815fab19d6", "36e42af19937", "9d500eec2188",
-    ],
-    "F": [  # 滚动 / 滑动 / 持续动量 (n=4)
-        "5fdbe9f87762", "48255a441729", "80cc85fa7fa7", "31ea17615154",
-    ],
-    "G": [  # 抛掷 / 弹道 (n=3)
-        "2db7ce10fffb", "daed47f0fab3",
-        # NOTE: third pid for G is missing in evalprompt.md as committed
-        # (heading says n=3 but only 2 entries listed). When the third
-        # is added upstream, append here. Until then class G effectively
-        # n=2 — flag in caveats per howtoreport.md §一 #4 (raw Δ only,
-        # no CI for n<5 anyway).
-    ],
-}
-"""Static prompt_id → class A-G map. ``n=42`` total; class G has the
-known evalprompt.md gap (n=2 in source, 3 promised in heading).
-
-For ``n<5`` classes (E/F/G) only raw Δ is meaningful; CI is suppressed
-by ``per_class_axes_avg_with_ci``.
-"""
+try:
+    from scipy.stats import binomtest as _binomtest
+    _HAS_SCIPY_BINOM = True
+except Exception:  # pragma: no cover
+    _HAS_SCIPY_BINOM = False
 
 
-def _build_prompt_to_class() -> dict[str, str]:
-    out: dict[str, str] = {}
-    for cls, pids in CLASS_A_G_PROMPT_IDS.items():
-        for pid in pids:
-            if pid in out:
-                raise RuntimeError(
-                    f"duplicate prompt_id {pid} in classes {out[pid]} and {cls}"
-                )
-            out[pid] = cls
-    return out
+AXES_DEFAULT: List[str] = ["SA", "PTV", "persistence", "inertia", "momentum"]
+N_AXES_DEFAULT: int = 5
+N_RESAMPLES_DEFAULT: int = 10_000
+ALPHA_DEFAULT: float = 0.05
+RNG_SEED_DEFAULT: int = 0
+
+_PROMPT_CLASS_JSON = pathlib.Path(__file__).resolve().parent / "PROMPT_CLASS.json"
 
 
-PROMPT_TO_CLASS: dict[str, str] = _build_prompt_to_class()
+def _load_prompt_class_file(path: pathlib.Path = _PROMPT_CLASS_JSON) -> Dict[str, Any]:
+    """Load PROMPT_CLASS.json (pid->class A-G map + class names)."""
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-# ---------- Aggregation primitives ----------
+_PC = _load_prompt_class_file()
+PROMPT_CLASS: Dict[str, str] = dict(_PC["prompts"])
+CLASS_NAMES: Dict[str, str] = dict(_PC["classes"])
 
 
-def per_prompt_axes_avg(
-    delta_records: Iterable[Mapping[str, Any]],
-    axes: Sequence[str] = AXES,
-) -> dict[str, float]:
-    """Reduce a stream of delta records to ``{prompt_id: axes_avg}``.
-
-    Asserts each prompt has exactly ``len(axes)`` axis entries (5 by
-    default). Missing/extra axis records raise ``ValueError`` so silent
-    averaging-over-incomplete-records cannot poison downstream stats.
-    """
-    by_prompt: dict[str, dict[str, float]] = {}
-    for r in delta_records:
-        pid = r["prompt_id"]
-        ax = r["axis"]
-        if ax not in axes:
+def load_scores(jsonl_dir: pathlib.Path) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Walk scores_perprompt/<pid>/<run_ts>/results.jsonl tree, latest run_ts wins."""
+    root = pathlib.Path(jsonl_dir)
+    out: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for pid_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        pid = pid_dir.name
+        ts_dirs = sorted(
+            (d for d in pid_dir.iterdir() if d.is_dir()),
+            key=lambda d: d.name,
+        )
+        if not ts_dirs:
             continue
-        by_prompt.setdefault(pid, {})[ax] = float(r["delta"])
-
-    out: dict[str, float] = {}
-    n_axes = len(axes)
-    for pid, ax_map in by_prompt.items():
-        if len(ax_map) != n_axes:
-            missing = sorted(set(axes) - set(ax_map))
-            extra = sorted(set(ax_map) - set(axes))
-            raise ValueError(
-                f"prompt_id {pid}: expected {n_axes} axes, got "
-                f"{len(ax_map)} (missing={missing}, extra={extra})"
-            )
-        out[pid] = sum(ax_map[a] for a in axes) / n_axes
-    return out
-
-
-def per_axis_deltas(
-    delta_records: Iterable[Mapping[str, Any]],
-    axis: str,
-) -> dict[str, float]:
-    """Project delta records onto a single ``axis`` → ``{prompt_id: delta}``."""
-    out: dict[str, float] = {}
-    for r in delta_records:
-        if r["axis"] != axis:
+        chosen = ts_dirs[-1]
+        results = chosen / "results.jsonl"
+        if not results.exists():
             continue
-        pid = r["prompt_id"]
-        if pid in out:
-            raise ValueError(
-                f"duplicate ({pid}, {axis}) in delta_records (existing="
-                f"{out[pid]}, new={r['delta']})"
-            )
-        out[pid] = float(r["delta"])
-    return out
-
-
-# ---------- Bootstrap CI ----------
-
-
-def bootstrap_ci(
-    values: Sequence[float],
-    n_resamples: int = 10_000,
-    alpha: float = 0.05,
-    rng_seed: int = 0,
-) -> tuple[float, float, float]:
-    """Percentile bootstrap CI for the **mean** of ``values``.
-
-    Per howtoreport.md §四:
-    - n_resamples = 10000 by default
-    - resample is over the input rows (treat as prompt-level when caller
-      passes per-prompt aggregates)
-    - returns ``(point, lo, hi)`` where ``point = mean(values)`` and
-      ``[lo, hi]`` is the (1-alpha) percentile interval.
-
-    For ``len(values) < 2`` the CI half-width is undefined; we return
-    ``(point, nan, nan)`` so the caller can downgrade to "raw Δ only".
-    """
-    n = len(values)
-    if n == 0:
-        return (math.nan, math.nan, math.nan)
-    point = sum(values) / n
-    if n < 2:
-        return (point, math.nan, math.nan)
-
-    rng = random.Random(rng_seed)
-    means: list[float] = []
-    for _ in range(n_resamples):
-        sample_sum = 0.0
-        for _i in range(n):
-            sample_sum += values[rng.randrange(n)]
-        means.append(sample_sum / n)
-    means.sort()
-    lo_idx = int(math.floor((alpha / 2.0) * n_resamples))
-    hi_idx = int(math.ceil((1.0 - alpha / 2.0) * n_resamples)) - 1
-    lo_idx = max(0, min(n_resamples - 1, lo_idx))
-    hi_idx = max(0, min(n_resamples - 1, hi_idx))
-    return (point, means[lo_idx], means[hi_idx])
-
-
-# ---------- Sign-tests ----------
-
-
-def _binom_two_sided_p(k: int, n: int, p: float = 0.5) -> float:
-    """Exact two-sided binomial p-value for k successes in n trials."""
-    if n == 0:
-        return 1.0
-
-    def _pmf(i: int) -> float:
-        # math.comb is 3.8+; videodpoWan runs on 3.11.
-        return math.comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i))
-
-    obs = _pmf(k)
-    total = 0.0
-    for i in range(n + 1):
-        if _pmf(i) <= obs + 1e-15:  # tolerance for fp ties
-            total += _pmf(i)
-    # Clamp to [0, 1] for numerical safety.
-    return max(0.0, min(1.0, total))
-
-
-def sign_test(
-    deltas: Sequence[float],
-    alpha: float = 0.05,
-) -> dict[str, Any]:
-    """Per-element two-sided sign-test of ``delta != 0``.
-
-    Zeros are excluded (consistent with the standard sign-test
-    convention; PhyJudge integer scale produces exact zeros at non-trivial
-    rate so this matters). Reports ``n_pos``, ``n_neg``, ``n_zero``,
-    ``p_two_sided``, and ``reject = p < alpha``.
-    """
-    n_pos = sum(1 for d in deltas if d > 0)
-    n_neg = sum(1 for d in deltas if d < 0)
-    n_zero = sum(1 for d in deltas if d == 0)
-    n = n_pos + n_neg
-    if n == 0:
-        return {
-            "n_pos": 0, "n_neg": 0, "n_zero": n_zero,
-            "p_two_sided": 1.0, "reject": False, "alpha": alpha,
-        }
-    k = max(n_pos, n_neg)
-    p = _binom_two_sided_p(k, n)
-    return {
-        "n_pos": n_pos, "n_neg": n_neg, "n_zero": n_zero,
-        "p_two_sided": p, "reject": p < alpha, "alpha": alpha,
-    }
-
-
-def paired_sign_test(
-    deltas_run_a: Mapping[str, float],
-    deltas_run_b: Mapping[str, float],
-    alpha: float = 0.05,
-) -> dict[str, Any]:
-    """Paired sign-test on prompt-id-aligned Δ values.
-
-    For each prompt that appears in **both** mappings, computes
-    ``run_a[pid] - run_b[pid]`` and runs ``sign_test`` on the differences.
-    Returns the standard sign-test dict augmented with ``n_aligned`` and
-    ``aligned_pids`` for audit trail.
-
-    This is the canonical winner-comparison per howtoreport.md §四:
-    "比较 round 间 winner: 按相同 prompt id 集合配对 sign-test, 不允许
-    直接比 axes-avg 点估计".
-    """
-    pids = sorted(set(deltas_run_a) & set(deltas_run_b))
-    if not pids:
-        raise ValueError("no overlapping prompt_ids between runs")
-    diffs = [deltas_run_a[p] - deltas_run_b[p] for p in pids]
-    out = sign_test(diffs, alpha=alpha)
-    out["n_aligned"] = len(pids)
-    out["aligned_pids"] = pids
-    return out
-
-
-# ---------- Multi-comparison (Bonferroni) ----------
-
-
-def bonferroni_alpha(alpha: float, n_tests: int) -> float:
-    """Bonferroni-corrected per-test alpha. ``n_tests = 5 * N_class`` in
-    the standard "5 axes × N classes" report layout per howtoreport.md
-    §四."""
-    if n_tests < 1:
-        raise ValueError(f"n_tests must be >= 1 (got {n_tests})")
-    return alpha / float(n_tests)
-
-
-# ---------- Per-class breakdown ----------
-
-
-def per_class_axes_avg_with_ci(
-    per_prompt_axes_avg_map: Mapping[str, float],
-    n_resamples: int = 10_000,
-    alpha: float = 0.05,
-    min_n_for_ci: int = 5,
-    rng_seed: int = 0,
-) -> dict[str, dict[str, Any]]:
-    """Class-A-G axes-avg roll-up with bootstrap CI.
-
-    For each class with ``n >= min_n_for_ci`` prompts present in the input
-    map, returns ``{cls: {"n": int, "delta": float, "ci_lo": float,
-    "ci_hi": float}}``. Below threshold, ``ci_lo`` / ``ci_hi`` are
-    ``None`` (per howtoreport.md §二 "n<5 的 class 只显示 raw Δ").
-
-    Classes with zero overlap are omitted entirely.
-    """
-    out: dict[str, dict[str, Any]] = {}
-    for cls, pids in CLASS_A_G_PROMPT_IDS.items():
-        present = [per_prompt_axes_avg_map[p] for p in pids
-                   if p in per_prompt_axes_avg_map]
-        if not present:
-            continue
-        n = len(present)
-        if n >= min_n_for_ci:
-            point, lo, hi = bootstrap_ci(
-                present, n_resamples=n_resamples,
-                alpha=alpha, rng_seed=rng_seed,
-            )
-            out[cls] = {"n": n, "delta": point,
-                        "ci_lo": lo, "ci_hi": hi}
-        else:
-            out[cls] = {"n": n,
-                        "delta": sum(present) / n,
-                        "ci_lo": None, "ci_hi": None}
-    return out
-
-
-# ---------- Loader for results.jsonl ----------
-
-
-def load_delta_records_from_results(
-    trained_results_path: pathlib.Path | str,
-    baseline_results_path: pathlib.Path | str,
-    score_field: str = "score",
-) -> list[dict[str, Any]]:
-    """Read trained + baseline results.jsonl files and emit aligned
-    delta records.
-
-    Each input file is JSONL with rows of shape
-    ``{"prompt_id": ..., "pair_id": ..., "axis": ..., "score": int, ...}``.
-    The merge key is ``(prompt_id, axis)``. Pairs in trained but not in
-    baseline (and vice versa) are dropped silently — caller can verify
-    cardinality before calling.
-    """
-    def _load(p: pathlib.Path | str) -> dict[tuple[str, str], dict[str, Any]]:
-        path = pathlib.Path(p)
-        out: dict[tuple[str, str], dict[str, Any]] = {}
-        with path.open("r", encoding="utf-8") as f:
+        per_axis: Dict[str, Dict[str, float]] = {}
+        with results.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 row = json.loads(line)
-                pid = row.get("prompt_id") or row.get("pair_id")
-                ax = row["axis"]
-                key = (pid, ax)
-                if key in out:
-                    raise ValueError(
-                        f"duplicate ({pid}, {ax}) in {path}"
-                    )
-                out[key] = row
-        return out
-
-    trained = _load(trained_results_path)
-    baseline = _load(baseline_results_path)
-    records: list[dict[str, Any]] = []
-    for key in sorted(trained.keys() & baseline.keys()):
-        pid, ax = key
-        records.append({
-            "prompt_id": pid,
-            "axis": ax,
-            "delta": float(trained[key][score_field])
-                     - float(baseline[key][score_field]),
-            "trained_score": float(trained[key][score_field]),
-            "baseline_score": float(baseline[key][score_field]),
-        })
-    return records
+                axis = row.get("axis")
+                role = row.get("role")
+                score = row.get("score")
+                if axis is None or role is None or score is None:
+                    continue
+                per_axis.setdefault(axis, {})[role] = float(score)
+        if per_axis:
+            out[pid] = per_axis
+    return out
 
 
-# ---------- One-shot summary for a report ----------
+def load_baseline(jsonl_path: pathlib.Path) -> Dict[str, Dict[str, float]]:
+    """Read a baseline results.jsonl, returning {pid: {axis: score}}."""
+    out: Dict[str, Dict[str, float]] = {}
+    with pathlib.Path(jsonl_path).open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            pid = row.get("prompt_id") or row.get("pair_id")
+            axis = row.get("axis")
+            score = row.get("score")
+            if pid is None or axis is None or score is None:
+                continue
+            out.setdefault(pid, {})[axis] = float(score)
+    return out
 
 
-def summarize_run(
-    delta_records: Sequence[Mapping[str, Any]],
-    n_resamples: int = 10_000,
-    alpha: float = 0.05,
-    rng_seed: int = 0,
-) -> dict[str, Any]:
-    """Compute the full set of numbers that the howtoreport.md template
-    asks for.
+def baseline_sha256(jsonl_path: pathlib.Path) -> str:
+    """File-level sha256 hex digest."""
+    h = hashlib.sha256()
+    with pathlib.Path(jsonl_path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    Returns a dict with:
-    - ``axes_avg``: ``{"delta": ..., "ci_lo": ..., "ci_hi": ..., "n": ...}``
-      — point + CI on the per-prompt axes-avg.
-    - ``per_axis``: ``{axis: {"delta", "ci_lo", "ci_hi", "sign_test_p"}}``.
-    - ``per_class``: ``{cls: {"n", "delta", "ci_lo", "ci_hi"}}`` — A-G.
-    - ``n_prompts``: number of prompts.
-    - ``axes_avg_sign_test``: sign-test on per-prompt Δ-axes-avg vs 0.
 
-    The caller is responsible for then comparing against a pre-registered
-    criterion (``paired_sign_test`` against another run's same dict).
-    """
-    pp = per_prompt_axes_avg(delta_records)
-    n_prompts = len(pp)
-    axes_avg_values = list(pp.values())
-    axes_avg_point, axes_avg_lo, axes_avg_hi = bootstrap_ci(
-        axes_avg_values, n_resamples=n_resamples,
-        alpha=alpha, rng_seed=rng_seed,
-    )
-    axes_avg_signtest = sign_test(axes_avg_values, alpha=alpha)
-
-    per_axis: dict[str, dict[str, Any]] = {}
-    for ax in AXES:
-        ax_deltas_map = per_axis_deltas(delta_records, ax)
-        ax_values = list(ax_deltas_map.values())
-        point, lo, hi = bootstrap_ci(
-            ax_values, n_resamples=n_resamples,
-            alpha=alpha, rng_seed=rng_seed,
+def compute_delta(
+    trained: Dict[str, Dict[str, Any]],
+    baseline: Dict[str, Dict[str, float]],
+    axes: List[str] = AXES_DEFAULT,
+) -> Dict[str, np.ndarray]:
+    """Per-axis delta arrays over the intersection of pids, sorted by pid."""
+    pids_t = set(trained.keys())
+    pids_b = set(baseline.keys())
+    missing = (pids_t ^ pids_b)
+    if missing:
+        warnings.warn(
+            f"compute_delta: {len(missing)} pid(s) skipped (not in both): "
+            f"{sorted(missing)[:5]}...",
+            stacklevel=2,
         )
-        st = sign_test(ax_values, alpha=alpha)
-        per_axis[ax] = {
-            "delta": point, "ci_lo": lo, "ci_hi": hi,
-            "sign_test_p": st["p_two_sided"], "n": len(ax_values),
-        }
+    pids = sorted(pids_t & pids_b)
+    out: Dict[str, np.ndarray] = {}
+    for axis in axes:
+        vals: List[float] = []
+        for pid in pids:
+            t = trained[pid].get(axis)
+            b = baseline[pid].get(axis)
+            if t is None or b is None:
+                continue
+            if isinstance(t, dict):
+                t = t.get("trained")
+                if t is None:
+                    continue
+            vals.append(float(t) - float(b))
+        out[axis] = np.asarray(vals, dtype=float)
+    return out
 
-    per_class = per_class_axes_avg_with_ci(
-        pp, n_resamples=n_resamples, alpha=alpha, rng_seed=rng_seed,
-    )
 
+def bootstrap_ci(
+    deltas: np.ndarray,
+    n_resamples: int = N_RESAMPLES_DEFAULT,
+    alpha: float = ALPHA_DEFAULT,
+    seed: int = RNG_SEED_DEFAULT,
+) -> Tuple[float, float, float]:
+    """Percentile bootstrap CI for the mean; resampling is over the input rows."""
+    arr = np.asarray(deltas, dtype=float)
+    n = arr.size
+    if n == 0:
+        return (float("nan"), float("nan"), float("nan"))
+    point = float(arr.mean())
+    if n < 2:
+        return (point, float("nan"), float("nan"))
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_resamples, n))
+    means = arr[idx].mean(axis=1)
+    lo = float(np.percentile(means, 100.0 * (alpha / 2.0)))
+    hi = float(np.percentile(means, 100.0 * (1.0 - alpha / 2.0)))
+    return (point, lo, hi)
+
+
+def _binom_two_sided(n_pos: int, n_trials: int, p: float = 0.5) -> float:
+    """Two-sided exact binomial p-value for k=n_pos in n=n_trials at H0=p."""
+    if n_trials == 0:
+        return 1.0
+    if _HAS_SCIPY_BINOM:
+        return float(_binomtest(n_pos, n_trials, p).pvalue)
+    from math import comb
+    obs = comb(n_trials, n_pos) * (p ** n_pos) * ((1 - p) ** (n_trials - n_pos))
+    total = 0.0
+    for k in range(n_trials + 1):
+        pk = comb(n_trials, k) * (p ** k) * ((1 - p) ** (n_trials - k))
+        if pk <= obs + 1e-15:
+            total += pk
+    return max(0.0, min(1.0, total))
+
+
+def sign_test(deltas: np.ndarray) -> Tuple[int, int, int, float]:
+    """Per-element two-sided sign test (zeros excluded from the trial count)."""
+    arr = np.asarray(deltas, dtype=float)
+    n_pos = int(np.sum(arr > 0))
+    n_neg = int(np.sum(arr < 0))
+    n_tie = int(np.sum(arr == 0))
+    n = n_pos + n_neg
+    if n == 0:
+        return (n_pos, n_neg, n_tie, 1.0)
+    k = max(n_pos, n_neg)
+    p = _binom_two_sided(k, n)
+    return (n_pos, n_neg, n_tie, float(p))
+
+
+def within_noise(mean: float, ci_lo: float, ci_hi: float) -> bool:
+    """|mean| < (ci_hi - ci_lo) / 2."""
+    if any(np.isnan(x) for x in (mean, ci_lo, ci_hi)):
+        return False
+    halfwidth = (ci_hi - ci_lo) / 2.0
+    return abs(mean) < halfwidth
+
+
+def paired_sign_test(
+    deltas_a: Dict[str, float],
+    deltas_b: Dict[str, float],
+) -> Tuple[int, int, int, float]:
+    """Paired sign test on (a[pid] - b[pid]) over the pid intersection."""
+    pids = sorted(set(deltas_a) & set(deltas_b))
+    if not pids:
+        raise ValueError("no overlapping prompt_ids between runs")
+    diffs = np.asarray([deltas_a[p] - deltas_b[p] for p in pids], dtype=float)
+    return sign_test(diffs)
+
+
+def bonferroni_alpha(
+    n_axes: int,
+    n_classes: int,
+    alpha: float = ALPHA_DEFAULT,
+) -> float:
+    """Bonferroni-corrected per-test alpha = alpha / (n_axes * n_classes)."""
+    if n_axes < 1 or n_classes < 1:
+        raise ValueError(f"n_axes and n_classes must be >= 1 (got {n_axes}, {n_classes})")
+    return alpha / float(n_axes * n_classes)
+
+
+def per_class_delta(
+    deltas_by_axis: Dict[str, Dict[str, float]],
+    classes: Dict[str, str] = PROMPT_CLASS,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Bucket per-axis deltas by class A-G; returns {cls: {axis: array}}."""
+    out: Dict[str, Dict[str, List[float]]] = {}
+    for axis, pid_to_delta in deltas_by_axis.items():
+        for pid, delta in pid_to_delta.items():
+            cls = classes.get(pid)
+            if cls is None:
+                continue
+            out.setdefault(cls, {}).setdefault(axis, []).append(float(delta))
     return {
-        "n_prompts": n_prompts,
-        "axes_avg": {
-            "delta": axes_avg_point,
-            "ci_lo": axes_avg_lo, "ci_hi": axes_avg_hi,
-            "sign_test_p": axes_avg_signtest["p_two_sided"],
-            "n_pos": axes_avg_signtest["n_pos"],
-            "n_neg": axes_avg_signtest["n_neg"],
-            "n_zero": axes_avg_signtest["n_zero"],
-        },
-        "per_axis": per_axis,
-        "per_class": per_class,
+        cls: {ax: np.asarray(v, dtype=float) for ax, v in ax_map.items()}
+        for cls, ax_map in out.items()
     }
 
 
-# ---------- Tiny CLI for ad-hoc use ----------
+def _vs_criterion(mean: float, ci_lo: float, ci_hi: float) -> str:
+    if np.isnan(ci_lo) or np.isnan(ci_hi):
+        return "n/a"
+    if within_noise(mean, ci_lo, ci_hi):
+        return "within-noise"
+    return "pass" if mean > 0 else "fail"
 
 
-def _cli(argv: list[str] | None = None) -> int:
+def render_headline_table(
+    deltas_by_axis: Dict[str, np.ndarray],
+    n: int,
+    criterion_pass_fn: Optional[Callable[[float, float, float], str]] = None,
+) -> str:
+    """Render howtoreport.md §二 Headline table (axes-avg only)."""
+    if criterion_pass_fn is None:
+        criterion_pass_fn = _vs_criterion
+    if not deltas_by_axis:
+        return "| metric | value | 95% CI | vs criterion |\n|---|---|---|---|\n"
+    arrs = list(deltas_by_axis.values())
+    m = min(a.size for a in arrs)
+    if m == 0:
+        axes_avg_arr = np.array([], dtype=float)
+    else:
+        axes_avg_arr = np.mean(np.stack([a[:m] for a in arrs], axis=0), axis=0)
+    mean, lo, hi = bootstrap_ci(axes_avg_arr)
+    verdict = "rolling-read-only" if n < 42 else criterion_pass_fn(mean, lo, hi)
+    lines = [
+        "| metric | value | 95% CI | vs criterion |",
+        "|---|---|---|---|",
+        f"| axes-avg Δ | {mean:+.3f} | [{lo:+.3f}, {hi:+.3f}] | {verdict} |",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_per_axis_table(deltas_by_axis: Dict[str, np.ndarray]) -> str:
+    """Render howtoreport.md §二 Per-axis table."""
+    lines = [
+        "| axis | Δ | 95% CI | sign-test p (vs 0) |",
+        "|---|---|---|---|",
+    ]
+    for axis in AXES_DEFAULT:
+        arr = deltas_by_axis.get(axis)
+        if arr is None or arr.size == 0:
+            lines.append(f"| {axis} | n/a | n/a | n/a |")
+            continue
+        mean, lo, hi = bootstrap_ci(arr)
+        _, _, _, p = sign_test(arr)
+        lines.append(
+            f"| {axis} | {mean:+.3f} | [{lo:+.3f}, {hi:+.3f}] | {p:.3f} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_per_class_table(
+    per_class: Dict[str, Dict[str, np.ndarray]],
+    min_n_for_ci: int = 5,
+) -> str:
+    """Render howtoreport.md §二 Per-class axes-avg Δ table."""
+    lines = [
+        "| class | n | Δ | 95% CI |",
+        "|---|---|---|---|",
+    ]
+    for cls in ["A", "B", "C", "D", "E", "F", "G"]:
+        ax_map = per_class.get(cls)
+        cls_label = f"{cls} {CLASS_NAMES.get(cls, '')}".strip()
+        if ax_map is None or not ax_map:
+            lines.append(f"| {cls_label} | 0 | n/a | n/a |")
+            continue
+        arrs = list(ax_map.values())
+        m = min(a.size for a in arrs)
+        if m == 0:
+            lines.append(f"| {cls_label} | 0 | n/a | n/a |")
+            continue
+        axes_avg = np.mean(np.stack([a[:m] for a in arrs], axis=0), axis=0)
+        n = axes_avg.size
+        if n >= min_n_for_ci:
+            mean, lo, hi = bootstrap_ci(axes_avg)
+            lines.append(
+                f"| {cls_label} | {n} | {mean:+.3f} | [{lo:+.3f}, {hi:+.3f}] |"
+            )
+        else:
+            mean = float(axes_avg.mean())
+            lines.append(f"| {cls_label} | {n} | {mean:+.3f} | n/a |")
+    return "\n".join(lines) + "\n"
+
+
+def render_run_identity(
+    ckpt: str,
+    ckpt_sha: str,
+    eval_gen_out: str,
+    baseline_match: bool,
+    n: int,
+    baseline_ref: str,
+    trainer_health: str = "",
+) -> str:
+    """Render howtoreport.md §二 Run identity table."""
+    lines = [
+        "| field | value |",
+        "|---|---|",
+        f"| ckpt | {ckpt} |",
+        f"| ckpt sha256 | {ckpt_sha} |",
+        f"| trainer step health | {trainer_health} |",
+        f"| eval gen out | {eval_gen_out} |",
+        f"| baseline_sha256_match | {'true' if baseline_match else 'false'} |",
+        f"| n | {n} |",
+        f"| baseline ref | {baseline_ref} |",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _cli(argv: Optional[List[str]] = None) -> int:
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Compute round-N PhyJudge eval stats per howtoreport.md."
+        description="howtoreport.md §二 markdown generator"
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    p_sum = sub.add_parser("summarize",
-                           help="trained vs baseline summary")
-    p_sum.add_argument("--trained-results", required=True,
-                       type=pathlib.Path)
-    p_sum.add_argument("--baseline-results", required=True,
-                       type=pathlib.Path)
-    p_sum.add_argument("--n-resamples", type=int, default=10_000)
-    p_sum.add_argument("--alpha", type=float, default=0.05)
-    p_sum.add_argument("--rng-seed", type=int, default=0)
-    p_sum.add_argument("--out-json", type=pathlib.Path, default=None)
-
-    p_paired = sub.add_parser("paired-sign-test",
-                              help="aligned-pid sign-test of run-a vs run-b")
-    p_paired.add_argument("--run-a-trained", required=True,
-                          type=pathlib.Path,
-                          help="trained results.jsonl for run A")
-    p_paired.add_argument("--run-a-baseline", required=True,
-                          type=pathlib.Path)
-    p_paired.add_argument("--run-b-trained", required=True,
-                          type=pathlib.Path)
-    p_paired.add_argument("--run-b-baseline", required=True,
-                          type=pathlib.Path)
-    p_paired.add_argument("--alpha", type=float, default=0.05)
-    p_paired.add_argument("--out-json", type=pathlib.Path, default=None)
-
+    p.add_argument("--scores-dir", required=True, type=pathlib.Path,
+                   help="<gen_out>/scores_perprompt/")
+    p.add_argument("--baseline", required=True, type=pathlib.Path,
+                   help="baseline results.jsonl")
+    p.add_argument("--output-md", required=True, type=pathlib.Path)
+    p.add_argument("--ckpt", default="<unset>")
+    p.add_argument("--ckpt-sha", default="<unset>")
+    p.add_argument("--baseline-ref", default="<unset>")
+    p.add_argument("--trainer-health", default="")
     args = p.parse_args(argv)
 
-    if args.cmd == "summarize":
-        records = load_delta_records_from_results(
-            args.trained_results, args.baseline_results,
-        )
-        out = summarize_run(
-            records, n_resamples=args.n_resamples,
-            alpha=args.alpha, rng_seed=args.rng_seed,
-        )
-        text = json.dumps(out, indent=2, ensure_ascii=False)
-        if args.out_json:
-            args.out_json.write_text(text + "\n", encoding="utf-8")
-        print(text)
-        return 0
+    trained = load_scores(args.scores_dir)
+    baseline = load_baseline(args.baseline)
+    deltas = compute_delta(trained, baseline)
+    n = min((a.size for a in deltas.values()), default=0)
+    baseline_sha = baseline_sha256(args.baseline)
 
-    if args.cmd == "paired-sign-test":
-        a_records = load_delta_records_from_results(
-            args.run_a_trained, args.run_a_baseline,
-        )
-        b_records = load_delta_records_from_results(
-            args.run_b_trained, args.run_b_baseline,
-        )
-        a_pp = per_prompt_axes_avg(a_records)
-        b_pp = per_prompt_axes_avg(b_records)
-        out = paired_sign_test(a_pp, b_pp, alpha=args.alpha)
-        # aligned_pids may be long; keep it but write to file separately
-        # if the caller used --out-json.
-        text = json.dumps(out, indent=2, ensure_ascii=False)
-        if args.out_json:
-            args.out_json.write_text(text + "\n", encoding="utf-8")
-        # When dumping to stdout, suppress the long pid list for skim.
-        compact = {k: v for k, v in out.items() if k != "aligned_pids"}
-        compact["n_aligned"] = out["n_aligned"]
-        print(json.dumps(compact, indent=2, ensure_ascii=False))
-        return 0
+    deltas_pid_by_axis: Dict[str, Dict[str, float]] = {}
+    pids_sorted = sorted(set(trained) & set(baseline))
+    for axis in AXES_DEFAULT:
+        d: Dict[str, float] = {}
+        for pid in pids_sorted:
+            t = trained[pid].get(axis)
+            b = baseline[pid].get(axis)
+            if t is None or b is None:
+                continue
+            if isinstance(t, dict):
+                t = t.get("trained")
+                if t is None:
+                    continue
+            d[pid] = float(t) - float(b)
+        deltas_pid_by_axis[axis] = d
+    pcd = per_class_delta(deltas_pid_by_axis)
 
-    return 2
+    verdict = "rolling-read-only" if n < 42 else "pass-or-fail"
+    body = []
+    body.append(f"# Round-? eval (n={n})\n")
+    body.append(f"**Verdict**: {verdict}\n")
+    body.append("**Criterion**: <fill from plan>\n")
+    body.append("**Next action**: <fill>\n\n")
+    body.append("## Run identity\n\n")
+    body.append(render_run_identity(
+        ckpt=args.ckpt, ckpt_sha=args.ckpt_sha,
+        eval_gen_out=str(args.scores_dir),
+        baseline_match=True, n=n, baseline_ref=args.baseline_ref,
+        trainer_health=args.trainer_health,
+    ))
+    body.append(f"\nbaseline_sha256: {baseline_sha}\n\n")
+    body.append(f"## Headline (n={n})\n\n")
+    body.append(render_headline_table(deltas, n))
+    body.append(f"\n## Per-axis Δ (n={n})\n\n")
+    body.append(render_per_axis_table(deltas))
+    body.append("\n## Per-class Δ axes-avg\n\n")
+    body.append(render_per_class_table(pcd))
+
+    args.output_md.write_text("".join(body), encoding="utf-8")
+    print(f"wrote {args.output_md}")
+    return 0
 
 
 if __name__ == "__main__":
