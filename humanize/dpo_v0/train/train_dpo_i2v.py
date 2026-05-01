@@ -453,17 +453,56 @@ class LoRALinear(nn.Module):
         # B initialized at zero so adapter contributes 0 at init.
         for p in self.base.parameters():
             p.requires_grad_(False)
-        # `enabled=False` makes the adapter a pass-through (= base linear). Used by the
-        # ref-via-toggled-LoRA trick to compute reference outputs without holding a
-        # second 27 GB WanModel on GPU. Math equivalence: LoRA.B is frozen-equal to
-        # what a separate frozen reference would store; setting enabled=False bypasses
-        # the delta path entirely so output is byte-identical to the original base linear.
-        self.enabled = True
+        # Reference LoRA — task #49 ``--ref-lora-from``. Optional second adapter that
+        # holds a frozen previous-policy LoRA (e.g. round-4 lora_final) used as the DPO
+        # reference distribution. ``A_ref`` / ``B_ref`` allocated on demand by
+        # :func:`inject_lora_ref`; loaded from a safetensors file by
+        # :func:`load_ref_lora_state`. Always ``requires_grad=False`` so the optimizer
+        # never touches them. ``ref_scale`` is set when the params are allocated.
+        self.A_ref: nn.Parameter | None = None
+        self.B_ref: nn.Parameter | None = None
+        self.ref_rank: int | None = None
+        self.ref_alpha: int | None = None
+        self.ref_scale: float | None = None
+        # Mode-switched forward (task #49):
+        #   "pi"  (default) — use A / B (current policy LoRA, trainable)
+        #   "ref"            — use A_ref / B_ref (frozen previous policy);
+        #                       falls back to base-only if A_ref is None
+        #   "off"            — pass-through (== base linear), preserves the
+        #                       round-4 ``lora_disabled()`` semantics for runs
+        #                       without ``--ref-lora-from``
+        self.mode: str = "pi"
+        # Backwards-compat: ``self.enabled = False`` is equivalent to ``mode="off"``.
+        # ``lora_disabled()`` flips ``mode``; existing call-sites that mutate
+        # ``.enabled`` are still respected via the property below.
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        # Preserve the old API: ``mod.enabled = False`` ↔ ``mode = "off"``;
+        # ``mod.enabled = True`` ↔ restore "pi" (the most common previous state).
+        if value:
+            if self.mode == "off":
+                self.mode = "pi"
+        else:
+            self.mode = "off"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
-        if not self.enabled:
+        if self.mode == "off":
             return base_out
+        if self.mode == "ref":
+            if self.A_ref is None or self.B_ref is None:
+                # No reference LoRA loaded → behave like the round-4
+                # ref-via-disabled-LoRA path (== base linear).
+                return base_out
+            x_a = x.to(self.A_ref.dtype)
+            delta = (x_a @ self.A_ref) @ self.B_ref
+            return base_out + (self.ref_scale * delta).to(base_out.dtype)
+        # mode == "pi" (default)
         x_a = x.to(self.A.dtype)
         delta = (x_a @ self.A) @ self.B
         return base_out + (self.scale * delta).to(base_out.dtype)
@@ -471,19 +510,51 @@ class LoRALinear(nn.Module):
 
 @contextlib.contextmanager
 def lora_disabled(model: nn.Module):
-    """Temporarily disable all LoRALinear adapters in `model` so it behaves like the
+    """Temporarily disable all LoRALinear adapters in ``model`` so it behaves like the
     frozen base. try/finally guarantees adapters are re-enabled even on exception
     (rl2 sign-off requirement: a leaked disabled state would silently null out training).
+
+    With task #49 ``--ref-lora-from``, this still flips ``mode = "off"`` (= base only,
+    NOT the reference adapter); the reference adapter is selected by the separate
+    :func:`ref_active` context manager. Round-4 invariants preserved.
     """
     layers = [m for m in model.modules() if isinstance(m, LoRALinear)]
-    prev = [m.enabled for m in layers]
+    prev = [m.mode for m in layers]
     try:
         for m in layers:
-            m.enabled = False
+            m.mode = "off"
         yield
     finally:
-        for m, e in zip(layers, prev):
-            m.enabled = e
+        for m, p in zip(layers, prev):
+            m.mode = p
+
+
+@contextlib.contextmanager
+def ref_active(model: nn.Module):
+    """Temporarily switch all LoRALinear adapters to ``mode="ref"`` so the policy's
+    forward pass uses the previous-policy reference LoRA (loaded via
+    :func:`load_ref_lora_state`) instead of the current trainable LoRA.
+
+    Use ONLY in DPO Pass A (no_grad reference forwards) when ``--ref-lora-from`` is
+    set. Pairs with :func:`load_ref_lora_state` (load) and ``--ref-lora-rank`` /
+    ``--ref-lora-alpha`` CLI flags.
+
+    If a layer has no ``A_ref`` allocated (e.g. ``--ref-lora-from`` was not set), the
+    layer's forward falls back to base-linear (equivalent to ``mode="off"``), so this
+    context is safe to enter unconditionally — but for clarity callers should still
+    branch on ``args.ref_lora_from is not None`` and use :func:`lora_disabled` when
+    no reference LoRA is set, so the math matches round-4 ref-via-disabled-LoRA
+    semantics.
+    """
+    layers = [m for m in model.modules() if isinstance(m, LoRALinear)]
+    prev = [m.mode for m in layers]
+    try:
+        for m in layers:
+            m.mode = "ref"
+        yield
+    finally:
+        for m, p in zip(layers, prev):
+            m.mode = p
 
 
 def inject_lora(model: nn.Module, target_re: re.Pattern, rank: int, alpha: float, dtype: torch.dtype, device: torch.device) -> tuple[list[nn.Parameter], list[str]]:
@@ -586,6 +657,118 @@ def load_lora_state(model: nn.Module, ckpt_path: pathlib.Path) -> tuple[int, int
             # transpose back to [in_features, rank] / [rank, out_features].
             mod.A.data.copy_(a_loaded.T.to(dtype=mod.A.dtype, device=mod.A.device))
             mod.B.data.copy_(b_loaded.T.to(dtype=mod.B.dtype, device=mod.B.device))
+        n_loaded += 1
+
+    return n_loaded, len(extra)
+
+
+def inject_lora_ref(
+    model: nn.Module,
+    rank: int,
+    alpha: float,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> int:
+    """Allocate frozen ``A_ref`` / ``B_ref`` parameters on every existing LoRALinear
+    module — task #49 ``--ref-lora-from`` previous-policy reference.
+
+    Must be called AFTER :func:`inject_lora` (so LoRALinear modules already exist),
+    AFTER any optional :func:`load_lora_state` (warm-start of A/B), and BEFORE
+    :func:`load_ref_lora_state` (which fills the freshly-allocated A_ref/B_ref).
+    Like :func:`load_lora_state`, must run BEFORE FSDP ``shard_model`` so the new
+    parameters are unsharded at allocation; FSDP will shard them on wrap.
+
+    The reference adapter shares the SAME target_re scope as the policy adapter
+    (every existing LoRALinear gets paired ref params). Asymmetric rank between
+    policy and reference is supported via ``rank`` / ``alpha`` differing from
+    ``mod.rank`` / ``mod.alpha``.
+
+    Returns the number of LoRALinear modules that received ref params.
+    """
+    n = 0
+    for _name, mod in model.named_modules():
+        if not isinstance(mod, LoRALinear):
+            continue
+        # Allocate ref params with explicit ``requires_grad=False`` so AdamW never
+        # touches them. Init at zero — load_ref_lora_state fills from ckpt.
+        a_ref = nn.Parameter(
+            torch.zeros(mod.base.in_features, rank, dtype=dtype, device=device),
+            requires_grad=False,
+        )
+        b_ref = nn.Parameter(
+            torch.zeros(rank, mod.base.out_features, dtype=dtype, device=device),
+            requires_grad=False,
+        )
+        mod.A_ref = a_ref
+        mod.B_ref = b_ref
+        mod.ref_rank = int(rank)
+        mod.ref_alpha = int(alpha)
+        mod.ref_scale = float(alpha) / float(rank)
+        n += 1
+    return n
+
+
+def load_ref_lora_state(model: nn.Module, ckpt_path: pathlib.Path) -> tuple[int, int]:
+    """Load reference-LoRA A/B weights from a DiffSynth-canonical safetensors file
+    into already-allocated ``A_ref`` / ``B_ref`` slots — task #49
+    ``--ref-lora-from``. Mirrors :func:`load_lora_state` but writes to the ref
+    parameters and enforces ``requires_grad=False`` after copy.
+
+    Order: AFTER :func:`inject_lora_ref` (allocates the slots), BEFORE FSDP
+    ``shard_model`` (so loads happen unsharded).
+
+    Returns ``(n_modules_loaded, n_orphan_keys_in_ckpt)``. Raises if any LoRALinear
+    has no ``A_ref`` allocated, if the ckpt is missing keys, or if rank shapes
+    disagree.
+    """
+    state = safetensors.torch.load_file(str(ckpt_path))
+
+    name_to_mod: dict[str, "LoRALinear"] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, LoRALinear):
+            clean = name.replace("_fsdp_wrapped_module.", "")
+            name_to_mod[clean] = mod
+
+    expected_keys: set[str] = set()
+    for clean in name_to_mod:
+        expected_keys.add(f"{clean}.lora_A.weight")
+        expected_keys.add(f"{clean}.lora_B.weight")
+    actual_keys = set(state.keys())
+
+    missing = sorted(expected_keys - actual_keys)
+    extra = sorted(actual_keys - expected_keys)
+    if missing:
+        raise RuntimeError(
+            f"--ref-lora-from: ckpt at {ckpt_path} is missing {len(missing)} "
+            f"key(s) that the LoRALinear modules require for the reference "
+            f"adapter. First 5: {missing[:5]}"
+        )
+
+    n_loaded = 0
+    for clean, mod in name_to_mod.items():
+        if mod.A_ref is None or mod.B_ref is None:
+            raise RuntimeError(
+                f"--ref-lora-from: {clean} has no A_ref/B_ref slot allocated. "
+                f"Call inject_lora_ref() before load_ref_lora_state()."
+            )
+        a_loaded = state[f"{clean}.lora_A.weight"]  # saved as [rank, in_features]
+        b_loaded = state[f"{clean}.lora_B.weight"]  # saved as [out_features, rank]
+        if a_loaded.shape[0] != mod.ref_rank:
+            raise RuntimeError(
+                f"--ref-lora-from: {clean}.lora_A rank mismatch "
+                f"(ckpt rank={a_loaded.shape[0]} vs --ref-lora-rank={mod.ref_rank})"
+            )
+        if b_loaded.shape[1] != mod.ref_rank:
+            raise RuntimeError(
+                f"--ref-lora-from: {clean}.lora_B rank mismatch "
+                f"(ckpt rank={b_loaded.shape[1]} vs --ref-lora-rank={mod.ref_rank})"
+            )
+        with torch.no_grad():
+            mod.A_ref.data.copy_(a_loaded.T.to(dtype=mod.A_ref.dtype, device=mod.A_ref.device))
+            mod.B_ref.data.copy_(b_loaded.T.to(dtype=mod.B_ref.dtype, device=mod.B_ref.device))
+        # Idempotent re-assertion of frozen status.
+        mod.A_ref.requires_grad_(False)
+        mod.B_ref.requires_grad_(False)
         n_loaded += 1
 
     return n_loaded, len(extra)
@@ -769,6 +952,35 @@ def main():
              "Under FSDP this uses FSDP.optim_state_dict (collective; "
              "rank0_only materialization) so each ckpt has a full optim "
              "state, not sharded. Set false to disable for disk-tight runs.",
+    )
+    # Round-N+1 previous-policy reference (task #49). Default None preserves
+    # the round-4 ref-via-disabled-LoRA semantics.
+    p.add_argument(
+        "--ref-lora-from",
+        type=pathlib.Path,
+        default=None,
+        help="Optional safetensors file with a previous-policy LoRA used as the "
+             "DPO reference (instead of the round-4 ref-via-disabled-LoRA path). "
+             "Loaded into freshly-allocated A_ref/B_ref slots on every LoRALinear "
+             "module after inject_lora() and (optionally) init_lora_from(), and "
+             "before FSDP shard_model(). Pass-A reference forwards then run with "
+             "ref_active() context (mode='ref') instead of lora_disabled() "
+             "(mode='off'). When unset, training reproduces round-4 reference "
+             "semantics byte-for-byte (lora_disabled path).",
+    )
+    p.add_argument(
+        "--ref-lora-rank",
+        type=int,
+        default=None,
+        help="Rank of the reference LoRA in --ref-lora-from. Defaults to "
+             "--lora-rank if not set. Supports asymmetric policy/reference rank.",
+    )
+    p.add_argument(
+        "--ref-lora-alpha",
+        type=int,
+        default=None,
+        help="Alpha of the reference LoRA in --ref-lora-from. Defaults to "
+             "--lora-alpha if not set.",
     )
     # Wandb (rank-0 only; failures are non-fatal so training never depends on wandb).
     p.add_argument("--wandb-project", type=str, default=None,
@@ -1114,6 +1326,28 @@ def main():
                 flush=True,
             )
 
+    # Round-N+1 previous-policy reference (task #49). When --ref-lora-from is set,
+    # allocate paired A_ref/B_ref params on every LoRALinear module and load the
+    # safetensors file into them. Pass-A reference forwards (in the main DPO loop
+    # below) then use ``ref_active()`` instead of ``lora_disabled()`` so the DPO
+    # math contrasts the trainable policy against the previous policy LoRA, not
+    # the bare base model. Order: AFTER inject_lora() + optional init_lora_from(),
+    # BEFORE FSDP shard_model().
+    if args.ref_lora_from is not None:
+        if not args.ref_lora_from.is_file():
+            raise SystemExit(f"--ref-lora-from: file not found: {args.ref_lora_from}")
+        ref_rank = args.ref_lora_rank if args.ref_lora_rank is not None else args.lora_rank
+        ref_alpha = args.ref_lora_alpha if args.ref_lora_alpha is not None else args.lora_alpha
+        n_ref_inject = inject_lora_ref(policy, ref_rank, ref_alpha, dtype, device)
+        n_ref_loaded, n_ref_orphan = load_ref_lora_state(policy, args.ref_lora_from)
+        if is_main:
+            print(
+                f"[ref-lora-from] allocated {n_ref_inject} ref slots "
+                f"(rank={ref_rank} alpha={ref_alpha}); loaded {n_ref_loaded} from "
+                f"{args.ref_lora_from} (ckpt orphan keys: {n_ref_orphan})",
+                flush=True,
+            )
+
     # rl9 precondition for ref-via-disabled-LoRA: no dropout in policy. WanModel uses
     # RMSNorm (no running stats) and flash attention without attention_dropout, so this
     # should be empty — but assert defensively in case a future commit adds dropout.
@@ -1267,8 +1501,19 @@ def main():
                 # Pass A: 4 no-grad forwards on POLICY for scalar MSEs.
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", dtype=dtype):
-                        # ref via disabled LoRA (mathematically equivalent to frozen base)
-                        with lora_disabled(policy.module if is_distributed else policy):
+                        # Reference forwards. With --ref-lora-from (task #49) the
+                        # policy temporarily switches to mode="ref" (uses A_ref /
+                        # B_ref = previous policy LoRA). Without --ref-lora-from
+                        # (round-4 invariant 1) the policy switches to mode="off"
+                        # (== bare base linear), preserving the round-4
+                        # ref-via-disabled-LoRA semantics byte-for-byte.
+                        _policy_inner = policy.module if is_distributed else policy
+                        _ref_ctx = (
+                            ref_active(_policy_inner)
+                            if args.ref_lora_from is not None
+                            else lora_disabled(_policy_inner)
+                        )
+                        with _ref_ctx:
                             v_ref_w_ng = policy([z_w_t], t_tensor, context, seq_len, y=[y])[0]
                             mse_ref_w = (v_ref_w_ng.float() - mse_target_w.float()).pow(2).mean()
                             del v_ref_w_ng
