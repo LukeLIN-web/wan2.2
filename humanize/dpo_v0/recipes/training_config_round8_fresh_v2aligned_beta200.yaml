@@ -1,0 +1,14 @@
+beta: 200
+dpo_loss_kind: sigmoid
+lora_alpha: 16
+lora_rank: 16
+lr: 1.0e-05
+max_pairs: 1024
+micro_batch: 1
+num_samples: 1024
+round_tag: round-8-fresh-v2aligned-beta200
+sampling_band:
+- 901
+- 999
+seed_namespace: round7-fresh-tier_b-1024-cond-present
+subset_pair_ids_sha256_hex16: a262b7153f58c37f
