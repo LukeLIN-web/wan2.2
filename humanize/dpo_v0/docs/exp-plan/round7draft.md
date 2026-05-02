@@ -182,10 +182,21 @@ re-trained optim (requires r4 re-run), (iii) fresh again with adjusted recipe.
 
 ## Decisions to lock at promote-time (open)
 
-1. **B rescue + E zero-buffer policy**: confirm 42 usable B-class rescue pids
-   can be rebuilt from the disk-missing pool and all 24 E cond-present pids are
-   usable. If not, step down to the 824 strict cond-present no-repeat cap or
-   explicitly approve a repeated-B trainer patch. Default: 1024 with B rescue.
+1. **B rescue + E zero-buffer policy** — **RESOLVED (Round 0, 2026-05-01) as
+   fallback (ii)**: the 4 unique source switch-frame jpgs the 46 B-class
+   disk-missing pids depend on are no longer present at
+   `/shared/user60/worldmodel/rlvideo/videodpo/worldmodelbench/physics-IQ-benchmark/switch-frames/`
+   nor any reachable mirror; rebuild was infeasible. luke1-equivalent
+   authorisation was given to take fallback (ii): keep `num_samples=1024`
+   but allow B-class repeated sampling. Implementation:
+   `humanize/dpo_v0/script/sample/round7_v2aligned_1024.py` defaults to
+   `--b-mode repeat` (172 cond-present-B + 42 deterministic repeats from
+   the same pool, salts `B-cond` / `B-rescue` / `B-repeat-pick`); trainer
+   `humanize/dpo_v0/train/train_dpo_i2v.py` adds `--allow-repeated-pair-ids`
+   (default false; round-7 launcher sets it true). Round-4/5/6 default
+   semantics are unchanged. E zero-buffer pre-flight (24/24 cond-present-E
+   non-empty in the trainer union latent manifest) still pending verify on
+   juyi-videorl pre-launch.
 2. **v2 classifier re-verify**: rerun rule on v2 PROMPT_CLASS (43 pids), assert
    43/43; same gate as round-6 plan §"decision 2".
 3. **Recipe yaml**: fork from `training_config_round6_v2aligned_beta100.yaml`
