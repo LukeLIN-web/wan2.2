@@ -827,6 +827,74 @@ def socket_tail() -> str:
         return "unknown"
 
 
+def resolve_resume_ckpt(ckpt_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, int]:
+    """Resolve a resume ckpt directory to (lora_path, optim_path, saved_step).
+
+    Selection: prefer ``lora_final.safetensors`` if present, else the highest-step
+    ``lora_step{N}.safetensors``. Companion optim file is ``<stem>_optim.pt``.
+
+    Step source (codex review F):
+      * ``lora_step{N}.safetensors`` → parse N from the filename.
+      * ``lora_final.safetensors`` → require ``run_manifest.json`` in the same dir
+        and read ``actual_steps`` from it (the only authoritative anchor for a
+        ckpt that has no step in its name).
+
+    Hard-errors on missing files, missing companion optim, or unreadable manifest.
+    """
+    if not ckpt_dir.is_dir():
+        raise SystemExit(f"--resume-from-ckpt: directory not found: {ckpt_dir}")
+
+    final_path = ckpt_dir / "lora_final.safetensors"
+    if final_path.is_file():
+        manifest_path = ckpt_dir / "run_manifest.json"
+        if not manifest_path.is_file():
+            raise SystemExit(
+                f"--resume-from-ckpt: {final_path.name} present but "
+                f"{manifest_path.name} missing — cannot determine saved step counter "
+                f"(filename has no step number). Either point at a "
+                f"lora_step{{N}}.safetensors file's directory or restore the manifest."
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(
+                f"--resume-from-ckpt: failed to read {manifest_path}: {e}"
+            ) from e
+        saved_step = manifest.get("actual_steps")
+        if not isinstance(saved_step, int) or saved_step <= 0:
+            raise SystemExit(
+                f"--resume-from-ckpt: {manifest_path} has invalid actual_steps="
+                f"{saved_step!r}; expected positive int."
+            )
+        lora_path = final_path
+    else:
+        step_files = sorted(
+            ckpt_dir.glob("lora_step*.safetensors"),
+            key=lambda p: int(re.match(r"lora_step(\d+)\.safetensors$", p.name).group(1))
+                if re.match(r"lora_step(\d+)\.safetensors$", p.name) else -1,
+        )
+        step_files = [p for p in step_files if re.match(r"lora_step(\d+)\.safetensors$", p.name)]
+        if not step_files:
+            raise SystemExit(
+                f"--resume-from-ckpt: no lora_final.safetensors and no "
+                f"lora_step{{N}}.safetensors found in {ckpt_dir}"
+            )
+        lora_path = step_files[-1]
+        m = re.match(r"lora_step(\d+)\.safetensors$", lora_path.name)
+        saved_step = int(m.group(1))
+
+    optim_path = lora_path.with_name(lora_path.stem + "_optim.pt")
+    if not optim_path.is_file():
+        raise SystemExit(
+            f"--resume-from-ckpt: {lora_path.name} present but companion "
+            f"{optim_path.name} missing — true resume requires saved Adam moments. "
+            f"Either re-train round-N with --save-optimizer-state true, or use "
+            f"--init-lora-from for a warm-restart with reset Adam state."
+        )
+
+    return lora_path, optim_path, saved_step
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", type=pathlib.Path, default=pathlib.Path("/shared/user63/workspace/data/Wan/Wan2.2-I2V-A14B"))
@@ -995,6 +1063,25 @@ def main():
         help="Alpha of the reference LoRA in --ref-lora-from. Defaults to "
              "--lora-alpha if not set.",
     )
+    # True-resume from a previous round's ckpt directory: loads LoRA weights,
+    # AdamW first/second moments, and the saved step counter so the run
+    # continues mid-trajectory (vs --init-lora-from which resets optimizer
+    # state and step). The directory must contain either
+    # lora_final.safetensors + run_manifest.json (manifest gives actual_steps),
+    # or lora_step{N}.safetensors (filename gives the step). Companion
+    # <stem>_optim.pt is required. Mutually exclusive with --init-lora-from.
+    p.add_argument(
+        "--resume-from-ckpt",
+        type=pathlib.Path,
+        default=None,
+        help="Optional ckpt DIRECTORY produced by a previous run with "
+             "--save-optimizer-state true. Loads LoRA weights, Adam state, and "
+             "step counter for true mid-trajectory resume. Per-rank reads the "
+             "shared file from disk; under FSDP all ranks collectively call "
+             "FSDP.optim_state_dict_to_load. Mutually exclusive with "
+             "--init-lora-from. Recipe / pair_ids / seed_namespace must match "
+             "the original run for shuffle and per-pair noise continuity.",
+    )
     # Wandb (rank-0 only; failures are non-fatal so training never depends on wandb).
     p.add_argument("--wandb-project", type=str, default=None,
                    help="Wandb project name. If unset (or --wandb-mode disabled), wandb is skipped.")
@@ -1027,6 +1114,20 @@ def main():
     if args.pair_ids_sha256_pin is not None and args.subset_pair_ids_json is None:
         raise SystemExit(
             "--pair-ids-sha256-pin set without --subset-pair-ids-json; both required together."
+        )
+    if args.resume_from_ckpt is not None and args.init_lora_from is not None:
+        raise SystemExit(
+            "--resume-from-ckpt and --init-lora-from are mutually exclusive: "
+            "resume already loads LoRA weights from the ckpt directory, and "
+            "init-lora-from would conflict with the saved Adam state."
+        )
+
+    resume_lora_path: pathlib.Path | None = None
+    resume_optim_path: pathlib.Path | None = None
+    resume_saved_step: int = 0
+    if args.resume_from_ckpt is not None:
+        resume_lora_path, resume_optim_path, resume_saved_step = resolve_resume_ckpt(
+            args.resume_from_ckpt
         )
 
     asset_pins = assert_model_asset_pins(args.upstream)
@@ -1358,6 +1459,15 @@ def main():
                 flush=True,
             )
 
+    if resume_lora_path is not None:
+        n_loaded, n_orphan = load_lora_state(policy, resume_lora_path)
+        if is_main:
+            print(
+                f"[resume] loaded {n_loaded} LoRA modules from "
+                f"{resume_lora_path} (ckpt orphan keys: {n_orphan})",
+                flush=True,
+            )
+
     # Round-N+1 previous-policy reference (task #49). When --ref-lora-from is set,
     # allocate paired A_ref/B_ref params on every LoRALinear module and load the
     # safetensors file into them. Pass-A reference forwards (in the main DPO loop
@@ -1408,6 +1518,35 @@ def main():
             policy = DDP(policy, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, betas=(0.9, 0.999))
+
+    # True-resume: load Adam first/second moments from the companion _optim.pt.
+    # Under FSDP all ranks read the same shared file (rank-0 wrote the full
+    # unsharded state via FSDP.optim_state_dict at save time) and call
+    # FSDP.optim_state_dict_to_load collectively to remap into per-rank shards
+    # for use_orig_params=True LoRA params; without FSDP, vanilla load.
+    if resume_optim_path is not None:
+        loaded_optim = torch.load(resume_optim_path, map_location="cpu")
+        if is_distributed and args.dit_fsdp:
+            from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
+            with _FSDP.state_dict_type(
+                policy,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+                FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            ):
+                sharded = _FSDP.optim_state_dict_to_load(
+                    model=policy, optim=optimizer, optim_state_dict=loaded_optim,
+                )
+            optimizer.load_state_dict(sharded)
+        else:
+            optimizer.load_state_dict(loaded_optim)
+        if is_main:
+            print(
+                f"[resume] loaded optimizer state from {resume_optim_path}",
+                flush=True,
+            )
+
     routing_counter = RoutingCounter(halt_on_low_noise=args.halt_on_low_noise)
 
     dataset = TierLatentDataset(records)
@@ -1430,18 +1569,34 @@ def main():
         target_steps = int(args.max_steps)
         control_mode = "step"
     target_samples = target_steps * samples_per_step
+    start_step = resume_saved_step
+    start_epoch_index = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
+    start_batch_in_epoch = start_step % steps_per_epoch if steps_per_epoch > 0 else 0
+    if start_step >= target_steps:
+        raise SystemExit(
+            f"--resume-from-ckpt: saved step counter ({start_step}) >= target_steps "
+            f"({target_steps}); the run would do zero iterations. Bump num_samples / "
+            f"max_steps in the round-9 yaml or pick an earlier resume point."
+        )
     if is_main:
         print(
             f"[schedule] control={control_mode} num_samples={args.num_samples} "
             f"max_steps={args.max_steps if control_mode == 'step' else None} "
             f"steps_per_epoch={steps_per_epoch} samples_per_step={samples_per_step} "
-            f"target_steps={target_steps} target_samples={target_samples}",
+            f"target_steps={target_steps} target_samples={target_samples} "
+            f"start_step={start_step}",
             flush=True,
         )
+        if resume_lora_path is not None:
+            print(
+                f"[resume] loaded step={start_step} epoch_index={start_epoch_index} "
+                f"optimizer_state=true ckpt_dir={args.resume_from_ckpt}",
+                flush=True,
+            )
 
     losses: list[float] = []
     acc_window: deque[int] = deque(maxlen=50)
-    step = 0
+    step = start_step
     wall_start = time.time()
 
     def _save_lora(ckpt_path):
@@ -1476,11 +1631,14 @@ def main():
             elif is_main:
                 torch.save(optimizer.state_dict(), opt_path)
 
-    epoch_index = 0
+    epoch_index = start_epoch_index
     while step < target_steps:
         if sampler is not None:
             sampler.set_epoch(epoch_index)
+        skip_in_epoch = start_batch_in_epoch if epoch_index == start_epoch_index else 0
         for batch_in_epoch, data in enumerate(loader):
+            if batch_in_epoch < skip_in_epoch:
+                continue
             if step >= target_steps:
                 break
             pid = data["pair_id"]
@@ -1688,7 +1846,10 @@ def main():
 
             # FSDP collective requires all ranks to enter summon_full_params together,
             # so the gating drops `is_main` here; _save_lora handles rank-0-only IO internally.
-            if step > 0 and step % args.save_every == 0:
+            # `step > start_step` (vs the original `step > 0`) keeps fresh-init behavior
+            # identical (start_step=0) while preventing a true-resume run from re-emitting
+            # the resume-source ckpt's cadence position in its own dir.
+            if step > start_step and step % args.save_every == 0:
                 ckpt_path = run_dir / f"lora_step{step}.safetensors"
                 _save_lora(ckpt_path)
                 if is_main:
@@ -1716,6 +1877,13 @@ def main():
             "samples_per_step": samples_per_step,
             "actual_steps": step,
             "actual_samples": step * samples_per_step,
+            "start_step": start_step,
+            "resume_from_ckpt": str(args.resume_from_ckpt) if args.resume_from_ckpt else None,
+            "seed_namespace": args.seed_namespace,
+            "latent_manifest_path": str(args.latent_manifest),
+            "latent_manifest_sha256": hashlib.sha256(
+                args.latent_manifest.read_bytes()
+            ).hexdigest() if args.latent_manifest and args.latent_manifest.is_file() else None,
             "lr": args.lr,
             "beta": args.beta,
             "lora_rank": args.lora_rank,
